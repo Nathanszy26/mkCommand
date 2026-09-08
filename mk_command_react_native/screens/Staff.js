@@ -417,14 +417,17 @@ export default class Staff extends Component {
     /** Command: the record was written. Drop the form, clear the ticks, and
      *  reload — a demerit can move a score, so the tree is now stale.
      *
-     *  Attachments are filed after the record commits, so they can fail on
-     *  their own. The record still stands; the alert says what did not make it
-     *  rather than letting the user assume the photos are there. */
-    onIssued = (action, count, attachmentErrors) => {
+     *  Attachments are filed, and the memo is mirrored to the myMK app inbox,
+     *  after the record commits — so either can fail on its own. The record
+     *  still stands; the alert says what did not make it rather than letting
+     *  the user assume the photos are there or the app was notified. */
+    onIssued = (action, count, notices) => {
         const label = action === 'memo' ? 'Memo' : action === 'merit' ? 'Merit' : 'Demerit';
-        const failures = attachmentErrors || [];
+        const failures = (notices && notices.attachments) || [];
+        const mirror = (notices && notices.mirror) || null;
         const detail = 'Sent to ' + count + ' staff.'
-            + (failures.length ? '\n\nAttachments not saved:\n' + failures.join('\n') : '');
+            + (failures.length ? '\n\nAttachments not saved:\n' + failures.join('\n') : '')
+            + (mirror ? '\n\n' + mirror : '');
 
         this.setState({ issueOpen: false, issueAction: null, checked: {} }, () => {
             Alert.alert(label + ' issued', detail);

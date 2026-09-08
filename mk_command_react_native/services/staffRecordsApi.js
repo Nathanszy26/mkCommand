@@ -172,9 +172,14 @@ export async function fetchAllStaff(user) {
 }
 
 // Creates ONE staff_memo row addressed to every recipient (web stores CSV ids).
-// issue: { to_ids[], cc_ids[], ref, from, subject, content }
+// issue: { to_ids[], cc_ids[], ref, subject, content }
+// From is NOT sent: the server writes staff_memo_from and
+// staff_memo_from_staff_id from the session it resolves itself.
 // attachments: optional [{ uri, name, type }]
-// Returns { id, recipients, attachments: { saved, errors[] } }.
+// The server also mirrors the memo into the myMK app inbox; that is best-effort
+// and reported separately, never a reason for the call to fail.
+// Returns { id, recipients, attachments: { saved, errors[] },
+//           mirror: { sent, skipped[], error } }.
 export function submitMemo(user, issue, attachments) {
     return postIssue('memo', user, issue, attachments);
 }

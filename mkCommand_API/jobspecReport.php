@@ -271,19 +271,21 @@ class ApprovalReportRepository
         return $this->run($sql, array(':v' => (int)$versionId));
     }
 
-    /** Query: companies present in the data, for the filter.
-     *  Driven from job_spec_version, not subsidiaries, so a comp_id with no
-     *  subsidiaries row still appears. display_name is not reliably populated,
-     *  hence the fallback chain down to a plain id label. */
+    /** Query: companies for the filter — the live, weekly-reporting group only
+     *  (subsidiaries.status / weekly_report_status). Driven from subsidiaries
+     *  rather than job_spec_version so a company in the group with no specs yet
+     *  is still selectable, and one outside the group is never offered.
+     *  `name` is the label; code and an id label are the fallbacks, since name
+     *  is NOT NULL but may still be blank. */
     public function companies()
     {
-        $sql = "SELECT c.comp_id,
-                       COALESCE(NULLIF(TRIM(s.display_name), ''),
-                                NULLIF(TRIM(s.name), ''),
+        $sql = "SELECT s.id AS comp_id,
+                       COALESCE(NULLIF(TRIM(s.name), ''),
                                 NULLIF(TRIM(s.code), ''),
-                                CONCAT('Company ', c.comp_id)) AS display_name
-                FROM (SELECT DISTINCT comp_id FROM mkPortal.job_spec_version) c
-                LEFT JOIN staff_portal2.subsidiaries s ON s.id = c.comp_id
+                                CONCAT('Company ', s.id)) AS display_name
+                FROM staff_portal2.subsidiaries s
+                WHERE s.status = '1'
+                  AND s.weekly_report_status = 1
                 ORDER BY display_name";
         return $this->run($sql, array());
     }

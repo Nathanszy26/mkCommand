@@ -70,11 +70,44 @@ const titleCase = (value) =>
 
 const pad = (n) => (n < 10 ? '0' + n : String(n));
 
-// Matches IssueRepository::RECORD_DATE_FORMAT — display only; the server stamps
-// the value that is actually stored.
-const todayLabel = () => {
+// Mirrors IssueRepository::MEMO_DATE_FORMAT (d/m/Y) and
+// PERFORMANCE_DATE_FORMAT (Y/m/d) — display only; the server stamps the value
+// that is actually stored. The two columns differ, so the label has to as well:
+// showing one format and storing the other is how the old m/d/Y label read as a
+// different day the moment the record appeared in the list.
+const todayLabel = (action) => {
     const d = new Date();
-    return pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + '/' + d.getFullYear();
+    const day = pad(d.getDate());
+    const month = pad(d.getMonth() + 1);
+    const year = d.getFullYear();
+    return action === 'memo'
+        ? day + '/' + month + '/' + year
+        : year + '/' + month + '/' + day;
+};
+
+/**
+ * The one line worth telling the issuer about the myMK inbox mirror, or null
+ * when there is nothing to say. Absent on merit/demerit, which are not mirrored.
+ *
+ * A failed mirror is not a failed memo — the record stands and the server logs
+ * it for a retry — so this reads as a note, not an error.
+ */
+const mirrorNotice = (mirror) => {
+    if (!mirror) {
+        return null;
+    }
+    // Only present while MK_ISSUE_DEBUG_ERRORS is on server-side.
+    if (mirror.log_error) {
+        return 'Mirror not logged: ' + mirror.log_error;
+    }
+    if (!mirror.sent) {
+        return 'Not shown in the myMK app inbox yet. The memo is saved and will be retried.'
+            + (mirror.error ? '\n(' + mirror.error + ')' : '');
+    }
+    const skipped = mirror.skipped || [];
+    return skipped.length
+        ? 'In the myMK app inbox. These attachments cannot be shown there: ' + skipped.join(', ') + '.'
+        : null;
 };
 
 const MAX_ATTACHMENTS = 5;   // matches $no_of_attachments on both web forms
@@ -91,6 +124,25 @@ const ALLOWED_EXT = [
 const extensionOf = (name) => {
     const parts = String(name || '').split('.');
     return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : '';
+};
+
+/**
+ * A picked name can arrive percent-encoded — an Android SAF uri segment
+ * standing in for a display name, or a file a browser saved. Decode it so the
+ * attachment row, and the name posted to the server, read the way the file is
+ * actually called. A stray '%' that is not a valid escape is left as it was
+ * rather than throwing.
+ *
+ * The server decodes too (AttachmentStore::displayName), which is the
+ * authority; this is so the issuer sees the real name before submitting.
+ * Decoding an already-plain name is a no-op, so the two never fight.
+ */
+const decodeName = (name) => {
+    try {
+        return decodeURIComponent(name);
+    } catch (e) {
+        return name;
+    }
 };
 
 const ACTION_META = {
@@ -294,9 +346,6 @@ export default class IssueActionModal extends Component {
 
             // memo
             ref: '',
-            // A missing session must surface as the submit error postIssue
-            // raises, not as a crash in the constructor.
-            from: titleCase((props.user && props.user.fullname) || ''),
             subject: '',
             content: '',
             ccIds: [],
@@ -349,6 +398,16 @@ export default class IssueActionModal extends Component {
 
     /* --- derived (queries) ------------------------------------------------- */
 
+    /**
+     * Query: the sender shown on the memo. Display only — the server writes
+     * both staff_memo_from and staff_memo_from_staff_id from the session it
+     * resolves itself, so this field cannot be typed over.
+     */
+    senderName() {
+        const { user } = this.props;
+        return titleCase((user && user.fullname) || '') || 'Your account';
+    }
+
     /** Only staff with a real users.id can receive a record; GW have none. */
     recipients() {
         return this.props.staff.filter((s) => s.id);
@@ -392,13 +451,12 @@ export default class IssueActionModal extends Component {
     /** Query: first validation failure, or null when the form is submittable. */
     validate() {
         const { action } = this.props;
-        const { from, subject, content, ref, title, points } = this.state;
+        const { subject, content, ref, title, points } = this.state;
 
         if (this.recipients().length === 0) {
             return 'None of the selected staff can receive this record.';
         }
         if (action === 'memo') {
-            if (!from.trim()) return 'From is required.';
             if (!subject.trim()) return 'Subject is required.';
             if (!content.trim()) return 'Content is required.';
             return null;
@@ -434,7 +492,7 @@ export default class IssueActionModal extends Component {
             const rejected = [];
 
             results.slice(0, remaining).forEach((file, i) => {
-                const name = file.name || 'attachment_' + (Date.now() + i);
+                const name = decodeName(file.name || 'attachment_' + (Date.now() + i));
                 const ext = extensionOf(name);
 
                 if (ALLOWED_EXT.indexOf(ext) === -1) {
@@ -543,7 +601,6 @@ export default class IssueActionModal extends Component {
                     to_ids: toIds,
                     cc_ids: this.state.ccIds,
                     ref: this.state.ref.trim(),
-                    from: this.state.from.trim(),
                     subject: this.state.subject.trim(),
                     content: this.state.content.trim(),
                 }, attachments);
@@ -558,11 +615,13 @@ export default class IssueActionModal extends Component {
                 }, attachments);
             }
 
-            // The record is committed by this point; attachments are best-effort
-            // and report their own failures. Say so instead of pretending the
-            // whole submit succeeded.
-            const failures = (result.attachments && result.attachments.errors) || [];
-            onDone(action, toIds.length, failures);
+            // The record is committed by this point; attachments and the app-inbox
+            // mirror are both best-effort and report their own failures. Say so
+            // instead of pretending the whole submit succeeded.
+            onDone(action, toIds.length, {
+                attachments: (result.attachments && result.attachments.errors) || [],
+                mirror: mirrorNotice(result.mirror),
+            });
         } catch (e) {
             this.setState({ submitting: false, error: e.message });
         }
@@ -585,14 +644,8 @@ export default class IssueActionModal extends Component {
                     />
                 </Field>
 
-                <Field label="From" required>
-                    <TextInput
-                        style={styles.input}
-                        value={this.state.from}
-                        onChangeText={(from) => this.setState({ from })}
-                        placeholder="Sender name"
-                        placeholderTextColor={C.faint}
-                    />
+                <Field label="From" required hint="Your account name, recorded with the memo.">
+                    <ReadOnly value={this.senderName()} />
                 </Field>
 
                 <Field label="CC" hint="Any staff member can be CC'd. Tap to search by name.">
@@ -805,7 +858,7 @@ export default class IssueActionModal extends Component {
                             </Field>
 
                             <Field label="Date" required hint="Stamped by the server when you submit.">
-                                <ReadOnly value={todayLabel()} />
+                                <ReadOnly value={todayLabel(action)} />
                             </Field>
 
                             {action === 'memo' ? this.renderMemoFields() : this.renderPerformanceFields()}

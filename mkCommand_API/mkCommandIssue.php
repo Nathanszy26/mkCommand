@@ -9,7 +9,9 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  * IN  action=types        person, comp_id
  *     action=staff        person, comp_id
- *     action=memo         person, comp_id, to_ids, cc_ids?, from, subject, content, ref?
+ *     action=memo         person, comp_id, to_ids, cc_ids?, subject, content, ref?
+ *                         (From is the caller — name and id both come from the
+ *                          resolved issuer row, never from the request.)
  *     action=performance  person, comp_id, to_ids, ref, title,
  *                         merit_demerit (Merit|Demerit), type_id?, points?
  *
@@ -21,6 +23,11 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  * OUT { success:true, ..., attachments:{ saved, errors[] } }
  *   | { success:false, message }
+ *
+ * A memo is additionally mirrored into the myMK app inbox (MemoMirrorClient)
+ * and the outcome recorded in staff_memo_mirror, so a memo the mirror missed
+ * can be found and re-posted later. The mirror never blocks the record:
+ *   { success:true, ..., mirror:{ sent, skipped[], error } }
  */
 
 /**
@@ -320,12 +327,21 @@ class PerformanceTypeRepository
 class IssueRepository
 {
     /**
-     * Confirmed against the live column: staff_performance_date holds Y/m/d
-     * (e.g. 2026/07/31), the same convention as staff_*_uploaded_date and as
-     * the STR_TO_DATE('%Y/%m/%d') calls in staffHierarchy.php. A mixed-format
-     * column breaks ORDER BY and the listing pages, so this must not drift.
+     * Two columns, two conventions — one shared constant would be a lie.
+     *
+     * staff_memo_date        d/m/Y  (08/05/2024 = 8 May 2024)
+     * staff_performance_date Y/m/d  (2026/07/31) — must stay year-first:
+     *   staffRecords.php filters it with `LIKE '<year>%'` and staffHierarchy.php
+     *   parses it with STR_TO_DATE('%Y/%m/%d'). Changing it breaks both.
+     *
+     * The *_uploaded_date audit stamps are Y/m/d on both and are unaffected.
+     *
+     * staff_memo_upload.php writes the same memo column from the web and must
+     * use d/m/Y too — a column carrying both conventions is unreadable, since
+     * 05/08 and 08/05 are different days with nothing to tell them apart.
      */
-    const RECORD_DATE_FORMAT = "Y/m/d";
+    const MEMO_DATE_FORMAT        = "d/m/Y";
+    const PERFORMANCE_DATE_FORMAT = "Y/m/d";
 
     private $db;
 
@@ -338,18 +354,20 @@ class IssueRepository
     public function createMemo(array $memo)
     {
         $sql = "INSERT INTO " . DatabaseConfig::STAFF_PROFILE . ".staff_memo
-                    (staff_memo_ref, staff_memo_date, staff_memo_to_staff_id, staff_memo_from,
+                    (staff_memo_ref, staff_memo_date, staff_memo_to_staff_id,
+                     staff_memo_from, staff_memo_from_staff_id,
                      staff_memo_cc_staff_id, staff_memo_subject, staff_memo_content,
                      staff_memo_uploaded_by, staff_memo_uploaded_date, staff_memo_uploaded_time)
-                VALUES (:ref, :date, :to_ids, :from, :cc_ids, :subject, :content,
+                VALUES (:ref, :date, :to_ids, :from, :from_id, :cc_ids, :subject, :content,
                         :uploaded_by, :uploaded_date, :uploaded_time)";
 
         $stmt = $this->db->prepare($sql);
         $stmt->execute(array(
             ':ref'           => $memo['ref'],
-            ':date'          => date(self::RECORD_DATE_FORMAT),
+            ':date'          => date(self::MEMO_DATE_FORMAT),
             ':to_ids'        => $memo['to_ids'],
             ':from'          => $memo['from'],
+            ':from_id'       => $memo['from_id'],
             ':cc_ids'        => $memo['cc_ids'],
             ':subject'       => $memo['subject'],
             ':content'       => $memo['content'],
@@ -380,7 +398,7 @@ class IssueRepository
                 VALUES (:ref, :date, :staff_id, :type_id, :title, :merit_demerit, :points,
                         :uploaded_by, :uploaded_date, :uploaded_time)";
 
-        $date         = date(self::RECORD_DATE_FORMAT);
+        $date         = date(self::PERFORMANCE_DATE_FORMAT);
         $uploadedDate = date("Y/m/d");
         $uploadedTime = date("H:i:s");
 
@@ -519,6 +537,23 @@ class AttachmentStore
         return preg_replace('/[^a-z0-9]/', '', $ext);
     }
 
+    /**
+     * Query: the name to store as original_filename — the one a recipient reads.
+     *
+     * Picked files can arrive percent-encoded: an Android SAF uri segment
+     * standing in for a display name, or a file a browser saved. Left alone,
+     * "Kaunter%20KWSP.pdf" is what lands in the app inbox.
+     *
+     * Decode BEFORE basename, not after: "..%2Fetc%2Fpasswd" only reveals its
+     * separators once decoded, and basename has to be the last word. rawurldecode
+     * rather than urldecode, so a real '+' in a filename survives. Decoding a
+     * plain name is a no-op, so this is safe whatever the client sent.
+     */
+    private static function displayName($originalName)
+    {
+        return basename(rawurldecode((string)$originalName));
+    }
+
     private static function reject(array $file)
     {
         $ext = self::extensionOf($file['name']);
@@ -607,7 +642,7 @@ class AttachmentStore
         );
         $insert->execute(array(
             ':record_id' => $recordId,
-            ':original'  => basename($originalName),
+            ':original'  => self::displayName($originalName),
         ));
 
         $attachmentId = (int)$this->db->lastInsertId();
@@ -619,6 +654,162 @@ class AttachmentStore
         $update->execute(array(':filename' => $filename, ':id' => $attachmentId));
 
         return $c['dir'] . '/' . $filename;
+    }
+}
+
+/**
+ * Posts a committed memo id to the myMK inbox mirror.
+ *
+ * The whole contract is the id — subject, body, recipients and attachments are
+ * all read from the memo row on the other side. Pure network: it holds no PDO
+ * and writes nothing, so MemoMirrorLog can record whatever comes back.
+ *
+ * The endpoint has no token and only accepts 127.0.0.1; hq maps
+ * dashboard.mkgroup.my to loopback in /etc/hosts so the URL, vhost and
+ * certificate all stay correct while the connection never leaves the box.
+ * A 403 means that hosts entry is missing — the error text says so, because
+ * that is the one failure a reader of the log will not otherwise guess.
+ */
+class MemoMirrorClient
+{
+    const URL             = 'https://dashboard.mkgroup.my/sportal-memo.php';
+    const TIMEOUT         = 10;
+    const CONNECT_TIMEOUT = 5;
+
+    /** Longest response we keep for diagnosis. The column is TEXT; be sane. */
+    const MAX_LOG_BYTES = 1000;
+
+    /**
+     * Query: POST the id and normalise the outcome. Never throws — the memo is
+     * already committed by the time this runs, and a mirror that is down must
+     * not cost the user the record they just wrote.
+     *
+     * Returns { ok, http, error, body[], raw }.
+     */
+    public static function post($memoId)
+    {
+        if (!function_exists('curl_init')) {
+            return self::outcome(false, 0, 'curl is not available on this server', null, '');
+        }
+
+        $ch = curl_init(self::URL);
+        curl_setopt_array($ch, array(
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => array('memo_id' => $memoId),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => self::TIMEOUT,
+            CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT,
+        ));
+
+        $raw      = curl_exec($ch);
+        $curlErr  = curl_error($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($raw === false) {
+            return self::outcome(false, $httpCode, 'could not reach the mirror: ' . $curlErr, null, '');
+        }
+
+        $body = json_decode($raw, true);
+
+        if ($httpCode === 403) {
+            return self::outcome(false, 403, 'mirror refused the call as non-local — check the /etc/hosts entry for dashboard.mkgroup.my', $body, $raw);
+        }
+        if ($httpCode !== 200 || !is_array($body) || empty($body['success'])) {
+            $message = (is_array($body) && isset($body['message']))
+                ? $body['message']
+                : 'mirror returned HTTP ' . $httpCode;
+            return self::outcome(false, $httpCode, $message, $body, $raw);
+        }
+
+        return self::outcome(true, 200, null, $body, $raw);
+    }
+
+    private static function outcome($ok, $http, $error, $body, $raw)
+    {
+        return array(
+            'ok'    => (bool)$ok,
+            'http'  => (int)$http,
+            'error' => $error,
+            'body'  => is_array($body) ? $body : array(),
+            'raw'   => substr((string)$raw, 0, self::MAX_LOG_BYTES),
+        );
+    }
+}
+
+/**
+ * One row per memo recording whether the mirror took it.
+ *
+ * UNIQUE on staff_memo_id, so a retry updates the row and bumps the attempt
+ * count rather than piling up history — the question this table exists to
+ * answer is "which memos are still not in the app inbox", and that is a scan
+ * for status <> 'sent'. The mirror itself is idempotent (`already_sent`), so
+ * re-posting a memo id is always safe.
+ */
+class MemoMirrorLog
+{
+    private $db;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    /**
+     * Command: write the outcome.
+     *
+     * Returns null on success, or the failure text — same report-back shape as
+     * AttachmentStore::saveAll(). It still never throws: a log that cannot be
+     * written must not undo a memo that was. But it does not hide either, or a
+     * missing GRANT looks identical to a mirror that was never called.
+     */
+    public function record($memoId, array $outcome)
+    {
+        $body = $outcome['body'];
+
+        $sql = "INSERT INTO " . DatabaseConfig::STAFF_PROFILE . ".staff_memo_mirror
+                    (staff_memo_id, staff_memo_mirror_status, staff_memo_mirror_attempts,
+                     staff_memo_mirror_http_code, staff_memo_mirror_job_id,
+                     staff_memo_mirror_recipients, staff_memo_mirror_already_sent,
+                     staff_memo_mirror_response,
+                     staff_memo_mirror_created_date, staff_memo_mirror_created_time,
+                     staff_memo_mirror_updated_date, staff_memo_mirror_updated_time)
+                VALUES (:memo_id, :status, 1, :http_code, :job_id, :recipients, :already_sent,
+                        :response, :created_date, :created_time, :updated_date, :updated_time)
+                ON DUPLICATE KEY UPDATE
+                    staff_memo_mirror_status       = VALUES(staff_memo_mirror_status),
+                    staff_memo_mirror_attempts     = staff_memo_mirror_attempts + 1,
+                    staff_memo_mirror_http_code    = VALUES(staff_memo_mirror_http_code),
+                    staff_memo_mirror_job_id       = VALUES(staff_memo_mirror_job_id),
+                    staff_memo_mirror_recipients   = VALUES(staff_memo_mirror_recipients),
+                    staff_memo_mirror_already_sent = VALUES(staff_memo_mirror_already_sent),
+                    staff_memo_mirror_response     = VALUES(staff_memo_mirror_response),
+                    staff_memo_mirror_updated_date = VALUES(staff_memo_mirror_updated_date),
+                    staff_memo_mirror_updated_time = VALUES(staff_memo_mirror_updated_time)";
+
+        $now  = date('Y/m/d');
+        $time = date('H:i:s');
+
+        try {
+            $stmt = $this->db->prepare($sql);
+            $stmt->execute(array(
+                ':memo_id'      => (int)$memoId,
+                ':status'       => $outcome['ok'] ? 'sent' : 'failed',
+                ':http_code'    => $outcome['http'],
+                ':job_id'       => isset($body['job_id']) ? (string)$body['job_id'] : null,
+                ':recipients'   => isset($body['recipients']) ? (int)$body['recipients'] : null,
+                ':already_sent' => !empty($body['already_sent']) ? '1' : '0',
+                ':response'     => $outcome['ok'] ? $outcome['raw'] : (string)$outcome['error'],
+                ':created_date' => $now,
+                ':created_time' => $time,
+                ':updated_date' => $now,
+                ':updated_time' => $time,
+            ));
+            return null;
+        } catch (Exception $e) {
+            error_log('mkCommandIssue mirror log failed: ' . $e->getMessage());
+            return $e->getMessage();
+        }
     }
 }
 
@@ -733,12 +924,11 @@ try {
     $repo = new IssueRepository($db);
 
     if ($action === 'memo') {
-        $from    = input('from');
         $subject = input('subject');
         $content = input('content');
 
-        if ($from === null || $subject === null || $content === null) {
-            fail('From, Subject and Content are all required');
+        if ($subject === null || $content === null) {
+            fail('Subject and Content are both required');
         }
 
         // CC spans the whole addressable directory, exactly like the web form —
@@ -749,11 +939,16 @@ try {
             fail('One of the CC recipients is not an addressable staff member', 400);
         }
 
+        // From is the issuer, taken from the row findStaff() already resolved —
+        // never from the request. A posted `from` is ignored: the sender's name
+        // is not the client's to assert, and the id has to agree with the name
+        // or the two columns can disagree about who wrote the memo.
         $memoId = $repo->createMemo(array(
             'ref'         => (string)input('ref', ''),
             'to_ids'      => implode(',', $toIds),
             'cc_ids'      => implode(',', $ccIds),
-            'from'        => $from,
+            'from'        => $issuer['fullname'],
+            'from_id'     => (string)$issuer['id'],
             'subject'     => $subject,
             'content'     => $content,
             'uploaded_by' => $issuer['id'],
@@ -763,6 +958,12 @@ try {
         $posted   = AttachmentStore::posted();
         $attached = AttachmentStore::forMemo($db)->saveAll(array($memoId), $posted['files']);
 
+        // Mirror LAST: the attachments have to be on disk before the app is told
+        // to go and fetch them, since the mirror links to the staff portal's own
+        // attachment folder rather than copying the files.
+        $mirror    = MemoMirrorClient::post($memoId);
+        $logFailed = (new MemoMirrorLog($db))->record($memoId, $mirror);
+
         respond(array(
             'success'     => true,
             'id'          => $memoId,
@@ -770,6 +971,21 @@ try {
             'attachments' => array(
                 'saved'  => $attached['saved'],
                 'errors' => array_merge($posted['errors'], $attached['errors']),
+            ),
+            'mirror'      => array(
+                'sent'       => $mirror['ok'],
+                // Word/Excel are on the memo but cannot be rendered in the app,
+                // so the issuer is told rather than left to assume otherwise.
+                'skipped'    => isset($mirror['body']['skipped_attachments'])
+                    ? $mirror['body']['skipped_attachments']
+                    : array(),
+                'error'      => $mirror['error'],
+                // Only while debugging: an unwritable log is a deployment fault
+                // (missing table, wrong schema, missing GRANT), not something
+                // the issuer can act on. It leaks schema names, same as the
+                // catch-all below, and goes when MK_ISSUE_DEBUG_ERRORS does.
+                'log_error'  => MK_ISSUE_DEBUG_ERRORS ? $logFailed : null,
+                'http'       => MK_ISSUE_DEBUG_ERRORS ? $mirror['http'] : null,
             ),
         ));
     }
