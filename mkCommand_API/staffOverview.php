@@ -41,7 +41,9 @@
  * Read-only. Every query in this file is a SELECT.
  *
  * Query string:
- *   comp_id  int     restrict the directory to one company (default: all granted)
+ *   comp_id  int     restrict the directory to one company. Absent means the
+ *                    VIEWER'S OWN company, which is what the page opens on;
+ *                    'all' is the explicit every-granted-company opt-out.
  *   q        string  search name / login / department / position
  *   sort     string  name | pending | demerits | memos
  *   person   string  open one staff's detail page — with scomp, below
@@ -349,31 +351,65 @@ class DirectoryRepository extends Repository
         return $this->run($sql, $args);
     }
 
-    /** Query: job spec counts per staff, keyed 'person|comp_id'. */
-    public function jobSpecCounts(array $compIds, $isGw = 0)
+    /**
+     * Query: each staff member's CURRENT job spec, keyed 'person|comp_id'.
+     *
+     * The newest version, not a tally of every version. A count answered a
+     * question nobody asks — "1 pending" stays true of somebody whose spec was
+     * approved months ago and superseded twice since — while what the column is
+     * read for is where this person's spec stands today.
+     *
+     * Newest is MAX(v.id), the same ordering versions() gives the detail page,
+     * so the directory row and the staff's own page can never name a different
+     * version as the current one.
+     *
+     * Two round-trips rather than one: the task count has to come from a JOIN on
+     * job_spec_version_item, and joining it before the GROUP BY would count
+     * items across every version the staff member has. The second query is an
+     * IN() on a handful of primary keys.
+     *
+     * Returns ['person|comp' => ['status' => string|null, 'items' => int]].
+     */
+    public function latestJobSpecs(array $compIds, $isGw = 0)
     {
         $rows = $this->run(
-            "SELECT v.person, v.comp_id,
-                    SUM(v.status = 'pending')  AS pending,
-                    SUM(v.status = 'approved') AS approved,
-                    SUM(v.status = 'rejected') AS rejected,
-                    MAX(v.submitted_at)        AS last_submitted
+            "SELECT v.person, v.comp_id, MAX(v.id) AS latest_id
              FROM mkPortal.job_spec_version v
              WHERE IFNULL(v.is_gw, 0) = " . ((int)$isGw ? 1 : 0) . "
                AND v.comp_id IN (" . self::intList($compIds) . ")
              GROUP BY v.person, v.comp_id"
         );
+        if (empty($rows)) { return array(); }
+
+        $ids = array();
+        foreach ($rows as $r) { $ids[] = (int)$r['latest_id']; }
+
+        $summaries = array();
+        foreach ($this->run(
+            "SELECT v.id, v.status, COUNT(i.id) AS items
+             FROM mkPortal.job_spec_version v
+             LEFT JOIN mkPortal.job_spec_version_item i ON i.version_id = v.id
+             WHERE v.id IN (" . self::intList($ids) . ")
+             GROUP BY v.id, v.status"
+        ) as $r) {
+            $summaries[(int)$r['id']] = array(
+                'status' => (string)$r['status'],
+                'items'  => (int)$r['items'],
+            );
+        }
+
         $out = array();
         foreach ($rows as $r) {
-            $out[$r['person'] . '|' . (int)$r['comp_id']] = array(
-                'pending'        => (int)$r['pending'],
-                'approved'       => (int)$r['approved'],
-                'rejected'       => (int)$r['rejected'],
-                'last_submitted' => $r['last_submitted'],
-            );
+            $id  = (int)$r['latest_id'];
+            $out[$r['person'] . '|' . (int)$r['comp_id']] = isset($summaries[$id])
+                ? $summaries[$id]
+                : self::NO_JOB_SPEC;
         }
         return $out;
     }
+
+    /** What a staff member with no job spec row at all reads as. */
+    const NO_JOB_SPEC = array('status' => null, 'items' => 0);
 
     /**
      * Query: which applications each staff is attached to.
@@ -1561,6 +1597,52 @@ function absoluteBase()
 /* Shared by the full page and by the AJAX responses, so each block of markup
  * has exactly one definition and the JS never rebuilds it. */
 
+/**
+ * Command: echo the Job Spec cell — the state of the staff member's current
+ * (newest) version.
+ *
+ * The task count rides along on an approved spec only: on an approved document
+ * it is the one number that says whether the thing HR signed off is a real
+ * spec or a stub, while on a pending one it is a detail of a draft that has not
+ * been agreed to yet.
+ *
+ * The status doubles as the pill class, exactly as the detail page's version
+ * table does it, so the three states are coloured from one set of rules.
+ */
+function renderJobSpecCell(array $spec)
+{
+    $status = isset($spec['status']) ? trim((string)$spec['status']) : '';
+    if ($status === '') {
+        echo '<span class="muted">none</span>';
+        return;
+    }
+
+    $label = ucfirst($status);
+    if ($status === 'approved') {
+        $label .= ' - ' . (int)$spec['items'];
+    }
+    echo '<span class="pill ' . h($status) . '">' . h($label) . '</span>';
+}
+
+/**
+ * Command: echo one merit/demerit tally as a pill.
+ *
+ * Zero is printed rather than left out. Both counts are meaningful for every
+ * staff member — "0 demerit" is a fact about them, not an absence of one — and
+ * a cell that renders only what is non-zero makes the reader work out which of
+ * the two a lone pill is before they can read it.
+ *
+ * A zero takes the neutral style instead of the green or red one: down 300 rows
+ * a column of coloured pills is a column of noise, and colour has to keep
+ * meaning "this person has a record".
+ */
+function renderTally($count, $kind)
+{
+    $count = (int)$count;
+    echo '<span class="pill ' . ($count ? $kind : 'off') . '">'
+       . $count . ' ' . $kind . '</span> ';
+}
+
 /** Command: echo one job spec version's tasks, inline beneath its row. */
 function renderTasks(array $rows, $span)
 {
@@ -1859,11 +1941,32 @@ if ($scope === null || empty($companies)) {
 
 $grantedIds = $scope->compIds();
 
-// A comp_id in the query string only ever narrows the grant; anything outside it
-// falls back to the whole grant rather than being honoured.
-$compId = null;
-if (ctype_digit(param('comp_id')) && $scope->coversCompany(param('comp_id'))) {
-    $compId = (int)param('comp_id');
+/**
+ * Which company the directory is filtered to. null means every granted company.
+ *
+ * The default is the viewer's OWN company: an admin over seven subsidiaries
+ * opens on the several hundred people they actually work with rather than on
+ * two thousand rows they have to filter down before the page is of any use.
+ *
+ * 'all' is the explicit opt-out, spelled out for the same reason the year
+ * parameter spells it out: the empty string cannot mean "all companies" here,
+ * because selfUrl() drops empty parameters and the <select> submits an empty
+ * value — so an empty comp_id would come back as "absent", fall through to this
+ * default, and the option could never be chosen at all.
+ *
+ * A comp_id outside the grant is not honoured; nor is the viewer's own company
+ * when the grant does not cover it (a grant may name other subsidiaries and not
+ * the grantee's own). Either falls back to the whole grant.
+ */
+$compParam = param('comp_id');
+if ($compParam === 'all') {
+    $compId = null;
+} elseif (ctype_digit($compParam) && $scope->coversCompany($compParam)) {
+    $compId = (int)$compParam;
+} elseif ($scope->coversCompany($viewerCompId)) {
+    $compId = $viewerCompId;
+} else {
+    $compId = null;
 }
 $activeCompIds = ($compId === null) ? $grantedIds : array($compId);
 
@@ -2051,7 +2154,7 @@ try {
         $dir    = new DirectoryRepository(Db::get());
         $people = $dir->staff($activeCompIds, $search);
 
-        $specs  = $scope->sees('jobspec') ? $dir->jobSpecCounts($activeCompIds) : array();
+        $specs  = $scope->sees('jobspec') ? $dir->latestJobSpecs($activeCompIds) : array();
         $appN   = $scope->sees('app')     ? $dir->appCounts($activeCompIds)
                                       : array('personal' => array(), 'company' => array());
         $memoN  = $scope->sees('memo')    ? $dir->memoCounts()                  : array('per' => array(), 'broadcast' => 0);
@@ -2066,7 +2169,7 @@ try {
 
             $people[$i]['spec'] = isset($specs[$key])
                 ? $specs[$key]
-                : array('pending' => 0, 'approved' => 0, 'rejected' => 0, 'last_submitted' => null);
+                : DirectoryRepository::NO_JOB_SPEC;
             // Personal assignments unioned with the company-wide ones, so an app
             // held both ways counts once.
             $mine = isset($appN['personal'][$key]) ? $appN['personal'][$key] : array();
@@ -2091,14 +2194,14 @@ try {
             $gwPeople = (new GwRepository(Db::get()))->directory(
                 array(GwRepository::COMP_ID), $search);
             $gwSpecs = $scope->sees('jobspec')
-                ? $dir->jobSpecCounts(array(GwRepository::COMP_ID), 1)
+                ? $dir->latestJobSpecs(array(GwRepository::COMP_ID), 1)
                 : array();
         }
         foreach ($gwPeople as $i => $g) {
             $key = $g['person'] . '|' . (int)$g['comp_id'];
             $gwPeople[$i]['spec'] = isset($gwSpecs[$key])
                 ? $gwSpecs[$key]
-                : array('pending' => 0, 'approved' => 0, 'rejected' => 0, 'last_submitted' => null);
+                : DirectoryRepository::NO_JOB_SPEC;
         }
 
         // Sorted here rather than in SQL: three of the four keys are assembled in
@@ -2106,7 +2209,15 @@ try {
         // the directory can never sort by a column it did not build.
         if ($sort !== 'name') {
             $bySort = function ($a, $b) use ($sort) {
-                if ($sort === 'pending') { $d = $b['spec']['pending'] - $a['spec']['pending']; }
+                // Sorts on what the column now shows: whose CURRENT spec is
+                // waiting on somebody. A tally of historic pending versions
+                // would order the list by a number that is no longer on screen.
+                if ($sort === 'pending') {
+                    $isPending = function ($row) {
+                        return (isset($row['spec']['status']) && $row['spec']['status'] === 'pending') ? 1 : 0;
+                    };
+                    $d = $isPending($b) - $isPending($a);
+                }
                 elseif ($sort === 'demerits') {
                     // GW carry no merit record at all, so the key may be absent.
                     $d = (isset($b['demerits']) ? $b['demerits'] : 0)
@@ -2617,7 +2728,12 @@ foreach ($performance as $p) {
                       changing the year does not silently drop the company
                       filter, the search or the sort on the way back out. */ ?>
             <?php foreach (array('person' => $staff['person'], 'scomp' => (int)$staff['comp_id'],
-                                 'comp_id' => $compId, 'q' => $search, 'sort' => $sort) as $k => $v): ?>
+                                 // 'all' rather than null: an absent comp_id now
+                                 // means "the viewer's own company", so dropping
+                                 // it here would quietly re-filter the directory
+                                 // on the way back out.
+                                 'comp_id' => ($compId === null ? 'all' : $compId),
+                                 'q' => $search, 'sort' => $sort) as $k => $v): ?>
                 <?php if ($v !== null && $v !== '') : ?>
                     <input type="hidden" name="<?php echo h($k); ?>" value="<?php echo h($v); ?>">
                 <?php endif; ?>
@@ -2704,7 +2820,7 @@ foreach ($performance as $p) {
         <form method="get" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
             <?php if (count($companies) > 1): ?>
                 <select name="comp_id" onchange="this.form.submit()">
-                    <option value="">All my companies</option>
+                    <option value="all" <?php echo ($compId === null ? 'selected' : ''); ?>>All my companies</option>
                     <?php foreach ($companies as $id => $name): ?>
                         <option value="<?php echo (int)$id; ?>" <?php echo ($compId === (int)$id ? 'selected' : ''); ?>>
                             <?php echo h($name); ?>
@@ -2796,20 +2912,7 @@ foreach ($performance as $p) {
                         <td class="muted"><?php echo h($p['company_name']); ?></td>
                     <?php endif; ?>
                     <?php if ($scope->sees('jobspec')): ?>
-                        <td>
-                            <?php if ((int)$p['spec']['pending']): ?>
-                                <span class="pill pending"><?php echo (int)$p['spec']['pending']; ?> pending</span>
-                            <?php endif; ?>
-                            <?php if ((int)$p['spec']['approved']): ?>
-                                <span class="pill approved"><?php echo (int)$p['spec']['approved']; ?> approved</span>
-                            <?php endif; ?>
-                            <?php if ((int)$p['spec']['rejected']): ?>
-                                <span class="pill rejected"><?php echo (int)$p['spec']['rejected']; ?> rejected</span>
-                            <?php endif; ?>
-                            <?php if (!$p['spec']['pending'] && !$p['spec']['approved'] && !$p['spec']['rejected']): ?>
-                                <span class="muted">none</span>
-                            <?php endif; ?>
-                        </td>
+                        <td><?php renderJobSpecCell($p['spec']); ?></td>
                     <?php endif; ?>
                     <?php if ($scope->sees('app')): ?>
                         <td class="num"><?php echo (int)$p['apps']; ?></td>
@@ -2819,15 +2922,9 @@ foreach ($performance as $p) {
                     <?php endif; ?>
                     <?php if ($scope->sees('merit')): ?>
                         <td>
-                            <?php if ((int)$p['merits']): ?>
-                                <span class="pill merit"><?php echo (int)$p['merits']; ?> merit</span>
-                            <?php endif; ?>
-                            <?php if ((int)$p['demerits']): ?>
-                                <span class="pill demerit"><?php echo (int)$p['demerits']; ?> demerit</span>
-                            <?php endif; ?>
-                            <?php if (!$p['merits'] && !$p['demerits']): ?>
-                                <span class="muted">none<?php echo $year !== '' ? ' in ' . h($year) : ''; ?></span>
-                            <?php elseif ((int)$p['net'] !== 0): ?>
+                            <?php renderTally($p['merits'], 'merit'); ?>
+                            <?php renderTally($p['demerits'], 'demerit'); ?>
+                            <?php if ((int)$p['net'] !== 0): ?>
                                 <div class="muted"><?php echo ($p['net'] > 0 ? '+' : '') . (int)$p['net']; ?> pts</div>
                             <?php endif; ?>
                         </td>
@@ -2838,8 +2935,9 @@ foreach ($performance as $p) {
 
             <?php /* General Workers, after the staff and behind their own band.
                       Their record is a job spec and nothing else — App, Memos and
-                      Merit read "n/a" rather than 0, because a zero would claim
-                      the record exists and is empty. */ ?>
+                      Merit read "—" rather than 0, because a zero would claim
+                      the record exists and is empty. The dash is the same
+                      "nothing here" this page uses everywhere else. */ ?>
             <?php if (!empty($gwPeople)): ?>
                 <tr class="grouphead">
                     <td colspan="<?php echo (int)$columns; ?>">
@@ -2869,24 +2967,11 @@ foreach ($performance as $p) {
                             <td class="muted"><?php echo h($g['company_name']); ?></td>
                         <?php endif; ?>
                         <?php if ($scope->sees('jobspec')): ?>
-                            <td>
-                                <?php if ((int)$g['spec']['pending']): ?>
-                                    <span class="pill pending"><?php echo (int)$g['spec']['pending']; ?> pending</span>
-                                <?php endif; ?>
-                                <?php if ((int)$g['spec']['approved']): ?>
-                                    <span class="pill approved"><?php echo (int)$g['spec']['approved']; ?> approved</span>
-                                <?php endif; ?>
-                                <?php if ((int)$g['spec']['rejected']): ?>
-                                    <span class="pill rejected"><?php echo (int)$g['spec']['rejected']; ?> rejected</span>
-                                <?php endif; ?>
-                                <?php if (!$g['spec']['pending'] && !$g['spec']['approved'] && !$g['spec']['rejected']): ?>
-                                    <span class="muted">none</span>
-                                <?php endif; ?>
-                            </td>
+                            <td><?php renderJobSpecCell($g['spec']); ?></td>
                         <?php endif; ?>
-                        <?php if ($scope->sees('app')): ?><td class="num muted">n/a</td><?php endif; ?>
-                        <?php if ($scope->sees('memo')): ?><td class="num muted">n/a</td><?php endif; ?>
-                        <?php if ($scope->sees('merit')): ?><td class="muted">n/a</td><?php endif; ?>
+                        <?php if ($scope->sees('app')): ?><td class="num muted">&mdash;</td><?php endif; ?>
+                        <?php if ($scope->sees('memo')): ?><td class="num muted">&mdash;</td><?php endif; ?>
+                        <?php if ($scope->sees('merit')): ?><td class="muted">&mdash;</td><?php endif; ?>
                         <td class="num"><a href="<?php echo h($gurl); ?>">View</a></td>
                     </tr>
                 <?php endforeach; ?>
