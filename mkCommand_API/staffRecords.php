@@ -19,8 +19,8 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  * Filters:
  *   memos       -> not deleted, and
- *                  id < 92  : me OR 'all' in staff_memo_to_staff_id (index.php)
- *                  id >= 92 : a live staff_memo_receivers To/CC row for me,
+ *                  id < 97  : me OR 'all' in staff_memo_to_staff_id (index.php)
+ *                  id >= 97 : a live staff_memo_receivers To/CC row for me,
  *                             'all' of my company, or 'all' of the group
  *   performance -> my records, not deleted, [date LIKE 'YEAR%']
  * Both newest-first. Recipient/staff names resolved in ONE batched lookup (no N+1).
@@ -117,11 +117,11 @@ class StaffRecordsRepository
 
     /**
      * From this memo id on, To/CC live in staff_memo_receivers and the CSV
-     * columns on staff_memo are ignored (they are blank, or stale — memo 92's
+     * columns on staff_memo are ignored (they are blank, or stale — memo 97's
      * CSV still says 'all' while its live receivers are Globinaco only).
      * Below it, the CSV columns are the only record.
      */
-    const RECEIVERS_FROM_MEMO_ID = 92;
+    const RECEIVERS_FROM_MEMO_ID = 97;
 
     /**
      * Shared by memos() and memoById(): if the two ever diverge, a memo becomes
