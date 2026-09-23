@@ -15,7 +15,8 @@ header('Content-Type: application/json; charset=UTF-8');
  *     action=performance  person, comp_id, to_ids, ref, title,
  *                         merit_demerit (Merit|Demerit), type_id?, points?
  *
- *     to_ids / cc_ids are CSV lists of users.id.
+ *     to_ids / cc_ids are CSV lists of users.id. A memo's To/CC are stored as
+ *     staff_memo_receivers rows; CC must be in the issuer's own company.
  *
  *     Optional attachments ride along as multipart files named attachment_1 ..
  *     attachment_5, exactly like the two web upload pages. Sending none is
@@ -39,6 +40,14 @@ header('Content-Type: application/json; charset=UTF-8');
  * The exception text leaks schema names and connection detail.
  */
 define('MK_ISSUE_DEBUG_ERRORS', true);
+
+/**
+ * TEMPORARY: false leaves `mirror` out of the memo response, so the app shows
+ * no "Not shown in the myMK app inbox yet" note while the mirror is returning
+ * 422. The mirror is still called and every outcome still lands in
+ * staff_memo_mirror. Set back to true once the mirror accepts memos again.
+ */
+define('MK_ISSUE_SHOW_MIRROR_NOTICE', false);
 
 class DatabaseConfig
 {
@@ -137,16 +146,27 @@ class SubordinateDirectory
                 INNER JOIN users u ON u.comp_id = s.id AND u.status = '1'
                 WHERE s.staff_memo = '1'";
 
-    /** Query: everyone the memo form may address, grouped by company code. */
-    public function addressableStaff()
+    /**
+     * Query: everyone in the caller's own company the memo form may address.
+     *
+     * CC is scoped to the issuer's company, not the whole group — a company
+     * without the staff_memo flag therefore gets an empty list, same as it
+     * would on the web form.
+     */
+    public function addressableStaff($compId)
     {
         $sql = "SELECT u.id, u.fullname, u.position, u.email, u.mobile_no,
                        s.code AS company_code
                 " . self::ADDRESSABLE_FROM . "
+                  AND u.comp_id = :comp_id
                 ORDER BY s.code, u.fullname";
 
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(':comp_id', (int)$compId, PDO::PARAM_INT);
+        $stmt->execute();
+
         $staff = array();
-        foreach ($this->db->query($sql)->fetchAll() as $row) {
+        foreach ($stmt->fetchAll() as $row) {
             $staff[] = array(
                 'id'        => (string)$row['id'],
                 'fullname'  => $row['fullname'],
@@ -160,23 +180,24 @@ class SubordinateDirectory
     }
 
     /**
-     * Query: the subset of $ids that are not addressable.
+     * Query: the subset of $ids that are not addressable within $compId.
      *
-     * Shares ADDRESSABLE_FROM with the picker on purpose — if this were stricter
-     * the form would offer people it then refuses to accept.
+     * Same WHERE as addressableStaff() on purpose — if this were stricter the
+     * form would offer people it then refuses to accept.
      */
-    public function unaddressableIds(array $ids)
+    public function unaddressableIds(array $ids, $compId)
     {
         if (empty($ids)) {
             return array();
         }
 
         $place = implode(',', array_fill(0, count($ids), '?'));
-        $sql = "SELECT u.id " . self::ADDRESSABLE_FROM . " AND u.id IN ({$place})";
+        $sql = "SELECT u.id " . self::ADDRESSABLE_FROM . " AND u.comp_id = ? AND u.id IN ({$place})";
 
         $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(1, (int)$compId, PDO::PARAM_INT);
         foreach (array_values($ids) as $i => $id) {
-            $stmt->bindValue($i + 1, (int)$id, PDO::PARAM_INT);
+            $stmt->bindValue($i + 2, (int)$id, PDO::PARAM_INT);
         }
         $stmt->execute();
 
@@ -327,20 +348,15 @@ class PerformanceTypeRepository
 class IssueRepository
 {
     /**
-     * Two columns, two conventions — one shared constant would be a lie.
+     * staff_memo_date and staff_performance_date are both Y/m/d (2026/09/23),
+     * the same as staff_memo_upload.php on the web. staff_performance_date
+     * must stay year-first: staffRecords.php filters it with `LIKE '<year>%'`
+     * and staffHierarchy.php parses it with STR_TO_DATE('%Y/%m/%d').
      *
-     * staff_memo_date        d/m/Y  (08/05/2024 = 8 May 2024)
-     * staff_performance_date Y/m/d  (2026/07/31) — must stay year-first:
-     *   staffRecords.php filters it with `LIKE '<year>%'` and staffHierarchy.php
-     *   parses it with STR_TO_DATE('%Y/%m/%d'). Changing it breaks both.
-     *
-     * The *_uploaded_date audit stamps are Y/m/d on both and are unaffected.
-     *
-     * staff_memo_upload.php writes the same memo column from the web and must
-     * use d/m/Y too — a column carrying both conventions is unreadable, since
-     * 05/08 and 08/05 are different days with nothing to tell them apart.
+     * Memos before the switch carry d/m/Y (and a few m/d/Y); readers have to
+     * tell them apart by where the 4-digit year sits.
      */
-    const MEMO_DATE_FORMAT        = "d/m/Y";
+    const MEMO_DATE_FORMAT        = "Y/m/d";
     const PERFORMANCE_DATE_FORMAT = "Y/m/d";
 
     private $db;
@@ -350,33 +366,67 @@ class IssueRepository
         $this->db = $db;
     }
 
-    /** Command: one memo row addressed to all recipients (web stores CSV ids). */
-    public function createMemo(array $memo)
+    /**
+     * Command: one memo row plus one staff_memo_receivers row per To/CC id,
+     * in one transaction — a memo with no receivers is invisible to everyone.
+     *
+     * Same shape as staff_memo_upload.php: staff_memo_to_staff_id /
+     * staff_memo_cc_staff_id are no longer written; receivers is the record.
+     * Each receiver's comp_id is taken from their users row, as the web's
+     * CheckTable() lookup does.
+     */
+    public function createMemo(array $memo, array $toIds, array $ccIds)
     {
-        $sql = "INSERT INTO " . DatabaseConfig::STAFF_PROFILE . ".staff_memo
-                    (staff_memo_ref, staff_memo_date, staff_memo_to_staff_id,
-                     staff_memo_from, staff_memo_from_staff_id,
-                     staff_memo_cc_staff_id, staff_memo_subject, staff_memo_content,
+        $memoSql = "INSERT INTO " . DatabaseConfig::STAFF_PROFILE . ".staff_memo
+                    (staff_memo_ref, staff_memo_date,
+                     staff_memo_from, staff_memo_from_staff_id, staff_memo_from_comp_id,
+                     staff_memo_subject, staff_memo_content,
                      staff_memo_uploaded_by, staff_memo_uploaded_date, staff_memo_uploaded_time)
-                VALUES (:ref, :date, :to_ids, :from, :from_id, :cc_ids, :subject, :content,
+                VALUES (:ref, :date, :from, :from_id, :from_comp_id, :subject, :content,
                         :uploaded_by, :uploaded_date, :uploaded_time)";
 
-        $stmt = $this->db->prepare($sql);
-        $stmt->execute(array(
-            ':ref'           => $memo['ref'],
-            ':date'          => date(self::MEMO_DATE_FORMAT),
-            ':to_ids'        => $memo['to_ids'],
-            ':from'          => $memo['from'],
-            ':from_id'       => $memo['from_id'],
-            ':cc_ids'        => $memo['cc_ids'],
-            ':subject'       => $memo['subject'],
-            ':content'       => $memo['content'],
-            ':uploaded_by'   => $memo['uploaded_by'],
-            ':uploaded_date' => date("Y/m/d"),
-            ':uploaded_time' => date("H:i:s"),
-        ));
+        $receiverSql = "INSERT INTO " . DatabaseConfig::STAFF_PROFILE . ".staff_memo_receivers
+                    (staff_memo_id, staff_memo_receiver_type,
+                     staff_memo_receiver_staff_id, staff_memo_receiver_comp_id)
+                SELECT :memo_id, :type, u.id, u.comp_id
+                FROM users u
+                WHERE u.id = :staff_id";
 
-        return (int)$this->db->lastInsertId();
+        $this->db->beginTransaction();
+        try {
+            $stmt = $this->db->prepare($memoSql);
+            $stmt->execute(array(
+                ':ref'           => $memo['ref'],
+                ':date'          => date(self::MEMO_DATE_FORMAT),
+                ':from'          => $memo['from'],
+                ':from_id'       => $memo['from_id'],
+                ':from_comp_id'  => $memo['from_comp_id'],
+                ':subject'       => $memo['subject'],
+                ':content'       => $memo['content'],
+                ':uploaded_by'   => $memo['uploaded_by'],
+                ':uploaded_date' => date("Y/m/d"),
+                ':uploaded_time' => date("H:i:s"),
+            ));
+            $memoId = (int)$this->db->lastInsertId();
+
+            $receiver = $this->db->prepare($receiverSql);
+            foreach (array('to' => $toIds, 'cc' => $ccIds) as $type => $ids) {
+                foreach ($ids as $staffId) {
+                    $receiver->execute(array(
+                        ':memo_id'  => $memoId,
+                        ':type'     => $type,
+                        ':staff_id' => (int)$staffId,
+                    ));
+                }
+            }
+
+            $this->db->commit();
+        } catch (Exception $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
+
+        return $memoId;
     }
 
     /**
@@ -906,7 +956,7 @@ try {
     }
 
     if ($action === 'staff') {
-        respond(array('success' => true, 'staff' => $directory->addressableStaff()));
+        respond(array('success' => true, 'staff' => $directory->addressableStaff($issuer['comp_id'])));
     }
 
     /* Everything past this point writes, so the recipient list is checked first. */
@@ -931,12 +981,11 @@ try {
             fail('Subject and Content are both required');
         }
 
-        // CC spans the whole addressable directory, exactly like the web form —
-        // see addressableStaff(). It still has to BE in that directory, so a
-        // stale or invented id is rejected rather than stored as a dangling ref.
+        // CC is limited to the issuer's own company — see addressableStaff().
+        // A stale, invented or other-company id is rejected rather than stored.
         $ccIds = idList(input('cc_ids'));
-        if (!empty($ccIds) && !empty($directory->unaddressableIds($ccIds))) {
-            fail('One of the CC recipients is not an addressable staff member', 400);
+        if (!empty($ccIds) && !empty($directory->unaddressableIds($ccIds, $issuer['comp_id']))) {
+            fail('CC recipients must be staff of your own company', 400);
         }
 
         // From is the issuer, taken from the row findStaff() already resolved —
@@ -944,15 +993,14 @@ try {
         // is not the client's to assert, and the id has to agree with the name
         // or the two columns can disagree about who wrote the memo.
         $memoId = $repo->createMemo(array(
-            'ref'         => (string)input('ref', ''),
-            'to_ids'      => implode(',', $toIds),
-            'cc_ids'      => implode(',', $ccIds),
-            'from'        => $issuer['fullname'],
-            'from_id'     => (string)$issuer['id'],
-            'subject'     => $subject,
-            'content'     => $content,
-            'uploaded_by' => $issuer['id'],
-        ));
+            'ref'          => (string)input('ref', ''),
+            'from'         => $issuer['fullname'],
+            'from_id'      => (string)$issuer['id'],
+            'from_comp_id' => (string)$issuer['comp_id'],
+            'subject'      => $subject,
+            'content'      => $content,
+            'uploaded_by'  => $issuer['id'],
+        ), $toIds, $ccIds);
 
         // Attachments are optional and filed after the commit — see saveAll().
         $posted   = AttachmentStore::posted();
@@ -964,7 +1012,7 @@ try {
         $mirror    = MemoMirrorClient::post($memoId);
         $logFailed = (new MemoMirrorLog($db))->record($memoId, $mirror);
 
-        respond(array(
+        $response = array(
             'success'     => true,
             'id'          => $memoId,
             'recipients'  => count($toIds),
@@ -987,7 +1035,15 @@ try {
                 'log_error'  => MK_ISSUE_DEBUG_ERRORS ? $logFailed : null,
                 'http'       => MK_ISSUE_DEBUG_ERRORS ? $mirror['http'] : null,
             ),
-        ));
+        );
+
+        // The app shows no mirror notice when `mirror` is absent. The mirror is
+        // still posted and logged in staff_memo_mirror either way.
+        if (!MK_ISSUE_SHOW_MIRROR_NOTICE) {
+            unset($response['mirror']);
+        }
+
+        respond($response);
     }
 
     if ($action === 'performance') {
