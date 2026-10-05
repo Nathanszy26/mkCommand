@@ -5,7 +5,8 @@ header('Content-Type: application/json; charset=UTF-8');
  * Job Spec WRITE + approval endpoint.
  *
  * MUST be hosted on globportal.com — prog4@localhost reaches BOTH mkPortal
- * (versions) and staff_portal2 (organization_chart) locally. No cross-server
+ * (versions), staff_portal2 (users) and evaluation (the reporting line)
+ * locally. No cross-server
  * DB hop: the mkcommand <-> globportal 3306 path is firewalled.
  * Same deployment folder as staffHierarchy.php (proven, in production).
  *
@@ -19,7 +20,7 @@ header('Content-Type: application/json; charset=UTF-8');
  * GW (is_gw=1) are a second target population: identity is
  * (monthly_assign_gw_code, comp_id 1) and the reporting line comes from
  * evaluation.monthly_assign_gw (boss_id/boss_comp_id) instead of
- * organization_chart. Both go through the StaffDirectory interface, so the
+ * the staff reporting line. Both go through the StaffDirectory interface, so the
  * permission rules below are written once and behave identically for each.
  *
  * Auto-approval rule: a submission auto-approves iff there
@@ -30,7 +31,7 @@ header('Content-Type: application/json; charset=UTF-8');
  * SECURITY NOTE (called out, not silently accepted): this stack has no server
  * session/token — exactly like staffHierarchy.php. Submitter/reviewer identity
  * is client-asserted; the server re-verifies only the RELATIONSHIP (self /
- * current direct superior) against organization_chart, never a client 'editable'
+ * current direct superior) against the reporting line, never a client 'editable'
  * flag. Bolt real auth onto every action here the moment the app has a token.
  *
  * PHP 7.2 compatible.
@@ -76,7 +77,9 @@ class Config
         );
     }
  
-    /** organization_chart + users, same box staffHierarchy.php reads. Local. */
+    /** users + the comp-1 org chart, same box staffHierarchy.php reads. Local.
+     *  The other companies' reporting line is evaluation.monthly_assign, read
+     *  through this same connection by its qualified name. */
     public static function staffPortal()
     {
         return array(
@@ -107,7 +110,7 @@ class Config
  
 /**
  * A target population and its reporting lines. Two implementations, chosen by
- * the version's is_gw flag: staff answer to organization_chart, GW answer to
+ * the version's is_gw flag: staff answer to the reporting line, GW answer to
  * monthly_assign_gw. Every permission decision goes through this interface, so
  * the rules (self / current direct superior / sole-approver auto-approve) are
  * written once and apply identically to both.
@@ -147,16 +150,21 @@ class OrgChartRepository implements StaffDirectory
                       AND IFNULL(ubx.mk_command_excluded, 0) = 1)";
  
     /** Comp 1's reporting lines live in organization_chart_glob; every other
-     *  company stays in organization_chart. Same rule as staffHierarchy.php:
-     *  routing is on the STAFF-side comp_id (the oc.comp_id column). */
+     *  company's live in evaluation.monthly_assign, the table the KPI pages
+     *  maintain. Same rule as staffHierarchy.php: routing is on the STAFF-side
+     *  comp_id (the oc.comp_id column).
+     *
+     *  monthly_assign keeps history, so one reporting line can hold several
+     *  live rows. This class decides who may write and approve a job spec, so
+     *  each read below says what it does about that. */
     const GLOB_COMP_ID = 1;
  
-    /** The staff's comp is known -> exactly one chart owns their rows. */
+    /** The staff's comp is known -> exactly one table owns their rows. */
     private static function chartFor($staffComp)
     {
         return ((int)$staffComp === self::GLOB_COMP_ID)
             ? 'organization_chart_glob'
-            : 'organization_chart';
+            : 'evaluation.monthly_assign';
     }
  
     /** A boss's comp says nothing about their children's comp, so a boss-first
@@ -165,7 +173,7 @@ class OrgChartRepository implements StaffDirectory
     private static function chartSources()
     {
         return array(
-            array('organization_chart',      'oc.comp_id <> ' . self::GLOB_COMP_ID),
+            array('evaluation.monthly_assign',    'oc.comp_id <> ' . self::GLOB_COMP_ID),
             array('organization_chart_glob', 'oc.comp_id = '  . self::GLOB_COMP_ID),
         );
     }
@@ -206,11 +214,15 @@ class OrgChartRepository implements StaffDirectory
     }
  
     /** Count CURRENT direct superiors of (staff), excluding one boss.
-     *  0 => the excluded boss is the sole superior (or none exist). */
+     *  0 => the excluded boss is the sole superior (or none exist).
+     *
+     *  COUNT DISTINCT over the boss, not COUNT(*) over the rows: the question
+     *  is how many PEOPLE could approve this, and monthly_assign can carry the
+     *  same superior on several live rows. */
     public function countOtherDirectSuperiors($staffP, $staffC, $exclP, $exclC)
     {
         $table = self::chartFor($staffC);
-        $sql = "SELECT COUNT(*) FROM {$table} oc
+        $sql = "SELECT COUNT(DISTINCT oc.boss_id, oc.boss_comp_id) FROM {$table} oc
                 WHERE oc.staff_id = :sp AND oc.comp_id = :sc
                   AND NOT (oc.boss_id = :ep AND oc.boss_comp_id = :ec)
                   AND " . self::ACTIVE_CLAUSE . "
@@ -224,13 +236,17 @@ class OrgChartRepository implements StaffDirectory
         return (int)$stmt->fetchColumn();
     }
  
-    /** Current direct subordinates (person + comp) of a boss — for the queue. */
+    /** Current direct subordinates (person + comp) of a boss — for the queue.
+     *
+     *  DISTINCT because monthly_assign keeps history: without it a subordinate
+     *  with several live rows is queued several times, and their one pending
+     *  job spec is listed once per row. */
     public function directSubordinates($bossP, $bossC)
     {
         $branches = array();
         foreach (self::chartSources() as $source) {
             list($table, $scope) = $source;
-            $branches[] = "SELECT oc.staff_id AS person, oc.comp_id AS comp_id
+            $branches[] = "SELECT DISTINCT oc.staff_id AS person, oc.comp_id AS comp_id
                 FROM {$table} oc
                 INNER JOIN users u
                     ON u.person = oc.staff_id AND u.comp_id = oc.comp_id
@@ -280,7 +296,7 @@ class OrgChartRepository implements StaffDirectory
 /**
  * GW directory — evaluation.monthly_assign_gw.
  *
- * Reached through the SAME PDO as organization_chart (fully-qualified table
+ * Reached through the SAME PDO as the staff tables (fully-qualified table
  * name), exactly like staffHierarchy.php reads evaluation2017. No second
  * connection. Requires SELECT on `evaluation`.
  *
@@ -761,7 +777,7 @@ class JobSpecWriteService
         if ($v['status'] !== 'pending') {
             throw new RuntimeException('ALREADY_' . strtoupper($v['status']));
         }
-        // GW route through monthly_assign_gw, staff through organization_chart.
+        // GW route through monthly_assign_gw, staff through the reporting line.
         if (!$this->directory((int)$v['is_gw'])->isDirectSuperior($rP, $rC, $v['person'], $v['comp_id'])) {
             throw new RuntimeException('NOT_A_DIRECT_SUPERIOR');
         }
@@ -803,7 +819,7 @@ class JobSpecWriteService
      *  enriched with names and the proposed task list so they're reviewable. */
     public function pendingForSuperior($bossP, $bossC)
     {
-        // One queue, both populations: direct reports from organization_chart
+        // One queue, both populations: direct reports from the reporting line
         // and GW from monthly_assign_gw. is_gw is carried so the version lookup
         // and the name lookup each hit the right table.
         $targets = array();
@@ -820,7 +836,7 @@ class JobSpecWriteService
         }
  
         // Batched name lookups: targets from their own directory, submitters
-        // always from organization_chart (only staff accounts can submit).
+        // always from the staff side (only staff accounts can submit).
         $staffPairs = array();
         $gwPairs    = array();
         foreach ($headers as $h) {

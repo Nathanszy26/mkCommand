@@ -117,10 +117,21 @@ class SubordinateDirectory
         $this->db = $db;
     }
 
+    /**
+     * [table, staff-side scope] for every reporting line. Comp 1 is the org
+     * chart; every other company is evaluation.monthly_assign, the same table
+     * the KPI pages read. The scopes are disjoint, so UNION ALL cannot
+     * double-count.
+     *
+     * monthly_assign keeps history, so one line can hold several live rows.
+     * descendantsById() keys every node by (person, comp_id) and skips a key it
+     * has already placed, so the duplicates collapse there — the issue list
+     * cannot show anybody twice.
+     */
     private static function chartSources()
     {
         return array(
-            array('organization_chart',      'oc.comp_id <> ' . self::GLOB_COMP_ID),
+            array('evaluation.monthly_assign',    'oc.comp_id <> ' . self::GLOB_COMP_ID),
             array('organization_chart_glob', 'oc.comp_id = '  . self::GLOB_COMP_ID),
         );
     }

@@ -40,7 +40,31 @@ class Database
 }
 
 /**
- * All organization_chart reads. Nothing here knows about HTTP.
+ * Profile photos live in the myMK app's storage bucket, not on this host.
+ * staff_profile.profile_pic / gw_profile.profile_pic hold a path relative to
+ * the bucket root; the app only ever gets the finished absolute URL.
+ *
+ * Mirrors staffDirectory.php's class of the same name — these endpoints are
+ * deliberately self-contained, as DatabaseConfig already is.
+ */
+class ProfilePhoto
+{
+    const URL_BASE = 'https://app.globportal.com/mymk/storage/';
+
+    /** Absolute URL of a stored path, or null when there is no photo on file.
+     *  Each path segment is encoded separately so the slashes survive. */
+    public static function url($pic)
+    {
+        if ($pic === null || trim($pic) === '') {
+            return null;
+        }
+        $segments = array_map('rawurlencode', explode('/', ltrim(trim($pic), '/')));
+        return self::URL_BASE . implode('/', $segments);
+    }
+}
+
+/**
+ * All reporting-line reads. Nothing here knows about HTTP.
  */
 class HierarchyRepository
 {
@@ -53,7 +77,31 @@ class HierarchyRepository
         AND (oc.monthly_assign_to IS NULL OR oc.monthly_assign_to = ''
             OR STR_TO_DATE(REPLACE(oc.monthly_assign_to, '-', '/'), '%Y/%m/%d') >= CURDATE())";
 
-    const USER_FIELDS = "u.id, u.person, u.comp_id, u.fullname, u.department, u.position, s.name AS company_name";
+    /**
+     * A staff member's profile photo path, correlated to `u`. Link priority
+     * mirrors enroll_admin.php and staffDirectory.php, so one person shows the
+     * same face on the Staff tab, in the directory, and in face enrolment:
+     *   1. staff_profile.person + comid  ==  users.person + comp_id
+     *   2. fallback: staff_profile.mymkid == users.id
+     * staff_profile lives in this same schema, so no second connection.
+     */
+    const PHOTO_SUBQUERY = "COALESCE(
+        (SELECT p.profile_pic FROM staff_profile p
+          WHERE p.person = u.person AND p.comid = u.comp_id
+            AND p.deleted_at IS NULL
+            AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+          LIMIT 1),
+        (SELECT p.profile_pic FROM staff_profile p
+          WHERE p.mymkid = u.id
+            AND p.deleted_at IS NULL
+            AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+          LIMIT 1)
+    )";
+
+    /** Every staff query selects the same columns, so adding one here reaches
+     *  the self card, the superior ladder and every node of the tree at once. */
+    const USER_FIELDS = "u.id, u.person, u.comp_id, u.fullname, u.department, u.position, s.name AS company_name,
+                         " . self::PHOTO_SUBQUERY . " AS profile_pic";
 
     /** A user is visible to MK Command at all. mk_command_excluded = 1 hides
      *  them everywhere in this app — hierarchy, job specs, the lot. NULL means
@@ -62,9 +110,17 @@ class HierarchyRepository
                           AND IFNULL(u.mk_command_excluded, 0) <> 1";
 
     /** Comp 1's reporting lines live in organization_chart_glob; every other
-     *  company stays in organization_chart. Routing is on the STAFF-side
-     *  comp_id (the oc.comp_id column) — that column owns the row. A boss may
-     *  therefore have children in both tables, so the reads below UNION them. */
+     *  company's live in evaluation.monthly_assign, the table the KPI pages
+     *  maintain. Routing is on the STAFF-side comp_id (the oc.comp_id column)
+     *  — that column owns the row. A boss may therefore have children in both
+     *  tables, so the reads below UNION them.
+     *
+     *  The two carry the same columns, so ACTIVE_CLAUSE applies to either
+     *  unchanged. They differ in one way that matters: monthly_assign keeps history, so one
+     *  reporting line can hold several live rows.
+     *  Both walks below key their nodes by (person, comp_id) and skip a key
+     *  they have already placed, so the extra rows collapse there rather than
+     *  being deduplicated in SQL. */
     const GLOB_COMP_ID = 1;
 
     /**
@@ -80,7 +136,7 @@ class HierarchyRepository
     private static function chartSources()
     {
         return array(
-            array('organization_chart',      'oc.comp_id <> ' . self::GLOB_COMP_ID),
+            array('evaluation.monthly_assign',    'oc.comp_id <> ' . self::GLOB_COMP_ID),
             array('organization_chart_glob', 'oc.comp_id = '  . self::GLOB_COMP_ID),
         );
     }
@@ -109,7 +165,8 @@ class HierarchyRepository
     public function findStaff($person, $compId)
     {
         $sql = "SELECT u.id, u.person, u.comp_id, u.fullname, u.department, u.position, u.email,
-                       s.name AS company_name
+                       s.name AS company_name,
+                       " . self::PHOTO_SUBQUERY . " AS profile_pic
                 FROM users u
                 LEFT JOIN subsidiaries s ON s.id = u.comp_id
                 WHERE u.person = :person AND u.comp_id = :comp_id
@@ -321,6 +378,7 @@ class GwRepository
                        mag.comp_id                    AS comp_id,
                        mag.monthly_assign_gw_fullname AS fullname,
                        mag.monthly_assign_gw_district AS district,
+                       mag.monthly_assign_gw_mobile_no AS mobile_no,
                        mag.boss_id, mag.boss_comp_id,
                        AVG(CAST(meg.monthly_evaluation_result AS DECIMAL(7,2))) AS score
                 FROM evaluation.monthly_assign_gw mag
@@ -348,6 +406,41 @@ class GwRepository
         $stmt->execute();
 
         return $stmt->fetchAll();
+    }
+
+    /**
+     * One company's GW photos, keyed by digit-only phone number.
+     *
+     * gw_profile has no GW code to join on — it is keyed on the phone number
+     * the worker signed up with, and `person` holds that number rather than a
+     * code. Comparing those means stripping separators off both sides, which
+     * defeats every index, so this is read in one go (259 rows company-wide)
+     * and matched in PHP rather than per node.
+     */
+    public function gwPhotoIndex($compId)
+    {
+        $sql = "SELECT p.person, p.mobile, p.profile_pic
+                FROM staff_portal2.gw_profile p
+                WHERE p.comp_id = :comp_id AND p.deleted_at IS NULL
+                  AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''";
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(':comp_id', (int)$compId, PDO::PARAM_INT);
+        $stmt->execute();
+
+        $index = array();
+        foreach ($stmt->fetchAll() as $r) {
+            // `person` wins over `mobile` when they disagree: it is the column
+            // the signup writes.
+            $byMobile = preg_replace('/\D/', '', (string)$r['mobile']);
+            if ($byMobile !== '' && !isset($index[$byMobile])) {
+                $index[$byMobile] = $r['profile_pic'];
+            }
+            $byPerson = preg_replace('/\D/', '', (string)$r['person']);
+            if ($byPerson !== '') {
+                $index[$byPerson] = $r['profile_pic'];
+            }
+        }
+        return $index;
     }
 }
 
@@ -428,6 +521,7 @@ class HierarchyService
                     'monthly_assign_from' => $row['monthly_assign_from'],
                     'monthly_assign_to'   => $row['monthly_assign_to'],
                     'is_gw'               => 0,
+                    'photo_url'           => ProfilePhoto::url($row['profile_pic']),
                 ];
                 $childKeys[$key] = [];
 
@@ -479,6 +573,9 @@ class HierarchyService
             return;
         }
 
+        // One lookup for the whole batch; GW only exist in comp 1 here.
+        $photos = $this->gwRepo->gwPhotoIndex(self::GW_COMP_ID);
+
         foreach ($this->gwRepo->findGwOf($bosses, $this->year, $this->gwMonth) as $row) {
             $key = self::gwKey($row['person'], $row['comp_id']);
             if (isset($nodes[$key])) {
@@ -502,10 +599,21 @@ class HierarchyService
                 'is_gw'               => 1,
                 // Monthly GW score (scoreNodes leaves GW alone). null = not evaluated.
                 'score'               => $row['score'] === null ? null : round((float)$row['score'], 2),
+                'photo_url'           => self::gwPhotoFor($row['mobile_no'], $photos),
             );
             $childKeys[$key]         = array();
             $childKeys[$parentKey][] = $key;
         }
+    }
+
+    /** One GW's photo URL from the batched index, or null. Their phone number
+     *  is the only link to gw_profile, so it is matched on digits alone. */
+    private static function gwPhotoFor($mobileNo, array $photos)
+    {
+        $digits = preg_replace('/\D/', '', (string)$mobileNo);
+        return ($digits !== '' && isset($photos[$digits]))
+            ? ProfilePhoto::url($photos[$digits])
+            : null;
     }
 
     /**
@@ -558,6 +666,7 @@ class HierarchyService
                     'company_name' => $row['company_name'],
                     'level'        => $level + 1,
                     'is_top'       => false,
+                    'photo_url'    => ProfilePhoto::url($row['profile_pic']),
                 ];
                 $index[$key] = count($chain) - 1;
 
@@ -687,6 +796,9 @@ try {
     if (!$staff) {
         respond(['success' => false, 'message' => 'Staff not found or inactive'], 404);
     }
+    // The raw path is an internal detail; the app only ever sees a usable URL.
+    $staff['photo_url'] = ProfilePhoto::url($staff['profile_pic']);
+    unset($staff['profile_pic']);
 
     $superiorChain = $service->buildSuperiorChain($staff['person'], $staff['comp_id']);
     $result        = $service->buildSubordinateTree($staff['person'], $staff['comp_id']);

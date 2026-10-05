@@ -3,7 +3,7 @@
  * Job Spec approval progress report.
  *
  * MUST be hosted on globportal.com, same folder as jobSpecWrite.php —
- * mkPortal (versions) and staff_portal2 (organization_chart, users) are both
+ * mkPortal (versions), staff_portal2 (users) and the reporting line are all
  * local there under prog4. The mkcommand <-> globportal 3306 path is firewalled.
  *
  * Reads job_spec_version directly, NOT the stg_jobspec_* staging tables: those
@@ -16,7 +16,7 @@
  * simpler and lets the boss/version join happen in the database.
  *
  * TWO POPULATIONS, reported separately:
- *   staff (is_gw = 0/NULL) -> superior comes from staff_portal2.organization_chart
+ *   staff (is_gw = 0/NULL) -> superior comes from evaluation.monthly_assign
  *                             (comp 1: organization_chart_glob — see chartSource)
  *   GW    (is_gw = 1)      -> superior comes from evaluation.monthly_assign_gw
  * They never mix: a GW's `person` is a monthly_assign_gw_code, which is a
@@ -88,8 +88,8 @@ class ApprovalReportRepository
     const NOT_SUBMITTER = "
         NOT (oc.boss_id = v.submitted_by AND oc.boss_comp_id = v.submitted_by_comp_id)";
 
-    /** A blank boss_id is not a superior. organization_chart holds rows with an
-     *  empty boss_id for top-of-chart staff; they pass ACTIVE_CLAUSE, and pass
+    /** A blank boss_id is not a superior. Both reporting-line tables hold rows
+     *  with an empty boss_id for top-of-chart staff; they pass ACTIVE_CLAUSE, and pass
      *  NOT_SUBMITTER because '' never equals a real submitted_by. Without this
      *  they INNER JOIN into byBoss() and collapse into one phantom superior with
      *  no name and a "no account" badge — while being wrongly excluded from
@@ -98,8 +98,9 @@ class ApprovalReportRepository
         TRIM(IFNULL(oc.boss_id, '')) <> ''";
 
     /** Comp 1's reporting lines live in organization_chart_glob; every other
-     *  company stays in organization_chart. Same rule as staffHierarchy.php and
-     *  jobSpecWrite.php: routing is on the STAFF-side comp_id. */
+     *  company's live in evaluation.monthly_assign. Same rule as
+     *  staffHierarchy.php and jobSpecWrite.php: routing is on the STAFF-side
+     *  comp_id. */
     const GLOB_COMP_ID = 1;
 
     public function __construct(PDO $db) { $this->db = $db; }
@@ -115,17 +116,23 @@ class ApprovalReportRepository
      * instead of duplicating it. The union sits INSIDE the join source, not at
      * the top level: byBoss() groups by boss, and a boss with staff in comp 1
      * and elsewhere would otherwise split into two half-counted rows.
+     *
+     * monthly_assign keeps history, so one reporting line can hold several live
+     * rows. Every query below is already proof against that — byBoss() counts
+     * DISTINCT version ids, staffForBoss() groups by version id, and
+     * withoutReviewer() only asks whether a row EXISTS — because a staff member
+     * with two superiors could always produce more than one row here.
      */
     protected static function chartSource($compId)
     {
         if ($compId !== null) {
             return ((int)$compId === self::GLOB_COMP_ID)
                 ? 'staff_portal2.organization_chart_glob oc'
-                : 'staff_portal2.organization_chart oc';
+                : 'evaluation.monthly_assign oc';
         }
         return "(SELECT staff_id, comp_id, boss_id, boss_comp_id,
                         monthly_assign_from, monthly_assign_to
-                 FROM staff_portal2.organization_chart
+                 FROM evaluation.monthly_assign
                  WHERE comp_id <> " . self::GLOB_COMP_ID . "
                  UNION ALL
                  SELECT staff_id, comp_id, boss_id, boss_comp_id,
@@ -298,7 +305,7 @@ class ApprovalReportRepository
  *
  * Identical question, different reporting line: a GW's superior is
  * (boss_id, boss_comp_id) on evaluation.monthly_assign_gw, not a row in
- * organization_chart. Extends the staff repository purely to reuse scopeSql()
+ * the staff reporting line. Extends the staff repository purely to reuse scopeSql()
  * and run(); every query below is its own, and nothing here touches the staff
  * side's results. chartSource() is inherited but never called — GW never read
  * an organization chart, so the comp-1 split does not apply to them.

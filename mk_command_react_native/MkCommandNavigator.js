@@ -125,7 +125,13 @@ const MkCommandNavigator = () => {
             <Tab.Screen
                 name={ROUTES.MkCommandStaff}
                 component={MkCommandStaff}
-                options={{ tabBarLabel: 'Staff' }}
+                // Swipe is off here because this screen uses the gesture for its
+                // own work — the org navigator, the horizontal lists — and a
+                // sideways drag that lands on Job Spec instead is indistinguishable
+                // from a bug. The tab bar still moves you; only the swipe is gone.
+                // (The navigator reads this from the FOCUSED screen's options, so
+                // it disables swiping away from Staff, not the whole bar.)
+                options={{ tabBarLabel: 'Staff', swipeEnabled: false }}
             />
             <Tab.Screen
                 name={ROUTES.MkCommandJobSpec}

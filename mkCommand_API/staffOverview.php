@@ -6,7 +6,8 @@
  * This page answers the HR question: "show me everybody, and let me open any
  * one of them and read the same five sections the app would show them."
  *
- *   Staff          staff_portal2.users + organization_chart (reporting line)
+ *   Staff          staff_portal2.users + the reporting line (org chart for
+ *                  comp 1, evaluation.monthly_assign elsewhere)
  *   Job Spec       mkPortal.job_spec_version (+ _item, _item_app)
  *   App            application.application via owner / developer / user
  *   Memo           staff_profile.staff_memo (+ attachments)
@@ -601,9 +602,9 @@ class StaffRepository extends Repository
 
     const USER_VISIBLE = DirectoryRepository::USER_VISIBLE;
 
-    /** Comp 1's reporting lines live in organization_chart_glob; everyone else
-     *  stays in organization_chart. Routing is on the STAFF-side comp_id — the
-     *  same rule staffHierarchy.php and jobSpecWrite.php apply. */
+    /** Comp 1's reporting lines live in organization_chart_glob; everyone
+     *  else's in evaluation.monthly_assign. Routing is on the STAFF-side
+     *  comp_id — the same rule staffHierarchy.php and jobSpecWrite.php apply. */
     const GLOB_COMP_ID = 1;
 
     /** Query: one staff member, or null. Scope is enforced by the caller. */
@@ -633,11 +634,15 @@ class StaffRepository extends Repository
      * staffHierarchy.php gives: MySQL materializes a UNION derived table instead
      * of merging it, which pushes the (boss_id, boss_comp_id) predicate outside
      * the branches and forces a full scan of both charts on every level.
+     *
+     * monthly_assign keeps history, so one line can hold several live rows. The
+     * two walks that read this both key their nodes by (person, comp_id) and
+     * skip a key already placed, so the duplicates collapse there.
      */
     private static function chartSources()
     {
         return array(
-            array('staff_portal2.organization_chart',      'oc.comp_id <> ' . self::GLOB_COMP_ID),
+            array('evaluation.monthly_assign',          'oc.comp_id <> ' . self::GLOB_COMP_ID),
             array('staff_portal2.organization_chart_glob', 'oc.comp_id =  ' . self::GLOB_COMP_ID),
         );
     }
