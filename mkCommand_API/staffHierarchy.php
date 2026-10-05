@@ -5,7 +5,7 @@ header('Content-Type: application/json; charset=UTF-8');
  * Staff hierarchy endpoint.
  *
  * IN  : person, comp_id (alias: comid)
- * OUT : { success, staff, superiors[], summary{}, subordinates[] }
+ * OUT : { success, staff, superiors[], summary{}, subordinates[], committees[] }
  *
  * subordinates[] is a nested tree; every node carries total_subordinates
  * (all descendants, not just direct children).
@@ -77,12 +77,43 @@ class HierarchyRepository
         AND (oc.monthly_assign_to IS NULL OR oc.monthly_assign_to = ''
             OR STR_TO_DATE(REPLACE(oc.monthly_assign_to, '-', '/'), '%Y/%m/%d') >= CURDATE())";
 
+    /** Phone numbers are stored two ways and compared as one. staff_profile
+     *  holds bare digits ('60128629616' or '0128629616'); users.mobile_no
+     *  carries separators ('016-8023754 '). Reducing both to digits and then
+     *  stripping the 60/0 trunk prefix leaves a single comparable number. */
+    const PHONE_PROFILE = "TRIM(LEADING '0' FROM TRIM(LEADING '60' FROM
+        REPLACE(REPLACE(REPLACE(p.person, '-', ''), ' ', ''), '+', '')))";
+    const PHONE_USER    = "TRIM(LEADING '0' FROM TRIM(LEADING '60' FROM
+        REPLACE(REPLACE(REPLACE(u.mobile_no, '-', ''), ' ', ''), '+', '')))";
+
+    /** Enough digits to be a real number. Without this guard the 494
+     *  staff_profile rows holding a USERNAME in `person` and the 13 live users
+     *  with no usable mobile_no would reduce to '' and match each other. */
+    const PHONE_MIN_DIGITS = "LENGTH(REPLACE(REPLACE(REPLACE(u.mobile_no, '-', ''), ' ', ''), '+', '')) >= 9";
+
     /**
      * A staff member's profile photo path, correlated to `u`. Link priority
      * mirrors enroll_admin.php and staffDirectory.php, so one person shows the
      * same face on the Staff tab, in the directory, and in face enrolment:
      *   1. staff_profile.person + comid  ==  users.person + comp_id
      *   2. fallback: staff_profile.mymkid == users.id
+     *   3. fallback: the phone number, reduced to digits on both sides
+     *
+     * Link 3 exists because comp 8 (TP Group) enrolled through a different
+     * path: their staff_profile.person holds the PHONE NUMBER rather than the
+     * username, and their mymkid is a myMK account id rather than users.id, so
+     * links 1 and 2 both miss and every one of them fell back to initials.
+     *
+     * Verified on live data before it was written: no two profiles in one
+     * company reduce to the same number, so this cannot return the wrong face;
+     * comp 8 is the ONLY company whose photos change (66 of its 69 live staff
+     * gain one, the other 3 have no profile row at all); and matching
+     * p.mobile as well adds nobody, so it deliberately does not.
+     *
+     * Link 3 cannot use an index, but COALESCE stops at the first non-NULL, so
+     * it only ever runs for someone links 1 and 2 could not resolve, and it is
+     * scoped to one company's profiles.
+     *
      * staff_profile lives in this same schema, so no second connection.
      */
     const PHOTO_SUBQUERY = "COALESCE(
@@ -95,6 +126,13 @@ class HierarchyRepository
           WHERE p.mymkid = u.id
             AND p.deleted_at IS NULL
             AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+          LIMIT 1),
+        (SELECT p.profile_pic FROM staff_profile p
+          WHERE p.comid = u.comp_id
+            AND p.deleted_at IS NULL
+            AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+            AND " . self::PHONE_MIN_DIGITS . "
+            AND " . self::PHONE_PROFILE . " = " . self::PHONE_USER . "
           LIMIT 1)
     )";
 
@@ -445,6 +483,230 @@ class GwRepository
 }
 
 /**
+ * Committees - mkPortal.mk_committee + mk_committee_member.
+ *
+ * mkPortal is MK Command's own schema (job_spec_version lives there too) and
+ * sits on the same MySQL instance as staff_portal2, so it is reachable through
+ * this connection fully-qualified - identical to how EvaluationRepository
+ * reaches evaluation2017. Requires SELECT on `mkPortal`.
+ *
+ * A committee is NOT confined to one company. Seats are keyed on
+ * (person, comp_id) and joined to users on that pair, so one committee can hold
+ * staff of several subsidiaries and every member carries its own company_name.
+ * mk_committee.comp_id only names the company that OWNS the committee
+ * (NULL = group-wide); it never limits who may sit on it.
+ *
+ * Staff only - a GW code lives in a different namespace that can collide with a
+ * users.person, so GW are not seatable. See committee.sql.
+ */
+class CommitteeRepository
+{
+    private $db;
+
+    const COMMITTEE = 'mkPortal.mk_committee';
+    const MEMBER    = 'mkPortal.mk_committee_member';
+
+    /** The committee itself is live today. Empty bounds mean "unbounded",
+     *  the same rule ACTIVE_CLAUSE applies to a reporting line. */
+    const COMMITTEE_LIVE = "c.status = '1' AND c.deleted_at IS NULL
+        AND (c.date_from IS NULL OR c.date_from <= CURDATE())
+        AND (c.date_to   IS NULL OR c.date_to   >= CURDATE())";
+
+    /** A seat on a committee is live today. Past members keep their row and
+     *  simply stop being returned, so the history survives. */
+    const MEMBER_LIVE = "m.status = '1' AND m.deleted_at IS NULL
+        AND (m.date_from IS NULL OR m.date_from <= CURDATE())
+        AND (m.date_to   IS NULL OR m.date_to   >= CURDATE())";
+
+    /** Resolved once per request by installed(); null until then. */
+    private $installed = null;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    /**
+     * Are the committee tables actually there right now?
+     *
+     * Committees are optional by design: committee.sql can be run before or
+     * after this file is uploaded and the Staff tab keeps working either way -
+     * it just reports no committees until the tables exist. Without this probe
+     * a deploy in the wrong order takes the WHOLE hierarchy down with an SQL
+     * error, over a feature nobody is using yet. Same contract staffDirectory
+     * has with its tag columns.
+     *
+     * One information_schema read, memoised for the request.
+     */
+    public function installed()
+    {
+        if ($this->installed !== null) {
+            return $this->installed;
+        }
+
+        $this->installed = false;
+
+        try {
+            $sql = "SELECT COUNT(*) AS n FROM information_schema.TABLES
+                     WHERE TABLE_SCHEMA = 'mkPortal'
+                       AND TABLE_NAME IN ('mk_committee', 'mk_committee_member')";
+            $row = $this->db->query($sql)->fetch();
+            $this->installed = ($row && (int)$row['n'] === 2);
+        } catch (Exception $e) {
+            // No information_schema grant: behave as if committees are not
+            // installed rather than failing the hierarchy over an add-on.
+            error_log('staffHierarchy committee schema probe failed: ' . $e->getMessage());
+        }
+
+        return $this->installed;
+    }
+
+    /**
+     * Query: the live committees ONE staff sits on, with that staff's own role.
+     * Empty when they sit on none - which is how the app decides not to draw
+     * the section at all.
+     */
+    public function committeesOf($person, $compId)
+    {
+        $sql = "SELECT c.id, c.name, c.code, c.description, c.comp_id,
+                       s.name AS company_name,
+                       m.committee_role AS role
+                FROM " . self::MEMBER . " m
+                INNER JOIN " . self::COMMITTEE . " c ON c.id = m.committee_id
+                LEFT JOIN subsidiaries s ON s.id = c.comp_id
+                WHERE m.person = :person AND m.comp_id = :comp_id
+                  AND " . self::MEMBER_LIVE . "
+                  AND " . self::COMMITTEE_LIVE . "
+                ORDER BY c.name ASC";
+
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(':person', $person, PDO::PARAM_STR);
+        $stmt->bindValue(':comp_id', (int)$compId, PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->fetchAll();
+    }
+
+    /**
+     * Query: every live member of MANY committees in one round-trip, so opening
+     * a committee in the app costs nothing - the membership is already there.
+     *
+     * The join to users is the cross-company part: it matches on the seat's own
+     * (person, comp_id), never on the committee's company, and USER_FIELDS hands
+     * back each member's own company_name, department, position and photo.
+     */
+    public function membersOf(array $committeeIds)
+    {
+        if (empty($committeeIds)) {
+            return array();
+        }
+
+        $place = implode(',', array_fill(0, count($committeeIds), '?'));
+
+        $sql = "SELECT m.committee_id, m.committee_role AS role,
+                       " . HierarchyRepository::USER_FIELDS . "
+                FROM " . self::MEMBER . " m
+                INNER JOIN users u
+                    ON u.person = m.person AND u.comp_id = m.comp_id
+                   AND " . HierarchyRepository::USER_VISIBLE . "
+                LEFT JOIN subsidiaries s ON s.id = u.comp_id
+                WHERE m.committee_id IN ({$place})
+                  AND " . self::MEMBER_LIVE . "
+                ORDER BY m.sort_order ASC, u.fullname ASC";
+
+        $stmt = $this->db->prepare($sql);
+        $i = 1;
+        foreach ($committeeIds as $id) {
+            $stmt->bindValue($i++, (int)$id, PDO::PARAM_INT);
+        }
+        $stmt->execute();
+
+        return $stmt->fetchAll();
+    }
+}
+
+/**
+ * Committees of one staff, each carrying its full membership.
+ *
+ * Two round-trips no matter how many committees there are, and the whole thing
+ * degrades to [] rather than failing: the Staff tab is a reporting-line screen
+ * first, and losing the committee card is a far smaller fault than losing the
+ * tree. (Contrast HierarchyService::attachGw, which deliberately does NOT catch
+ * - dropping subordinates there would be an invisible correctness bug.)
+ */
+class CommitteeService
+{
+    private $repo;
+
+    public function __construct(CommitteeRepository $repo)
+    {
+        $this->repo = $repo;
+    }
+
+    public function committeesFor($person, $compId)
+    {
+        if (!$this->repo->installed()) {
+            return array();
+        }
+
+        try {
+            $committees = $this->repo->committeesOf($person, $compId);
+            if (empty($committees)) {
+                return array();
+            }
+
+            $ids = array();
+            foreach ($committees as $row) {
+                $ids[] = (int)$row['id'];
+            }
+
+            $byCommittee = array();
+            foreach ($this->repo->membersOf($ids) as $row) {
+                $byCommittee[(int)$row['committee_id']][] = array(
+                    'id'           => (int)$row['id'],
+                    'person'       => $row['person'],
+                    'comp_id'      => (int)$row['comp_id'],
+                    'fullname'     => $row['fullname'],
+                    'department'   => $row['department'],
+                    'position'     => $row['position'],
+                    'company_name' => $row['company_name'],
+                    'role'         => $row['role'],
+                    // Always a staff record here, but the app keys people on
+                    // (person, comp_id, is_gw) everywhere - so say so, and a
+                    // committee member row works with the rest of the screen.
+                    'is_gw'        => 0,
+                    'photo_url'    => ProfilePhoto::url($row['profile_pic']),
+                );
+            }
+
+            $out = array();
+            foreach ($committees as $row) {
+                $id      = (int)$row['id'];
+                $members = isset($byCommittee[$id]) ? $byCommittee[$id] : array();
+
+                $out[] = array(
+                    'id'           => $id,
+                    'name'         => $row['name'],
+                    'code'         => $row['code'],
+                    'description'  => $row['description'],
+                    // null on both = group-wide, not "missing".
+                    'comp_id'      => $row['comp_id'] === null ? null : (int)$row['comp_id'],
+                    'company_name' => $row['company_name'],
+                    'my_role'      => $row['role'],
+                    'member_count' => count($members),
+                    'members'      => $members,
+                );
+            }
+
+            return $out;
+        } catch (Exception $e) {
+            error_log('staffHierarchy committee lookup failed: ' . $e->getMessage());
+            return array();
+        }
+    }
+}
+
+/**
  * Turns flat assignment rows into the nested tree + totals.
  */
 class HierarchyService
@@ -773,9 +1035,10 @@ try {
         respond(['success' => false, 'message' => 'person and comp_id are required'], 400);
     }
 
-    $repo     = new HierarchyRepository(Database::getConnection());
-    $evalRepo = new EvaluationRepository(Database::getConnection());
-    $gwRepo   = new GwRepository(Database::getConnection());
+    $repo      = new HierarchyRepository(Database::getConnection());
+    $evalRepo  = new EvaluationRepository(Database::getConnection());
+    $gwRepo    = new GwRepository(Database::getConnection());
+    $committee = new CommitteeService(new CommitteeRepository(Database::getConnection()));
 
     $year = input('year');
     if ($year === null || $year === '') {
@@ -802,6 +1065,9 @@ try {
 
     $superiorChain = $service->buildSuperiorChain($staff['person'], $staff['comp_id']);
     $result        = $service->buildSubordinateTree($staff['person'], $staff['comp_id']);
+    // [] when this staff sits on none, and until committee.sql has been run.
+    // The app draws the section only when this comes back non-empty.
+    $committees    = $committee->committeesFor($staff['person'], $staff['comp_id']);
 
     respond([
         'success'      => true,
@@ -814,6 +1080,7 @@ try {
             'direct_superiors'    => $superiorChain['direct'],
         ],
         'subordinates' => $result['tree'],
+        'committees'   => $committees,
     ]);
 } catch (Exception $e) {
     error_log('staffHierarchy error: ' . $e->getMessage());

@@ -127,13 +127,43 @@ class DirectoryRepository
      */
     const NO_DEPARTMENT = '__none__';
 
+    /** Phone numbers are stored two ways and compared as one. staff_profile
+     *  holds bare digits ('60128629616' or '0128629616'); users.mobile_no
+     *  carries separators ('016-8023754 '). Reducing both to digits and then
+     *  stripping the 60/0 trunk prefix leaves a single comparable number. */
+    const PHONE_PROFILE = "TRIM(LEADING '0' FROM TRIM(LEADING '60' FROM
+        REPLACE(REPLACE(REPLACE(p.person, '-', ''), ' ', ''), '+', '')))";
+    const PHONE_USER    = "TRIM(LEADING '0' FROM TRIM(LEADING '60' FROM
+        REPLACE(REPLACE(REPLACE(u.mobile_no, '-', ''), ' ', ''), '+', '')))";
+
+    /** Enough digits to be a real number. Without this guard the 494
+     *  staff_profile rows holding a USERNAME in `person` and the 13 live users
+     *  with no usable mobile_no would reduce to '' and match each other. */
+    const PHONE_MIN_DIGITS = "LENGTH(REPLACE(REPLACE(REPLACE(u.mobile_no, '-', ''), ' ', ''), '+', '')) >= 9";
+
     /**
      * A staff member's profile photo path, correlated to `u`. Link priority
      * mirrors enroll_admin.php's checkFaceEncodings, so the directory shows the
      * same face the face-enrolment admin sees:
      *   1. staff_profile.person + comid  ==  users.person + comp_id
      *   2. fallback: staff_profile.mymkid == users.id
-     * Both are indexed, so this stays cheap even over a whole company.
+     *   3. fallback: the phone number, reduced to digits on both sides
+     *
+     * Link 3 exists because comp 8 (TP Group) enrolled through a different
+     * path: their staff_profile.person holds the PHONE NUMBER rather than the
+     * username, and their mymkid is a myMK account id rather than users.id, so
+     * links 1 and 2 both miss and every one of them fell back to initials.
+     *
+     * Verified on live data before it was written: no two profiles in one
+     * company reduce to the same number, so this cannot return the wrong face;
+     * comp 8 is the ONLY company whose photos change (66 of its 69 live staff
+     * gain one, the other 3 have no profile row at all); and matching
+     * p.mobile as well adds nobody, so it deliberately does not.
+     *
+     * Links 1 and 2 are indexed, so this stays cheap even over a whole company.
+     * Link 3 cannot use an index, but COALESCE stops at the first non-NULL, so
+     * it only ever runs for someone links 1 and 2 could not resolve, and it is
+     * scoped to one company's profiles.
      */
     const STAFF_PHOTO_SUBQUERY = "COALESCE(
         (SELECT p.profile_pic FROM staff_profile p
@@ -145,6 +175,13 @@ class DirectoryRepository
           WHERE p.mymkid = u.id
             AND p.deleted_at IS NULL
             AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+          LIMIT 1),
+        (SELECT p.profile_pic FROM staff_profile p
+          WHERE p.comid = u.comp_id
+            AND p.deleted_at IS NULL
+            AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+            AND " . self::PHONE_MIN_DIGITS . "
+            AND " . self::PHONE_PROFILE . " = " . self::PHONE_USER . "
           LIMIT 1)
     )";
 

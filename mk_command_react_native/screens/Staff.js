@@ -142,6 +142,102 @@ const SuperiorRow = ({ person, showRail, isLast, onPress }) => {
     );
 };
 
+/**
+ * One member of a committee.
+ *
+ * A committee crosses companies, so the company belongs on the line itself
+ * rather than behind a tap — on a group-wide committee it is the thing that
+ * tells two colleagues apart. Tapping opens that person's card, the same as
+ * every other person row on this screen.
+ */
+const CommitteeMemberRow = ({ member, isMe, onPress }) => (
+    <TouchableOpacity
+        style={[styles.memberRow, isMe && styles.memberRowMe]}
+        activeOpacity={0.6}
+        onPress={() => onPress(member)}
+    >
+        <Avatar
+            fullname={member.fullname}
+            photoUrl={member.photo_url}
+            size={32}
+            color={isMe ? C.primary : C.muted}
+        />
+        <View style={styles.personText}>
+            <View style={styles.nameRow}>
+                <Text style={styles.memberName} numberOfLines={1}>
+                    {titleCase(member.fullname)}
+                </Text>
+                {isMe && (
+                    <View style={[styles.teamPill, styles.mePill]}>
+                        <Text style={[styles.teamPillText, styles.mePillText]}>You</Text>
+                    </View>
+                )}
+            </View>
+            <Text style={styles.personMeta} numberOfLines={1}>
+                {member.position || 'No Position'}
+                {member.company_name ? ` \u2022 ${member.company_name}` : ''}
+            </Text>
+        </View>
+        {!!member.role && (
+            <View style={styles.rolePill}>
+                <Text style={styles.rolePillText} numberOfLines={1}>
+                    {member.role}
+                </Text>
+            </View>
+        )}
+    </TouchableOpacity>
+);
+
+/**
+ * One committee, closed to a single line until it is opened.
+ *
+ * Closed is the default on purpose: what this section answers first is "which
+ * committees am I on", and one committee can seat a dozen people from several
+ * companies. Opening it lists the whole membership — the hierarchy payload
+ * already carries it, so that costs no round-trip and no spinner.
+ */
+const CommitteeRow = ({ committee, open, onToggle, onPressMember, meKey }) => {
+    const members = committee.members || [];
+
+    return (
+        <View style={styles.committeeWrap}>
+            <TouchableOpacity
+                style={[styles.committeeRow, open && styles.committeeRowOpen]}
+                activeOpacity={0.6}
+                onPress={() => onToggle(committee.id)}
+            >
+                <Text style={styles.rootCaret}>{open ? '\u25BE' : '\u25B8'}</Text>
+                <View style={styles.committeeText}>
+                    <Text style={styles.committeeName} numberOfLines={2}>
+                        {committee.name}
+                        {committee.code ? ` (${committee.code})` : ''}
+                    </Text>
+                </View>
+                <View style={styles.committeeCount}>
+                    <Text style={styles.committeeCountText}>{committee.member_count}</Text>
+                </View>
+            </TouchableOpacity>
+
+            {open && (
+                <View style={styles.memberList}>
+                    {members.length === 0 ? (
+                        <Text style={styles.kidsNote}>No active members.</Text>
+                    ) : (
+                        members.map((member) => (
+                            <CommitteeMemberRow
+                                key={nodeKey(member)}
+                                member={member}
+                                isMe={nodeKey(member) === meKey}
+                                onPress={onPressMember}
+                            />
+                        ))
+                    )}
+                </View>
+            )}
+        </View>
+    );
+};
+
 /** Tri-state-free checkbox: on/off only, cascade logic lives in the screen. */
 const Checkbox = ({ checked, onPress }) => (
     <TouchableOpacity
@@ -334,6 +430,7 @@ export default class Staff extends Component {
             data: null,
             expanded: {},
             checked: {},
+            openCommittees: {},   // committee id -> membership showing
             issueAction: null,    // 'memo' | 'merit' | 'demerit' for the selected staff
             issueOpen: false,     // the issue form is up
             user: null,           // session + own name, handed to the issue form
@@ -458,6 +555,14 @@ export default class Staff extends Component {
     toggle = (key) => {
         this.setState((prev) => ({
             expanded: { ...prev.expanded, [key]: !prev.expanded[key] },
+        }));
+    };
+
+    /** Command: show/hide one committee's membership. Its own key space — a
+     *  committee id is an integer and would collide with a nodeKey. */
+    toggleCommittee = (id) => {
+        this.setState((prev) => ({
+            openCommittees: { ...prev.openCommittees, [id]: !prev.openCommittees[id] },
         }));
     };
 
@@ -1606,6 +1711,10 @@ export default class Staff extends Component {
         }
 
         const { staff, superiors, summary, subordinates } = data;
+        // Absent until committee.sql is run and this staff is seated on one.
+        const committees = data.committees || [];
+        // Who "me" is inside a member list, in the same key space as everyone else.
+        const meKey = nodeKey({ person: staff.person, comp_id: staff.comp_id, is_gw: 0 });
         const my = this.state.myDetail;
         // Work contact first, personal only when there is no work one — the
         // same rule the directory card applies.
@@ -1762,6 +1871,25 @@ export default class Staff extends Component {
                         <StatCard label="Direct Subordinates" value={summary.direct_subordinates} color={C.success} />
                         <StatCard label="Total Subordinates" value={summary.total_subordinates} color={C.text} />
                     </View>
+
+                    {/* Committees. Drawn only when this staff actually sits on
+                        one: there is nothing worth saying to the many people
+                        who sit on none, and an empty card would push the
+                        reporting line — what this tab is for — further down. */}
+                    {committees.length > 0 && (
+                        <Section title="Committees" count={committees.length}>
+                            {committees.map((committee) => (
+                                <CommitteeRow
+                                    key={committee.id}
+                                    committee={committee}
+                                    open={!!this.state.openCommittees[committee.id]}
+                                    onToggle={this.toggleCommittee}
+                                    onPressMember={this.openInfo}
+                                    meKey={meKey}
+                                />
+                            ))}
+                        </Section>
+                    )}
 
                     <Section title="Superiors" count={superiors.length}>
                         {superiors.length === 0 ? (
@@ -2122,6 +2250,63 @@ const styles = StyleSheet.create({
     },
     headerBadgeText: { color: '#fff', fontSize: 11, fontWeight: '700' },
     cardBody: { padding: 10 },
+
+    /* committees */
+    committeeWrap: { marginBottom: 7 },
+    committeeRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: C.bg,
+        borderRadius: 10,
+        borderWidth: 1,
+        borderColor: C.border,
+        paddingHorizontal: 10,
+        paddingVertical: 10,
+    },
+    committeeRowOpen: { borderColor: C.primary, backgroundColor: C.primarySoft },
+    committeeText: { flex: 1, marginHorizontal: 9 },
+    committeeName: { fontSize: 14, fontWeight: '700', color: C.text },
+    committeeCount: {
+        minWidth: 24,
+        borderRadius: 10,
+        backgroundColor: C.primary,
+        paddingHorizontal: 7,
+        paddingVertical: 2,
+        alignItems: 'center',
+    },
+    committeeCountText: { color: '#fff', fontSize: 11, fontWeight: '700' },
+
+    // The membership sits inside its committee rather than beside it, so an
+    // open one still reads as one block when several are listed.
+    memberList: { marginTop: 7, marginLeft: 12 },
+    memberRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: C.surface,
+        borderRadius: 9,
+        borderWidth: 1,
+        borderColor: C.border,
+        borderLeftWidth: 3,
+        borderLeftColor: C.border,
+        paddingHorizontal: 9,
+        paddingVertical: 8,
+        marginBottom: 6,
+    },
+    memberRowMe: { borderLeftColor: C.primary, backgroundColor: C.primarySoft },
+    memberName: { flexShrink: 1, fontSize: 13.5, fontWeight: '700', color: C.text },
+    mePill: { backgroundColor: C.primarySoft, borderColor: C.primary },
+    mePillText: { color: C.primary },
+    rolePill: {
+        marginLeft: 7,
+        maxWidth: 92,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: C.border,
+        backgroundColor: C.bg,
+        paddingHorizontal: 7,
+        paddingVertical: 3,
+    },
+    rolePillText: { fontSize: 10, fontWeight: '700', color: C.muted },
 
     hint: { fontSize: 11.5, color: C.muted, marginBottom: 8, marginLeft: 4 },
     emptyText: { color: C.muted, fontSize: 13, textAlign: 'center', paddingVertical: 14 },
