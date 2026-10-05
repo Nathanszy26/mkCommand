@@ -948,27 +948,48 @@ export default class Staff extends Component {
         this.setState({ menuNode: null }, () => this.openInfo(menuNode));
     };
 
-    /** Placeholder. Said so plainly rather than opening an empty screen —
-     *  a menu item that silently does nothing reads as a bug. */
-    reportIssue = () => {
+    /**
+     * Command: close the menu, then hand over to an existing page.
+     *
+     * Both targets live in the app's ROOT stack, not in this tab navigator, so
+     * navigate() bubbles up to find them — the same call staff-utility.js makes
+     * from its own menus. Neither takes params: each reads AppUser from the
+     * store itself, so there is nothing to pass and nothing to keep in step.
+     */
+    goToRoute = (route) => {
         this.setState({ fabOpen: false }, () => {
-            Alert.alert('Report Issue', 'Not available yet — coming in a later update.');
+            const nav = this.props.navigation;
+            if (nav) {
+                nav.navigate(route);
+            }
         });
     };
+
+    /** The I.T Call Centre page — staff-utility.js's "I.T Call Centre Support". */
+    reportIssue = () => this.goToRoute(ROUTES.CallCentre);
+
+    /** staff-utility.js's "Leave Application", off its Leave menu. */
+    leaveApplication = () => this.goToRoute(ROUTES.StaffLeave);
 
     /**
      * Bottom-right floating menu. Collapsed it is one button; tapping it fans
      * out the items above it and dims the page so a second tap anywhere closes.
      *
-     * Staff Directory search moved to a bar at the top of the page, so Report
-     * Issue is the only item left here — the menu stays, ready for the next one.
+     * Both items hand off to pages that already exist elsewhere in the app
+     * rather than reimplementing them here.
+     *
+     * Leave Application is hidden for comp 8 (TP Group), who are not on this
+     * leave system. It is hidden too when the session has not loaded yet: for
+     * an exclusion rule, showing it to someone who should not see it is the
+     * worse failure of the two.
      *
      * `lifted` raises the whole thing clear of the Issue Actions bar, which
      * appears at the bottom of this same screen whenever staff are ticked —
      * otherwise the button would sit on top of the Proceed button.
      */
     renderFab(lifted) {
-        const { fabOpen } = this.state;
+        const { fabOpen, user } = this.state;
+        const showLeave = !!user && String(user.compId) !== '8';
 
         return (
             <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
@@ -994,6 +1015,14 @@ export default class Staff extends Component {
                                 tone="muted"
                                 onPress={this.reportIssue}
                             />
+                            {showLeave && (
+                                <FabItem
+                                    icon={'\u2708'}
+                                    label="Leave Application"
+                                    tone="muted"
+                                    onPress={this.leaveApplication}
+                                />
+                            )}
                         </View>
                     )}
 
