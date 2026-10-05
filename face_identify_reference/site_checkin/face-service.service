@@ -1,0 +1,17 @@
+[Unit]
+Description=Face Recognition Service for Staff Attendance
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/html/glob/it/mkPortal/site_checkin/face_services
+ExecStart=/var/www/html/glob/it/mkPortal/site_checkin/face_services/venv/bin/gunicorn --bind 127.0.0.1:5000 --workers 2 --timeout 60 face_service:app
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/www/html/glob/it/mkPortal/site_checkin/face_services/face_service.log
+StandardError=append:/var/www/html/glob/it/mkPortal/site_checkin/face_services/face_service.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

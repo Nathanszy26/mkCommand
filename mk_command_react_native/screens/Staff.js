@@ -17,6 +17,7 @@ import ROUTES from '../../../../library/routes.js';
 import IssueActionModal from './IssueActionModal.js';
 import StaffDirectorySearch from '../components/StaffDirectorySearch.js';
 import PhotoViewerModal from '../components/PhotoViewerModal.js';
+import StaffPhotoSearchModal from '../components/StaffPhotoSearchModal.js';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { fetchStaffDetail, fetchRoots } from '../services/staffDirectoryApi.js';
 import StaffPhoto from '../components/StaffPhoto.js';
@@ -440,6 +441,7 @@ export default class Staff extends Component {
             searchOpen: false,    // the directory search panel is up
             myDetail: null,       // own contact card, loaded after the hierarchy
             viewPhoto: null,      // photo being shown full screen
+            photoSearchOpen: false, // "Staff Search (By Photo)" is up
 
             // --- org navigation, in place on this page ---------------------
             // focus === null means "me": the full screen with the tree, the
@@ -968,6 +970,19 @@ export default class Staff extends Component {
     /** The I.T Call Centre page — staff-utility.js's "I.T Call Centre Support". */
     reportIssue = () => this.goToRoute(ROUTES.CallCentre);
 
+    /** Command: find a staff member from a picture of their face. A modal
+     *  rather than a route: it belongs to this screen, and what it finds is
+     *  handed straight to the card this screen already draws. */
+    openPhotoSearch = () => this.setState({ fabOpen: false, photoSearchOpen: true });
+
+    closePhotoSearch = () => this.setState({ photoSearchOpen: false });
+
+    /** Command: a face was matched and confirmed — open that person's card by
+     *  the one path every other way in uses, so Back behaves the same. */
+    onPhotoSearchResult = (staff) => {
+        this.setState({ photoSearchOpen: false }, () => this.openInfo(staff));
+    };
+
     /** staff-utility.js's "Leave Application", off its Leave menu. */
     leaveApplication = () => this.goToRoute(ROUTES.StaffLeave);
 
@@ -975,8 +990,9 @@ export default class Staff extends Component {
      * Bottom-right floating menu. Collapsed it is one button; tapping it fans
      * out the items above it and dims the page so a second tap anywhere closes.
      *
-     * Both items hand off to pages that already exist elsewhere in the app
-     * rather than reimplementing them here.
+     * Report Issue and Leave Application hand off to pages that already exist
+     * elsewhere in the app rather than reimplementing them here. Staff Search
+     * opens in place, because what it finds belongs on this screen's own card.
      *
      * Leave Application is hidden for comp 8 (TP Group), who are not on this
      * leave system. It is hidden too when the session has not loaded yet: for
@@ -1009,6 +1025,12 @@ export default class Staff extends Component {
                 >
                     {fabOpen && (
                         <View style={styles.fabItems}>
+                            <FabItem
+                                icon={'\u2315'}
+                                label="Staff Search (By Photo)"
+                                tone="muted"
+                                onPress={this.openPhotoSearch}
+                            />
                             <FabItem
                                 icon={'!'}
                                 label="Report Issue"
@@ -1999,6 +2021,20 @@ export default class Staff extends Component {
                         uri={this.state.viewPhoto.uri}
                         fullname={this.state.viewPhoto.fullname}
                         onClose={() => this.setState({ viewPhoto: null })}
+                    />
+                )}
+
+                {/* Mounted only while open, so every search starts from scratch
+                    rather than reopening on the last person it found. */}
+                {this.state.photoSearchOpen && !!this.state.user && (
+                    <StaffPhotoSearchModal
+                        visible
+                        session={{
+                            person: this.state.user.person,
+                            compId: this.state.user.compId,
+                        }}
+                        onClose={this.closePhotoSearch}
+                        onOpenStaff={this.onPhotoSearchResult}
                     />
                 )}
 
