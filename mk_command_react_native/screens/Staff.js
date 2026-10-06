@@ -19,7 +19,7 @@ import StaffDirectorySearch from '../components/StaffDirectorySearch.js';
 import PhotoViewerModal from '../components/PhotoViewerModal.js';
 import StaffPhotoSearchModal from '../components/StaffPhotoSearchModal.js';
 import Icon from 'react-native-vector-icons/Ionicons';
-import { fetchStaffDetail, fetchRoots } from '../services/staffDirectoryApi.js';
+import { fetchStaffDetail, fetchRoots, fetchCommittees } from '../services/staffDirectoryApi.js';
 import StaffPhoto from '../components/StaffPhoto.js';
 import { forgetFailures } from '../components/imageQueue.js';
 
@@ -140,6 +140,74 @@ const SuperiorRow = ({ person, showRail, isLast, onPress }) => {
                 <Text style={[styles.pillText, pillTextStyle]}>{label}</Text>
             </View>
         </TouchableOpacity>
+    );
+};
+
+/**
+ * Where you stand in the chart, drawn as a path: the company, then the
+ * reporting line from the top down, then whoever is on screen.
+ *
+ * Built from the reporting line rather than from the way you walked in, so it
+ * reads the same whether you arrived by Up, by a search or by a face - the
+ * question it answers is "where am I", not "how did I get here". Every crumb
+ * but the last one is a tap back to that level.
+ *
+ * It scrolls sideways instead of wrapping or squeezing the text: six levels of
+ * full names will not fit across a phone, and a trail you cannot read is worse
+ * than one you have to push along. It is also held to one line so the card
+ * below never moves down a row when the line happens to be a deep one.
+ */
+const TrailBar = ({ crumbs }) => {
+    // Kept on the closure rather than in state: the only thing it is for is
+    // pinning the far end in view, which has no bearing on what is drawn.
+    let scroller = null;
+    return (
+        <ScrollView
+            ref={(node) => {
+                scroller = node;
+            }}
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            style={styles.trailWrap}
+            contentContainerStyle={styles.trailRow}
+            // Where you are matters more than where you came from, so a trail
+            // too long to fit opens at its end and is pushed back, not forward.
+            onContentSizeChange={() =>
+                scroller && scroller.scrollToEnd({ animated: false })
+            }
+        >
+            {crumbs.map((crumb, i) => {
+                const here = i === crumbs.length - 1;
+                return (
+                    <View key={crumb.key} style={styles.trailItem}>
+                        {i > 0 && <Text style={styles.trailSep}>{'\u203A'}</Text>}
+                        <TouchableOpacity
+                            style={[styles.trailCrumb, here && styles.trailCrumbHere]}
+                            activeOpacity={crumb.onPress ? 0.6 : 1}
+                            disabled={!crumb.onPress}
+                            onPress={crumb.onPress || undefined}
+                            hitSlop={{ top: 8, bottom: 8, left: 2, right: 2 }}
+                        >
+                            {!!crumb.icon && (
+                                <Icon
+                                    name={crumb.icon}
+                                    size={12}
+                                    color={here ? C.primary : C.muted}
+                                    style={styles.trailIcon}
+                                />
+                            )}
+                            <Text
+                                style={[styles.trailText, here && styles.trailTextHere]}
+                                numberOfLines={1}
+                            >
+                                {crumb.label}
+                            </Text>
+                        </TouchableOpacity>
+                    </View>
+                );
+            })}
+        </ScrollView>
     );
 };
 
@@ -459,6 +527,17 @@ export default class Staff extends Component {
             rootsLoading: false,
             rootsError: null,
 
+            // Two ways of reading the same company at its top level: by the
+            // chart it reports through, or by the committees it sits on.
+            // Departments is the default - it is the structure everything else
+            // on this screen is built out of.
+            rootsView: 'departments',   // 'departments' | 'committees'
+            committees: [],
+            committeesInstalled: true,  // false = committee.sql not run on host
+            committeesLoaded: false,    // fetched once per company, then kept
+            committeesLoading: false,
+            committeesError: null,
+
             // Which rows are open, and who is under them. One pair of maps
             // for every depth and for both lists, keyed by nodeKey — a row is
             // the same row wherever it appears, so opening it in a department
@@ -486,6 +565,16 @@ export default class Staff extends Component {
         // so it is the thing the gesture should fix.
         if (refreshing) {
             forgetFailures();
+            // A reload means "fetch it again", including the list the user is
+            // actually looking at. Dropping the flag is enough: the committees
+            // view re-asks the moment it finds it has nothing cached.
+            if (this.state.committeesLoaded) {
+                this.setState({ committeesLoaded: false }, () => {
+                    if (this.state.rootsOpen && this.state.rootsView === 'committees') {
+                        this.loadCommittees();
+                    }
+                });
+            }
         }
 
         try {
@@ -832,7 +921,9 @@ export default class Staff extends Component {
         this.openInfo(boss);
     };
 
-    /** Command: Back - one step along the trail, or home when it is empty. */
+    /** One step back along the trail, or home when it is empty. No button of
+     *  its own any more - Up calls it when the level above is where we just
+     *  came from, so climbing out shortens the trail instead of growing it. */
     goBack = () => {
         const { focusStack, searchOpen } = this.state;
         if (searchOpen) {
@@ -849,12 +940,70 @@ export default class Staff extends Component {
     };
 
     /**
+     * Command: switch the top level between the chart and the committees.
+     *
+     * The committees are fetched the first time they are asked for and then
+     * kept, like the roots above them: both describe one company, the company
+     * does not change under you, and paying for the round-trip every time the
+     * filter is tapped would make the switch feel broken. Pull-to-refresh is
+     * what reloads either of them.
+     */
+    setRootsView = (view) => {
+        if (this.state.rootsView === view) {
+            return;
+        }
+        this.setState({ rootsView: view });
+        if (view === 'committees' && !this.state.committeesLoaded) {
+            this.loadCommittees();
+        }
+    };
+
+    /**
+     * Fetch the committees this company may see.
+     *
+     * Failure is reported in place rather than thrown at the screen: the
+     * chart is still there behind the filter, and a committee list that could
+     * not load should cost you the list, not the page.
+     */
+    loadCommittees = async () => {
+        const { user } = this.state;
+        if (!user) {
+            return;
+        }
+
+        this.setState({ committeesLoading: true, committeesError: null });
+        try {
+            const res = await fetchCommittees(
+                { person: user.person, compId: user.compId },
+                user.compId
+            );
+            if (this.unmounted) {
+                return;
+            }
+            this.setState({
+                committees: res.committees,
+                committeesInstalled: res.installed,
+                committeesLoaded: true,
+                committeesLoading: false,
+            });
+        } catch (error) {
+            if (this.unmounted) {
+                return;
+            }
+            this.setState({
+                committeesLoading: false,
+                committeesError: error.message || 'Failed to load committees',
+            });
+        }
+    };
+
+    /**
      * Command: show the company's top level - departments for comp 1, top-of-
      * chart people elsewhere. Also where Up lands once the superiors run out,
      * so climbing never dead-ends.
      */
     openRoots = async () => {
-        const { user, roots } = this.state;
+        const { user, roots, rootsView, committeesLoaded, committeesLoading } = this.state;
         this.setState({
             rootsOpen: true,
             focus: null,
@@ -862,6 +1011,14 @@ export default class Staff extends Component {
             focusStack: [],
             searchOpen: false,
         });
+
+        // The view is remembered across a trip into somebody's card, so coming
+        // back can land on the committees - and a refresh in the meantime will
+        // have dropped what was cached for them. Nothing else would ask again,
+        // and an empty list reads as "this company has none".
+        if (rootsView === 'committees' && !committeesLoaded && !committeesLoading) {
+            this.loadCommittees();
+        }
 
         if (roots.length > 0) {
             return;
@@ -972,7 +1129,9 @@ export default class Staff extends Component {
 
     /** Command: find a staff member from a picture of their face. A modal
      *  rather than a route: it belongs to this screen, and what it finds is
-     *  handed straight to the card this screen already draws. */
+     *  handed straight to the card this screen already draws. Driven from the
+     *  nav bar's camera button; the floating menu is closed on the way in all
+     *  the same, so opening it from anywhere leaves the page tidy. */
     openPhotoSearch = () => this.setState({ fabOpen: false, photoSearchOpen: true });
 
     closePhotoSearch = () => this.setState({ photoSearchOpen: false });
@@ -991,8 +1150,9 @@ export default class Staff extends Component {
      * out the items above it and dims the page so a second tap anywhere closes.
      *
      * Report Issue and Leave Application hand off to pages that already exist
-     * elsewhere in the app rather than reimplementing them here. Staff Search
-     * opens in place, because what it finds belongs on this screen's own card.
+     * elsewhere in the app rather than reimplementing them here. Search by
+     * photo used to live here too; it is a nav bar button now, beside the
+     * other search, because that is where people look for it.
      *
      * Leave Application is hidden for comp 8 (TP Group), who are not on this
      * leave system. It is hidden too when the session has not loaded yet: for
@@ -1026,12 +1186,6 @@ export default class Staff extends Component {
                     {fabOpen && (
                         <View style={styles.fabItems}>
                             <FabItem
-                                icon={'\u2315'}
-                                label="Staff Search (By Photo)"
-                                tone="muted"
-                                onPress={this.openPhotoSearch}
-                            />
-                            <FabItem
                                 icon={'!'}
                                 label="Report Issue"
                                 tone="muted"
@@ -1061,18 +1215,122 @@ export default class Staff extends Component {
     }
 
     /**
+     * The reporting line above whoever is on screen, top of the chart first.
+     *
+     * The same list the Superiors section draws, in the same order, so the
+     * trail and the section below it never disagree about who is above you.
+     * The backend returns it nearest-first; a path reads the other way round.
+     */
+    trailChain() {
+        const { focus, focusDetail, data } = this.state;
+        const supers = focus
+            ? ((focusDetail && focusDetail.superiors) || [])
+            : ((data && data.superiors) || []);
+        return supers
+            .slice()
+            .sort((a, b) =>
+                b.level !== a.level
+                    ? b.level - a.level
+                    : titleCase(a.fullname).localeCompare(titleCase(b.fullname))
+            );
+    }
+
+    /**
+     * The trail under the nav bar, or nothing when there is no place to name.
+     *
+     * Hidden behind the directory search: that panel is a list of everybody,
+     * not a place in the chart, and a stale path over it would only mislead.
+     *
+     * On the top level the company IS where you are, so it is the one crumb
+     * and it is not a link back to itself. Anywhere else it leads the path and
+     * takes you to the top level, which is what the building button does.
+     */
+    renderTrail() {
+        const { focus, focusDetail, data, rootsOpen, searchOpen, focusLoading } = this.state;
+        if (searchOpen) {
+            return null;
+        }
+
+        const me = data && data.staff;
+        // The same pair renderFocus draws from: the row we already had, with
+        // the fetched record over the top of it once it lands.
+        const current = focus ? (focusDetail || focus) : me;
+        if (!current) {
+            return null;
+        }
+
+        const company =
+            current.company_name || (me && me.company_name) || 'Company';
+
+        if (rootsOpen) {
+            // The company, then which of its two faces is on screen. The
+            // company crumb goes back to the chart, so the trail is also the
+            // way out of the committees list.
+            const onChart = this.state.rootsView !== 'committees';
+            return (
+                <TrailBar
+                    crumbs={[
+                        {
+                            key: 'co',
+                            label: company,
+                            icon: 'business',
+                            onPress: onChart ? null : () => this.setRootsView('departments'),
+                        },
+                        onChart
+                            ? { key: 'dept', label: 'Departments', icon: 'folder' }
+                            : { key: 'comm', label: 'Committees', icon: 'people' },
+                    ]}
+                />
+            );
+        }
+
+        const crumbs = [
+            { key: 'co', label: company, icon: 'business', onPress: this.openRoots },
+        ];
+        this.trailChain().forEach((boss) => {
+            crumbs.push({
+                key: nodeKey(boss),
+                label: titleCase(boss.fullname),
+                onPress: () => this.openInfo(boss),
+            });
+        });
+        // Somebody else's line arrives a moment after their name does. Say so
+        // rather than drawing a short path that is about to grow a middle.
+        if (focus && focusLoading) {
+            crumbs.push({ key: 'wait', label: '\u2026' });
+        }
+        crumbs.push({
+            key: 'here',
+            label: titleCase(current.fullname),
+            icon: focus ? null : 'person',
+        });
+
+        return <TrailBar crumbs={crumbs} />;
+    }
+
+    /**
      * The navigation strip, fixed above the body.
      *
      * Up climbs to the superior (and to the company once they run out), the
-     * building button jumps to the top level, the person button comes home, and
-     * Search swaps the body for the directory.
+     * building button jumps to the top level, the person button comes home,
+     * Search swaps the body for the directory, and the camera beside it does
+     * the same search from a face.
      *
-     * No breadcrumb: the card below already says whose it is, and the trail was
-     * repeating that name back at the cost of the width the search box now has.
-     * Back still walks the way you came, one step at a time.
+     * The two searches sit side by side on purpose. Searching by photo is the
+     * same job as searching by name - you have someone in front of you and you
+     * want their card - so it belongs where the other search is, not buried in
+     * a menu in the far corner.
+     *
+     * No Back button: it was spending width these buttons need, and Up walks
+     * out of a chart a level at a time while the person button comes straight
+     * home - which is the way out people were reaching for anyway.
+     *
+     * Where you are is answered under the bar instead, by renderTrail, where
+     * it has a line to itself and can be read without costing the controls
+     * any room.
      */
     renderNavBar() {
-        const { focus, rootsOpen, searchOpen } = this.state;
+        const { rootsOpen, searchOpen } = this.state;
 
         return (
             <View style={styles.navBar}>
@@ -1127,16 +1385,17 @@ export default class Staff extends Component {
                     </Text>
                 </TouchableOpacity>
 
-                {(!!focus || rootsOpen || searchOpen) && (
-                    <TouchableOpacity
-                        style={styles.navBack}
-                        activeOpacity={0.7}
-                        onPress={this.goBack}
-                        hitSlop={{ top: 10, bottom: 10, left: 6, right: 6 }}
-                    >
-                        <Text style={styles.navBackText}>Back</Text>
-                    </TouchableOpacity>
-                )}
+                {/* The same search, from a face instead of a name - so it sits
+                    against the search box rather than off with the buttons
+                    that move around the chart. */}
+                <TouchableOpacity
+                    style={styles.navIconBtn}
+                    activeOpacity={0.7}
+                    onPress={this.openPhotoSearch}
+                    hitSlop={{ top: 10, bottom: 10, left: 6, right: 6 }}
+                >
+                    <Icon name="camera" size={18} color={C.primary} />
+                </TouchableOpacity>
             </View>
         );
     }
@@ -1165,6 +1424,7 @@ export default class Staff extends Component {
 
                 <View style={scrolled ? styles.navWrapScroll : styles.navWrap}>
                     {this.renderNavBar()}
+                    {this.renderTrail()}
                 </View>
             </View>
         );
@@ -1432,6 +1692,177 @@ export default class Staff extends Component {
      * their own.
      */
     renderRoots() {
+        return (
+            <View>
+                {this.renderRootsFilter()}
+                {this.state.rootsView === 'committees'
+                    ? this.renderCommittees()
+                    : this.renderDepartments()}
+            </View>
+        );
+    }
+
+    /**
+     * The two-way switch above the top level.
+     *
+     * A segmented control rather than a dropdown: there are two answers, both
+     * fit on the line, and which one you are on should be readable without
+     * opening anything. Drawn even while the lists are loading so the switch
+     * never jumps around under the thumb.
+     */
+    renderRootsFilter() {
+        const { rootsView, roots, committees, committeesLoaded } = this.state;
+
+        // The same number the Departments section puts in its header: the
+        // rows UNDER the top of the chart, or the whole list where there is no
+        // top. Two different counts for one list would read as a bug.
+        const under = roots.filter((r) => !r.is_top).length;
+
+        const tabs = [
+            {
+                key: 'departments',
+                label: 'Departments',
+                icon: 'folder',
+                // The committees only know their count once fetched, so that
+                // one stays blank until it has something true to say.
+                count: roots.length === 0 ? null : (under > 0 ? under : roots.length),
+            },
+            {
+                key: 'committees',
+                label: 'Committees',
+                icon: 'people',
+                count: committeesLoaded ? committees.length : null,
+            },
+        ];
+
+        return (
+            <View style={styles.filterBar}>
+                {tabs.map((tab) => {
+                    const on = rootsView === tab.key;
+                    return (
+                        <TouchableOpacity
+                            key={tab.key}
+                            style={[styles.filterTab, on && styles.filterTabOn]}
+                            activeOpacity={0.7}
+                            onPress={() => this.setRootsView(tab.key)}
+                        >
+                            <Icon
+                                name={tab.icon}
+                                size={15}
+                                color={on ? '#ffffff' : C.primary}
+                            />
+                            <Text style={[styles.filterTabText, on && styles.filterTabTextOn]}>
+                                {tab.label}
+                            </Text>
+                            {tab.count !== null && (
+                                <View style={[styles.filterCount, on && styles.filterCountOn]}>
+                                    <Text
+                                        style={[
+                                            styles.filterCountText,
+                                            on && styles.filterCountTextOn,
+                                        ]}
+                                    >
+                                        {tab.count}
+                                    </Text>
+                                </View>
+                            )}
+                        </TouchableOpacity>
+                    );
+                })}
+            </View>
+        );
+    }
+
+    /**
+     * The committees this company may see, each opening to its membership.
+     *
+     * The same CommitteeRow the card below your own details uses, so a
+     * committee reads identically whether you met it through your own seat or
+     * through the company's list - and tapping a member opens their card by
+     * the same path everything else on this screen uses.
+     *
+     * Who may SEE a committee is the company's business; who is IN one is not
+     * filtered by that, so a committee scoped to this company still lists its
+     * members from every other subsidiary, each labelled with their own.
+     */
+    renderCommittees() {
+        const {
+            committees,
+            committeesLoading,
+            committeesError,
+            committeesInstalled,
+            user,
+        } = this.state;
+
+        if (committeesLoading) {
+            return (
+                <View style={styles.inlineState}>
+                    <ActivityIndicator color={C.primary} />
+                </View>
+            );
+        }
+        if (committeesError) {
+            return (
+                <View style={styles.inlineState}>
+                    <Text style={styles.errorText}>{committeesError}</Text>
+                    <TouchableOpacity style={styles.retryBtn} onPress={this.loadCommittees}>
+                        <Text style={styles.retryText}>Retry</Text>
+                    </TouchableOpacity>
+                </View>
+            );
+        }
+        // "Not set up on the server" and "this company has none" look the same
+        // in an empty list and are not the same problem, so they are told
+        // apart - one is for whoever runs the database, the other is an answer.
+        if (!committeesInstalled) {
+            return (
+                <View style={styles.inlineState}>
+                    <Text style={styles.emptyText}>
+                        Committees are not set up on the server yet.
+                    </Text>
+                </View>
+            );
+        }
+        if (committees.length === 0) {
+            return (
+                <View style={styles.inlineState}>
+                    <Text style={styles.emptyText}>
+                        No committees are shared with this company.
+                    </Text>
+                </View>
+            );
+        }
+
+        const meKey = user ? `${user.person}|${user.compId}|0` : null;
+
+        return (
+            <Section title="Committees" count={committees.length}>
+                {committees.map((committee) => (
+                    <View key={committee.id}>
+                        <CommitteeRow
+                            committee={committee}
+                            open={!!this.state.openCommittees[committee.id]}
+                            onToggle={this.toggleCommittee}
+                            onPressMember={this.openInfo}
+                            meKey={meKey}
+                        />
+                        {/* Which companies may see it. Worth a line here, where
+                            you are reading the company's whole list, and not on
+                            your own card, where you are reading your own seats. */}
+                        {!!committee.scope_label && (
+                            <Text style={styles.committeeScope} numberOfLines={1}>
+                                {committee.scope_label}
+                            </Text>
+                        )}
+                    </View>
+                ))}
+            </Section>
+        );
+    }
+
+    /** The company's chart at its top level: departments where the company has
+     *  them on file, the people with nobody above them where it does not. */
+    renderDepartments() {
         const { roots, rootsLoading, rootsError } = this.state;
 
         if (rootsLoading) {
@@ -2095,6 +2526,29 @@ const styles = StyleSheet.create({
     heroName: { fontSize: 19, fontWeight: '700', color: C.text, marginTop: 10 },
     heroMeta: { fontSize: 13, color: C.muted, marginTop: 2 },
 
+    // The trail sits on the page background under the bar, not inside it: the
+    // bar is the controls, and this is a label for what they are pointed at.
+    trailWrap: { marginTop: 8, flexGrow: 0 },
+    trailRow: { flexDirection: 'row', alignItems: 'center', paddingRight: 14 },
+    trailItem: { flexDirection: 'row', alignItems: 'center' },
+    trailSep: { fontSize: 13, color: C.muted, marginHorizontal: 3 },
+    trailCrumb: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        borderWidth: 1,
+        borderColor: C.border,
+        backgroundColor: C.surface,
+        borderRadius: 8,
+        paddingHorizontal: 8,
+        paddingVertical: 5,
+    },
+    // The last crumb is where you stand, so it is the one that is filled in.
+    trailCrumbHere: { borderColor: C.primary, backgroundColor: C.primarySoft },
+    trailIcon: { marginRight: 4 },
+    // Capped, so one long name cannot push the rest of the path off the end.
+    trailText: { fontSize: 12, fontWeight: '600', color: C.muted, maxWidth: 170 },
+    trailTextHere: { color: C.primary, fontWeight: '800' },
+
     navWrap: { paddingHorizontal: 14, paddingTop: 12, paddingBottom: 12 },
     navWrapScroll: { paddingBottom: 12 },
     navBar: {
@@ -2134,7 +2588,7 @@ const styles = StyleSheet.create({
         flex: 1,
         flexDirection: 'row',
         alignItems: 'center',
-        marginHorizontal: 6,
+        marginLeft: 6,
         borderWidth: 1,
         borderColor: C.primary,
         backgroundColor: C.primarySoft,
@@ -2146,10 +2600,50 @@ const styles = StyleSheet.create({
     navSearchIcon: { fontSize: 17, fontWeight: '700', color: C.primary, marginRight: 5 },
     navSearchText: { flex: 1, fontSize: 13.5, fontWeight: '700', color: C.primary },
     navSearchTextOn: { color: '#ffffff' },
-    navBack: { paddingLeft: 4, paddingRight: 2, paddingVertical: 9 },
-    navBackText: { fontSize: 13.5, fontWeight: '700', color: C.primary },
 
     inlineState: { alignItems: 'center', paddingVertical: 26 },
+
+    /* departments / committees switch, above the top level */
+    filterBar: { flexDirection: 'row', marginBottom: 12 },
+    filterTab: {
+        flex: 1,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderWidth: 1,
+        borderColor: C.primary,
+        backgroundColor: C.surface,
+        borderRadius: 10,
+        paddingVertical: 10,
+        paddingHorizontal: 8,
+        marginRight: 8,
+    },
+    // The selected side is filled rather than merely tinted: this decides what
+    // the whole list below it is, so it has to be readable at a glance.
+    filterTabOn: { backgroundColor: C.primary },
+    filterTabText: { fontSize: 13, fontWeight: '700', color: C.primary, marginLeft: 6 },
+    filterTabTextOn: { color: '#ffffff' },
+    filterCount: {
+        minWidth: 20,
+        alignItems: 'center',
+        backgroundColor: C.primarySoft,
+        borderRadius: 9,
+        paddingHorizontal: 5,
+        paddingVertical: 1,
+        marginLeft: 6,
+    },
+    filterCountOn: { backgroundColor: 'rgba(255, 255, 255, 0.22)' },
+    filterCountText: { fontSize: 11, fontWeight: '800', color: C.primary },
+    filterCountTextOn: { color: '#ffffff' },
+    // Sits under its committee rather than on the row: it answers "who else
+    // can see this", which is a footnote, not the name of the thing.
+    committeeScope: {
+        fontSize: 11,
+        color: C.muted,
+        marginTop: -2,
+        marginBottom: 10,
+        marginLeft: 22,
+    },
 
     rootRow: {
         flexDirection: 'row',

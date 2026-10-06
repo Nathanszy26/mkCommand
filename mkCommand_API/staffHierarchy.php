@@ -493,8 +493,14 @@ class GwRepository
  * A committee is NOT confined to one company. Seats are keyed on
  * (person, comp_id) and joined to users on that pair, so one committee can hold
  * staff of several subsidiaries and every member carries its own company_name.
- * mk_committee.comp_id only names the company that OWNS the committee
- * (NULL = group-wide); it never limits who may sit on it.
+ *
+ * mk_committee.comp_id is a comma-separated list of the companies allowed to
+ * SEE the committee in staffDirectory.php's Committees list - NULL or empty
+ * means every company (see committee_visibility.sql). It still limits nothing
+ * about membership, and this file does not filter on it AT ALL: the question
+ * here is "which committees is this person on", and that is answered by their
+ * seat. Hiding a committee somebody actually sits on, because their company is
+ * not on the viewer list, would be a lie rather than a permission.
  *
  * Staff only - a GW code lives in a different namespace that can collide with a
  * users.person, so GW are not seatable. See committee.sql.
@@ -568,12 +574,13 @@ class CommitteeRepository
      */
     public function committeesOf($person, $compId)
     {
+        // No join to subsidiaries on c.comp_id: it holds a LIST now, and
+        // `s.id = '1,2,3'` does not fail in MySQL - it coerces to 1 and
+        // quietly names the wrong company. The ids are parsed in PHP instead.
         $sql = "SELECT c.id, c.name, c.code, c.description, c.comp_id,
-                       s.name AS company_name,
                        m.committee_role AS role
                 FROM " . self::MEMBER . " m
                 INNER JOIN " . self::COMMITTEE . " c ON c.id = m.committee_id
-                LEFT JOIN subsidiaries s ON s.id = c.comp_id
                 WHERE m.person = :person AND m.comp_id = :comp_id
                   AND " . self::MEMBER_LIVE . "
                   AND " . self::COMMITTEE_LIVE . "
@@ -643,6 +650,28 @@ class CommitteeService
         $this->repo = $repo;
     }
 
+    /**
+     * '1, 2,3' -> array(1, 2, 3). NULL or empty -> array(), meaning "every
+     * company". Mirrors staffDirectory.php's CommitteeService::parseCompIds -
+     * two files read the same hand-typed column, so they must read it the
+     * same way. Change one, change the other.
+     */
+    public static function parseCompIds($raw)
+    {
+        if ($raw === null || trim((string)$raw) === '') {
+            return array();
+        }
+
+        $out = array();
+        foreach (explode(',', (string)$raw) as $part) {
+            $part = trim($part);
+            if ($part !== '' && ctype_digit($part)) {
+                $out[] = (int)$part;
+            }
+        }
+        return array_values(array_unique($out));
+    }
+
     public function committeesFor($person, $compId)
     {
         if (!$this->repo->installed()) {
@@ -689,9 +718,10 @@ class CommitteeService
                     'name'         => $row['name'],
                     'code'         => $row['code'],
                     'description'  => $row['description'],
-                    // null on both = group-wide, not "missing".
-                    'comp_id'      => $row['comp_id'] === null ? null : (int)$row['comp_id'],
-                    'company_name' => $row['company_name'],
+                    // Which companies may see this in the Committees list. []
+                    // = all of them. Reported for parity with staffDirectory's
+                    // committees action; it does not gate anything here.
+                    'visible_to'   => self::parseCompIds($row['comp_id']),
                     'my_role'      => $row['role'],
                     'member_count' => count($members),
                     'members'      => $members,

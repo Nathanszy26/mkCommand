@@ -110,6 +110,34 @@ export async function fetchRoots(session, targetCompId) {
 }
 
 /**
+ * The committees one company is allowed to see, each with its full membership
+ * already attached — the other way of reading a company's top level.
+ *
+ * Which committees come back is decided by mk_committee.comp_id, a list of the
+ * companies that may SEE each one (empty = all of them). Who is IN one is not
+ * filtered by that at all, so a committee scoped to Globinaco still lists its
+ * members from every other subsidiary. See committee_visibility.sql.
+ *
+ * `installed` is false where the committee tables have not been created on the
+ * host yet. That is a different thing from a company with no committees, and
+ * the screen says so differently — so it is reported rather than flattened
+ * into an empty list.
+ */
+export async function fetchCommittees(session, targetCompId) {
+    requireSession(session);
+    const data = await getJson({
+        action: 'committees',
+        person: session.person,
+        comp_id: session.compId,
+        target_comp_id: targetCompId,
+    });
+    return {
+        installed: data.installed !== false,
+        committees: data.committees || [],
+    };
+}
+
+/**
  * Staff and GW in `targetCompId` matching `query` on name, email, mobile,
  * department, position or the task text of their latest approved job spec.
  * `department` is optional; null means every department.

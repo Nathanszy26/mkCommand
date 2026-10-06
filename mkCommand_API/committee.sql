@@ -16,8 +16,14 @@
 --
 -- A committee is deliberately NOT confined to one company: membership is keyed
 -- on (person, comp_id), so one committee can seat staff from several
--- subsidiaries at once. mk_committee.comp_id names the company that OWNS the
--- committee (NULL = group-wide); it never limits who may sit on it.
+-- subsidiaries at once.
+--
+-- NOTE: mk_committee.comp_id has since been widened to a comma-separated list
+-- of the companies allowed to SEE the committee -- run committee_visibility.sql
+-- after this file, and read it for the current rule. It still limits nothing
+-- about membership. The int(11) column and the "owning company" wording below
+-- are what this file originally created; they are left as written so the
+-- history reads straight, but the live column is VARCHAR.
 --
 -- Scope: staff only. GW (evaluation.monthly_assign_gw) are not seatable here —
 -- the join below is to staff_portal2.users, and a GW code lives in a different

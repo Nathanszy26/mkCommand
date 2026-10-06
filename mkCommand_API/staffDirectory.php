@@ -6,10 +6,12 @@ header('Content-Type: application/json; charset=UTF-8');
  * MK Command Staff tab.
  *
  * IN  : person, comp_id (alias: comid)   the CALLER's session, always required
- *       action = companies | departments | roots | search | browse | detail
- *                                                  (default: search)
+ *       action = companies | departments | roots | committees | search |
+ *                browse | detail                    (default: search)
  *       departments : [target_comp_id]
  *       roots       : [target_comp_id]   - the org navigator's top level
+ *       committees  : [target_comp_id]   - the committees that company may see,
+ *                                          each with its full membership
  *       search      : q, [target_comp_id], [department], [limit]
  *       browse      : [target_comp_id], [department]   — whole company, no text
  *       detail      : target_person, [target_comp_id], [is_gw]
@@ -1524,6 +1526,300 @@ class DirectoryRepository
 }
 
 /**
+ * Committees a COMPANY may see - mkPortal.mk_committee + mk_committee_member.
+ *
+ * staffHierarchy.php answers "which committees is this person on", starting
+ * from their seat. This answers the other question: "which committees does
+ * this company have", starting from the company. Same two tables, opposite
+ * direction, so the two readers live in different files on purpose.
+ *
+ * ---- Visibility ----------------------------------------------------------
+ * mk_committee.comp_id is a comma-separated list of the companies allowed to
+ * SEE the committee (see committee_visibility.sql):
+ *
+ *     NULL or ''   every company
+ *     '1'          comp 1 only
+ *     '1,2,3'      comps 1, 2 and 3
+ *
+ * It does NOT limit who may sit on one. A committee only comp 1 can see may
+ * seat staff of comps 3 and 8, and whoever can see it gets the full
+ * membership - the seats are keyed on (person, comp_id) and joined to users on
+ * that pair, never on this column.
+ *
+ * FIND_IN_SET is the match, over REPLACE(..., ' ', '') so a hand-typed
+ * '1, 2, 3' behaves like '1,2,3'. The column is small, hand-maintained and
+ * read without an index either way - there is one live committee today.
+ *
+ * Staff only. A GW code lives in a different namespace that can collide with a
+ * users.person, so GW are not seatable. See committee.sql.
+ */
+class CommitteeRepository
+{
+    private $db;
+
+    const COMMITTEE = 'mkPortal.mk_committee';
+    const MEMBER    = 'mkPortal.mk_committee_member';
+
+    /** The committee itself is live today. Empty bounds mean "unbounded" -
+     *  the same rule the reporting-line tables use for a date range. */
+    const COMMITTEE_LIVE = "c.status = '1' AND c.deleted_at IS NULL
+        AND (c.date_from IS NULL OR c.date_from <= CURDATE())
+        AND (c.date_to   IS NULL OR c.date_to   >= CURDATE())";
+
+    /** A seat is live today. Past members keep their row and simply stop being
+     *  returned, so the history survives. */
+    const MEMBER_LIVE = "m.status = '1' AND m.deleted_at IS NULL
+        AND (m.date_from IS NULL OR m.date_from <= CURDATE())
+        AND (m.date_to   IS NULL OR m.date_to   >= CURDATE())";
+
+    /** Empty list = everyone, otherwise the asking company must be in it. */
+    const VISIBLE_TO_COMP = "(c.comp_id IS NULL OR TRIM(c.comp_id) = ''
+        OR FIND_IN_SET(:vis_comp_id, REPLACE(c.comp_id, ' ', '')) > 0)";
+
+    /** Resolved once per request by installed(); null until then. */
+    private $installed = null;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    /**
+     * Are the committee tables actually there right now?
+     *
+     * Committees are optional by design - committee.sql may not have been run
+     * on this host yet. Without this probe, a deploy in the wrong order turns
+     * the Committees tab into a 500 instead of an empty list. Same contract
+     * staffHierarchy.php has with the same two tables.
+     *
+     * One information_schema read, memoised for the request.
+     */
+    public function installed()
+    {
+        if ($this->installed !== null) {
+            return $this->installed;
+        }
+
+        $this->installed = false;
+
+        try {
+            $sql = "SELECT COUNT(*) AS n FROM information_schema.TABLES
+                     WHERE TABLE_SCHEMA = 'mkPortal'
+                       AND TABLE_NAME IN ('mk_committee', 'mk_committee_member')";
+            $row = $this->db->query($sql)->fetch();
+            $this->installed = ($row && (int)$row['n'] === 2);
+        } catch (Exception $e) {
+            error_log('staffDirectory committee schema probe failed: ' . $e->getMessage());
+        }
+
+        return $this->installed;
+    }
+
+    /**
+     * Query: every live committee this company is allowed to see.
+     *
+     * No join to subsidiaries on c.comp_id any more - it is a list now, and
+     * s.id = '1,2,3' would silently resolve to subsidiary 1 rather than
+     * failing. The company names belong to whoever is reading the list, so
+     * CommitteeService resolves them from the parsed ids instead.
+     */
+    public function visibleTo($compId)
+    {
+        $sql = "SELECT c.id, c.name, c.code, c.description, c.comp_id,
+                       c.date_from, c.date_to
+                FROM " . self::COMMITTEE . " c
+                WHERE " . self::COMMITTEE_LIVE . "
+                  AND " . self::VISIBLE_TO_COMP . "
+                ORDER BY c.name ASC";
+
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindValue(':vis_comp_id', (string)(int)$compId, PDO::PARAM_STR);
+        $stmt->execute();
+
+        return $stmt->fetchAll();
+    }
+
+    /**
+     * Query: every live member of MANY committees in one round-trip, so the
+     * list arrives with its people already in it and opening one costs nothing.
+     *
+     * The join to users is the cross-company part: it matches the seat's own
+     * (person, comp_id), never the committee's visibility list, and hands back
+     * each member's own company_name, department, position and photo.
+     */
+    public function membersOf(array $committeeIds)
+    {
+        if (empty($committeeIds)) {
+            return array();
+        }
+
+        $place = implode(',', array_fill(0, count($committeeIds), '?'));
+
+        $sql = "SELECT m.committee_id, m.committee_role AS role,
+                       u.person, u.comp_id, u.fullname, u.department, u.position,
+                       s.name AS company_name,
+                       " . DirectoryRepository::STAFF_PHOTO_SUBQUERY . " AS profile_pic
+                FROM " . self::MEMBER . " m
+                INNER JOIN users u
+                    ON u.person = m.person AND u.comp_id = m.comp_id
+                   AND " . DirectoryRepository::USER_VISIBLE . "
+                LEFT JOIN subsidiaries s ON s.id = u.comp_id
+                WHERE m.committee_id IN ({$place})
+                  AND " . self::MEMBER_LIVE . "
+                ORDER BY m.sort_order ASC, u.fullname ASC";
+
+        $stmt = $this->db->prepare($sql);
+        $i = 1;
+        foreach ($committeeIds as $id) {
+            $stmt->bindValue($i++, (int)$id, PDO::PARAM_INT);
+        }
+        $stmt->execute();
+
+        return $stmt->fetchAll();
+    }
+
+    /** id => name for the subsidiaries named in a visibility list, so the app
+     *  can say "Globinaco, Arus Sawit" rather than "1,2". */
+    public function companyNames(array $ids)
+    {
+        if (empty($ids)) {
+            return array();
+        }
+
+        $place = implode(',', array_fill(0, count($ids), '?'));
+        $stmt  = $this->db->prepare(
+            "SELECT id, name FROM subsidiaries WHERE id IN ({$place})"
+        );
+        $i = 1;
+        foreach ($ids as $id) {
+            $stmt->bindValue($i++, (int)$id, PDO::PARAM_INT);
+        }
+        $stmt->execute();
+
+        $out = array();
+        foreach ($stmt->fetchAll() as $row) {
+            $out[(int)$row['id']] = $row['name'];
+        }
+        return $out;
+    }
+}
+
+/**
+ * The company's committees, each carrying its full membership.
+ *
+ * Three round-trips no matter how many committees there are: the list, every
+ * member of all of them at once, and the company names behind the visibility
+ * lists. Degrades to an empty list rather than failing - the Committees view is
+ * a second face on a screen whose first job is the org chart, and a fault there
+ * should not be able to take the chart down with it.
+ */
+class CommitteeService
+{
+    private $repo;
+
+    public function __construct(CommitteeRepository $repo)
+    {
+        $this->repo = $repo;
+    }
+
+    /**
+     * '1, 2,3' -> array(1, 2, 3). NULL or empty -> array(), which means "every
+     * company" everywhere this value is read.
+     *
+     * Non-numeric junk is dropped rather than coerced: the column is typed by
+     * hand, and a stray word there should narrow nothing and widen nothing.
+     */
+    public static function parseCompIds($raw)
+    {
+        if ($raw === null || trim((string)$raw) === '') {
+            return array();
+        }
+
+        $out = array();
+        foreach (explode(',', (string)$raw) as $part) {
+            $part = trim($part);
+            if ($part !== '' && ctype_digit($part)) {
+                $out[] = (int)$part;
+            }
+        }
+        return array_values(array_unique($out));
+    }
+
+    public function forCompany($compId)
+    {
+        if (!$this->repo->installed()) {
+            return array();
+        }
+
+        try {
+            $committees = $this->repo->visibleTo($compId);
+            if (empty($committees)) {
+                return array();
+            }
+
+            $ids        = array();
+            $scopeComps = array();
+            foreach ($committees as $row) {
+                $ids[] = (int)$row['id'];
+                foreach (self::parseCompIds($row['comp_id']) as $cid) {
+                    $scopeComps[$cid] = true;
+                }
+            }
+
+            $names = $this->repo->companyNames(array_keys($scopeComps));
+
+            $byCommittee = array();
+            foreach ($this->repo->membersOf($ids) as $row) {
+                $byCommittee[(int)$row['committee_id']][] = array(
+                    'person'       => $row['person'],
+                    'comp_id'      => (int)$row['comp_id'],
+                    'fullname'     => $row['fullname'],
+                    'department'   => $row['department'],
+                    'position'     => $row['position'],
+                    'company_name' => $row['company_name'],
+                    'role'         => $row['role'],
+                    // Always a staff record here, but the app keys people on
+                    // (person, comp_id, is_gw) everywhere - so say so, and a
+                    // committee member row works with the rest of the screen.
+                    'is_gw'        => 0,
+                    'photo_url'    => ProfilePhoto::url($row['profile_pic']),
+                );
+            }
+
+            $out = array();
+            foreach ($committees as $row) {
+                $id      = (int)$row['id'];
+                $members = isset($byCommittee[$id]) ? $byCommittee[$id] : array();
+                $visible = self::parseCompIds($row['comp_id']);
+
+                $labels = array();
+                foreach ($visible as $cid) {
+                    $labels[] = isset($names[$cid]) ? $names[$cid] : ('Company ' . $cid);
+                }
+
+                $out[] = array(
+                    'id'           => $id,
+                    'name'         => $row['name'],
+                    'code'         => $row['code'],
+                    'description'  => $row['description'],
+                    // [] = every company. The app badges that as "Group-wide"
+                    // rather than listing every subsidiary there is.
+                    'visible_to'   => $visible,
+                    'scope_label'  => empty($labels) ? 'Group-wide' : implode(', ', $labels),
+                    'member_count' => count($members),
+                    'members'      => $members,
+                );
+            }
+
+            return $out;
+        } catch (Exception $e) {
+            error_log('staffDirectory committee lookup failed: ' . $e->getMessage());
+            return array();
+        }
+    }
+}
+
+/**
  * Orchestration: one directory question per method.
  */
 class DirectoryService
@@ -1816,7 +2112,13 @@ try {
     }
 
     $service = new DirectoryService($repo);
-    $action  = input('action');
+
+    // Built eagerly but costs nothing until asked: the schema probe inside it
+    // is lazy, so a request that never touches committees never runs it.
+    $committeeRepo    = new CommitteeRepository(Database::getConnection());
+    $committeeService = new CommitteeService($committeeRepo);
+
+    $action = input('action');
     if ($action === null) {
         $action = 'search';
     }
@@ -1859,6 +2161,25 @@ try {
             'source'  => $result['source'],
             'count'   => count($result['roots']),
             'roots'   => $result['roots'],
+        ));
+    }
+
+    // The company's committees rather than its chart - the other way of
+    // reading "who is in this company", and the Staff tab's top level offers
+    // both. Visibility is mk_committee.comp_id (see committee_visibility.sql);
+    // membership is not filtered by it, so a committee this company may see is
+    // returned with every one of its members, whatever company they are from.
+    if ($action === 'committees') {
+        $committees = $committeeService->forCompany($targetComp);
+        respond(array(
+            'success'    => true,
+            'comp_id'    => (int)$targetComp,
+            // false when committee.sql has not been run on this host. The app
+            // says so rather than drawing an empty list that looks like a
+            // company with no committees.
+            'installed'  => $committeeRepo->installed(),
+            'count'      => count($committees),
+            'committees' => $committees,
         ));
     }
 
