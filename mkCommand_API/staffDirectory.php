@@ -98,6 +98,29 @@ class DirectoryRepository
                           AND IFNULL(u.mk_command_excluded, 0) <> 1";
 
     /**
+     * USER_VISIBLE's counterpart for GW, and there for the same reason: the
+     * two endpoints must agree about who exists.
+     *
+     * kpi_scorecard_exclude is the GW equivalent of users.mk_command_excluded -
+     * the flag that takes somebody out of MK Command without ending their
+     * assignment. staffHierarchy.php's GwRepository::ACTIVE_CLAUSE has always
+     * honoured it; this file did not, so a GW flagged out still appeared in the
+     * directory, listed under a boss whose own screen showed them none. Keep
+     * the two in step: a GW listed here must be one the hierarchy would draw.
+     *
+     * Deliberately NOT carrying GwRepository's `comp_id = '1'`. That clause is
+     * about which bosses can have GW under them in the org tree, not about
+     * which GW exist - comp 4 has 608 of them - and the directory is asked
+     * about one company at a time, so the company it was asked for is the one
+     * it answers about.
+     *
+     * The alias is `g` everywhere this is used.
+     */
+    const GW_VISIBLE = "g.monthly_assign_gw_status = '1'
+                        AND (g.kpi_scorecard_exclude IS NULL
+                             OR g.kpi_scorecard_exclude <> '1')";
+
+    /**
      * Where a company's reporting line lives.
      *
      * Comp 1 keeps its own chart in staff_portal2.organization_chart_glob, as
@@ -481,6 +504,14 @@ class DirectoryRepository
      *  - a subsidiary with no visible staff and no active GW is dropped rather
      *    than offered as an option that opens an empty list.
      *
+     * The GW counts here deliberately do NOT apply GW_VISIBLE. They answer
+     * "how big is this company", on the same basis manpower_summary.php
+     * reports it, and a GW flagged out of MK Command is still somebody the
+     * company employs. Every count that labels a LIST does apply it, so the
+     * number you tap always matches the rows you get; this one labels a
+     * company. Changing it would move a figure management reconciles against
+     * that report, which is a different decision from fixing a list.
+     *
      * The caller's own company is kept whatever its flag says, because it is
      * what the search opens on — filtering it out would leave the picker
      * showing a company that is not in its own list.
@@ -571,7 +602,7 @@ class DirectoryRepository
                          COUNT(DISTINCT g.monthly_assign_gw_code) AS n
                   FROM evaluation.monthly_assign_gw g
                        " . self::placedGwJoin($compId) . "
-                  WHERE g.comp_id = :comp_id AND g.monthly_assign_gw_status = '1'
+                  WHERE g.comp_id = :comp_id AND " . self::GW_VISIBLE . "
                         " . self::placedGwWhere($compId) . "
                   GROUP BY name
                   ORDER BY name ASC";
@@ -770,7 +801,7 @@ class DirectoryRepository
                     LEFT JOIN subsidiaries s ON s.id = g.comp_id
                     " . self::placedGwJoin($compId) . "
                     WHERE g.comp_id = :comp_id
-                      AND g.monthly_assign_gw_status = '1'
+                      AND " . self::GW_VISIBLE . "
                       " . self::placedGwWhere($compId) . "
                       {$deptClause}
                       {$textClause}
@@ -944,7 +975,7 @@ class DirectoryRepository
                     LEFT JOIN subsidiaries s ON s.id = g.comp_id
                     WHERE g.monthly_assign_gw_code = :code
                       AND g.comp_id = :comp_id
-                      AND g.monthly_assign_gw_status = '1'
+                      AND " . self::GW_VISIBLE . "
                     GROUP BY g.monthly_assign_gw_code
                 ) t";
 
@@ -1078,7 +1109,7 @@ class DirectoryRepository
                 FROM evaluation.monthly_assign_gw g
                 LEFT JOIN subsidiaries s ON s.id = g.comp_id
                 WHERE g.boss_id = :person AND g.boss_comp_id = :comp_id
-                  AND g.monthly_assign_gw_status = '1'
+                  AND " . self::GW_VISIBLE . "
                 GROUP BY g.monthly_assign_gw_code
                 ORDER BY fullname ASC";
 
@@ -1396,7 +1427,7 @@ class DirectoryRepository
                          COUNT(DISTINCT g.monthly_assign_gw_code) AS n
                   FROM evaluation.monthly_assign_gw g
                   WHERE (g.boss_id, g.boss_comp_id) IN ({$tuples})
-                    AND g.monthly_assign_gw_status = '1'
+                    AND " . self::GW_VISIBLE . "
                   GROUP BY g.boss_id, g.boss_comp_id";
 
         $stmt = $this->db->prepare($gwSql);

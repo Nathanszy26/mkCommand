@@ -542,7 +542,9 @@ export default class Staff extends Component {
             // for every depth and for both lists, keyed by nodeKey — a row is
             // the same row wherever it appears, so opening it in a department
             // and opening it on a card mean the same thing. Kept across a
-            // close/open, so a branch is fetched once.
+            // close/open, so a branch is fetched once — and dropped by
+            // dropCaches on a pull-to-refresh, which is the only thing that
+            // ends it short of leaving the screen.
             openNodes: {},
             nodeKids: {},
         };
@@ -556,6 +558,50 @@ export default class Staff extends Component {
         this.unmounted = true;
     }
 
+    /**
+     * Throw away every list this screen has cached, and re-ask for whichever
+     * one is currently on screen.
+     *
+     * Four things were being kept and none of them were being dropped on a
+     * refresh: opened branches (nodeKids), the card you are looking at
+     * (focusDetail), the company's top level (roots) and its committees. Each
+     * is cached on purpose - a branch should not re-fetch every time you
+     * collapse and re-open it - but "cached until the app is killed" is not
+     * the same promise, and it made pull-to-refresh a no-op for everything
+     * except the hierarchy itself. A stale branch can outlive a server-side
+     * correction indefinitely, which is exactly how it was found.
+     *
+     * Branches are closed as well as emptied: an open row with nothing behind
+     * it has no way to ask for its own contents again.
+     */
+    dropCaches = () => {
+        const { focus, rootsOpen, rootsView } = this.state;
+
+        this.setState(
+            {
+                nodeKids: {},
+                openNodes: {},
+                roots: [],
+                rootsSource: null,
+                committees: [],
+                committeesLoaded: false,
+            },
+            () => {
+                // Re-ask for whatever is actually being looked at. The rest
+                // re-fetches on its own the next time it is opened, now that
+                // it has nothing to show from memory.
+                if (focus) {
+                    this.showFocus(focus);
+                } else if (rootsOpen) {
+                    this.openRoots();
+                    if (rootsView === 'committees') {
+                        this.loadCommittees();
+                    }
+                }
+            }
+        );
+    };
+
     /** Command: fetches hierarchy and pushes it into state. */
     load = async (refreshing = false) => {
         this.setState(refreshing ? { refreshing: true, error: null } : { loading: true, error: null });
@@ -565,16 +611,7 @@ export default class Staff extends Component {
         // so it is the thing the gesture should fix.
         if (refreshing) {
             forgetFailures();
-            // A reload means "fetch it again", including the list the user is
-            // actually looking at. Dropping the flag is enough: the committees
-            // view re-asks the moment it finds it has nothing cached.
-            if (this.state.committeesLoaded) {
-                this.setState({ committeesLoaded: false }, () => {
-                    if (this.state.rootsOpen && this.state.rootsView === 'committees') {
-                        this.loadCommittees();
-                    }
-                });
-            }
+            this.dropCaches();
         }
 
         try {
