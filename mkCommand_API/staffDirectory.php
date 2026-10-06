@@ -1678,40 +1678,15 @@ class CommitteeRepository
         return $stmt->fetchAll();
     }
 
-    /** id => name for the subsidiaries named in a visibility list, so the app
-     *  can say "Globinaco, Arus Sawit" rather than "1,2". */
-    public function companyNames(array $ids)
-    {
-        if (empty($ids)) {
-            return array();
-        }
-
-        $place = implode(',', array_fill(0, count($ids), '?'));
-        $stmt  = $this->db->prepare(
-            "SELECT id, name FROM subsidiaries WHERE id IN ({$place})"
-        );
-        $i = 1;
-        foreach ($ids as $id) {
-            $stmt->bindValue($i++, (int)$id, PDO::PARAM_INT);
-        }
-        $stmt->execute();
-
-        $out = array();
-        foreach ($stmt->fetchAll() as $row) {
-            $out[(int)$row['id']] = $row['name'];
-        }
-        return $out;
-    }
 }
 
 /**
  * The company's committees, each carrying its full membership.
  *
- * Three round-trips no matter how many committees there are: the list, every
- * member of all of them at once, and the company names behind the visibility
- * lists. Degrades to an empty list rather than failing - the Committees view is
- * a second face on a screen whose first job is the org chart, and a fault there
- * should not be able to take the chart down with it.
+ * Two round-trips no matter how many committees there are: the list, and every
+ * member of all of them at once. Degrades to an empty list rather than failing
+ * - the Committees view is a second face on a screen whose first job is the org
+ * chart, and a fault there should not be able to take the chart down with it.
  */
 class CommitteeService
 {
@@ -1757,16 +1732,10 @@ class CommitteeService
                 return array();
             }
 
-            $ids        = array();
-            $scopeComps = array();
+            $ids = array();
             foreach ($committees as $row) {
                 $ids[] = (int)$row['id'];
-                foreach (self::parseCompIds($row['comp_id']) as $cid) {
-                    $scopeComps[$cid] = true;
-                }
             }
-
-            $names = $this->repo->companyNames(array_keys($scopeComps));
 
             $byCommittee = array();
             foreach ($this->repo->membersOf($ids) as $row) {
@@ -1790,22 +1759,19 @@ class CommitteeService
             foreach ($committees as $row) {
                 $id      = (int)$row['id'];
                 $members = isset($byCommittee[$id]) ? $byCommittee[$id] : array();
-                $visible = self::parseCompIds($row['comp_id']);
-
-                $labels = array();
-                foreach ($visible as $cid) {
-                    $labels[] = isset($names[$cid]) ? $names[$cid] : ('Company ' . $cid);
-                }
 
                 $out[] = array(
                     'id'           => $id,
                     'name'         => $row['name'],
                     'code'         => $row['code'],
                     'description'  => $row['description'],
-                    // [] = every company. The app badges that as "Group-wide"
-                    // rather than listing every subsidiary there is.
-                    'visible_to'   => $visible,
-                    'scope_label'  => empty($labels) ? 'Group-wide' : implode(', ', $labels),
+                    // Which companies may see this; [] = every company. Nothing
+                    // on screen draws it - the filtering is already done by the
+                    // time the list gets here - but it is the rule this row was
+                    // selected by, and it costs only parsing a column already
+                    // fetched. Worth having when a committee turns up somewhere
+                    // it was not expected.
+                    'visible_to'   => self::parseCompIds($row['comp_id']),
                     'member_count' => count($members),
                     'members'      => $members,
                 );

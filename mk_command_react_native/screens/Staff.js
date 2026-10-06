@@ -1781,9 +1781,11 @@ export default class Staff extends Component {
      * through the company's list - and tapping a member opens their card by
      * the same path everything else on this screen uses.
      *
-     * Who may SEE a committee is the company's business; who is IN one is not
-     * filtered by that, so a committee scoped to this company still lists its
-     * members from every other subsidiary, each labelled with their own.
+     * Who may SEE a committee is the company's business and is settled before
+     * the list ever reaches here - so nothing on screen talks about it. Who is
+     * IN one is not filtered by that at all, so a committee scoped to this
+     * company still lists its members from every other subsidiary, each
+     * labelled with their own.
      */
     renderCommittees() {
         const {
@@ -1838,23 +1840,14 @@ export default class Staff extends Component {
         return (
             <Section title="Committees" count={committees.length}>
                 {committees.map((committee) => (
-                    <View key={committee.id}>
-                        <CommitteeRow
-                            committee={committee}
-                            open={!!this.state.openCommittees[committee.id]}
-                            onToggle={this.toggleCommittee}
-                            onPressMember={this.openInfo}
-                            meKey={meKey}
-                        />
-                        {/* Which companies may see it. Worth a line here, where
-                            you are reading the company's whole list, and not on
-                            your own card, where you are reading your own seats. */}
-                        {!!committee.scope_label && (
-                            <Text style={styles.committeeScope} numberOfLines={1}>
-                                {committee.scope_label}
-                            </Text>
-                        )}
-                    </View>
+                    <CommitteeRow
+                        key={committee.id}
+                        committee={committee}
+                        open={!!this.state.openCommittees[committee.id]}
+                        onToggle={this.toggleCommittee}
+                        onPressMember={this.openInfo}
+                        meKey={meKey}
+                    />
                 ))}
             </Section>
         );
@@ -2635,15 +2628,6 @@ const styles = StyleSheet.create({
     filterCountOn: { backgroundColor: 'rgba(255, 255, 255, 0.22)' },
     filterCountText: { fontSize: 11, fontWeight: '800', color: C.primary },
     filterCountTextOn: { color: '#ffffff' },
-    // Sits under its committee rather than on the row: it answers "who else
-    // can see this", which is a footnote, not the name of the thing.
-    committeeScope: {
-        fontSize: 11,
-        color: C.muted,
-        marginTop: -2,
-        marginBottom: 10,
-        marginLeft: 22,
-    },
 
     rootRow: {
         flexDirection: 'row',
