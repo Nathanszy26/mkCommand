@@ -537,6 +537,388 @@ def identify():
         'mymk_id': str(best['mymk_id']) if best['mymk_id'] else None,
     })
 
+# ======================== GROUP IDENTIFY ========================
+#
+# Everything below is additive. /recognize, /identify and /enroll are untouched:
+# a group photo needs a different image pipeline from a check-in selfie, so it
+# gets its own decoder and its own route rather than loosening the ones the
+# check-in flow depends on.
+
+# A check-in selfie is one face filling the frame, so decode_base64_image()
+# shrinks to 480px and HOG still sees it. A muster photo is 8-20 people in a
+# row, where every pixel of face matters. Today's uploads arrive at 1600x1200
+# (the timestamp-camera app downscales before upload), so this cap is usually
+# not even reached — it is here so that a higher-resolution upload, if that app
+# is ever reconfigured, is NOT thrown away.
+GROUP_MAX_DIMENSION = 2600
+
+# Two thresholds, because the two stages make claims of very different strength.
+#
+# Pool stage: the candidate set is one mandor's own roster, a dozen people. The
+# prior that a face belongs to one of them is high and there is almost no room
+# for a stranger to win, so the normal tolerance is safe.
+POOL_TOLERANCE = 0.5
+# Outside stage: "a GW from another district was in this photo" is a far stronger
+# assertion, made against a gallery ~200x larger where a lookalike is ~200x more
+# likely. It has to clear a higher bar. This is exactly the failure the pool
+# split exists to stop: scanning all 3,200 enrolled faces for a 40px masked face
+# returned GWs from Beaufort and Sipitang standing in a Papar road crew.
+OUTSIDE_TOLERANCE = 0.45
+
+# Guard against a crowd shot (or a false-positive storm) pinning a worker.
+GROUP_MAX_FACES = 40
+
+# GW exist only in company 1, and gw_face_encodings carries no comp_id column.
+GROUP_COMP_ID = '1'
+
+
+def decode_base64_image_group(base64_string):
+    """
+    Decode a base64 string to a numpy array, preserving enough resolution for
+    the small faces in a group photo. Same EXIF handling and RGB conversion as
+    decode_base64_image(), but capped at GROUP_MAX_DIMENSION instead of 480.
+    """
+    try:
+        if ',' in base64_string:
+            base64_string = base64_string.split(',', 1)[1]
+
+        image_bytes = base64.b64decode(base64_string)
+        pil_image = Image.open(BytesIO(image_bytes))
+        pil_image = ImageOps.exif_transpose(pil_image)
+
+        if max(pil_image.size) > GROUP_MAX_DIMENSION:
+            pil_image.thumbnail((GROUP_MAX_DIMENSION, GROUP_MAX_DIMENSION), Image.LANCZOS)
+
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+
+        return np.array(pil_image)
+    except Exception as e:
+        logger.error('Group image decode failed: %s', e)
+        return None
+
+
+def _rows_to_gallery(rows, is_gw):
+    """Shared row -> gallery-entry mapping, so every loader below agrees on shape."""
+    gallery = []
+    for row in rows:
+        try:
+            gallery.append({
+                'person': row['person'],
+                'comp_id': str(row['comp_id']),
+                'mymk_id': row['mymk_id'],
+                'is_gw': is_gw,
+                'encoding': np.array(json.loads(row['encoding']), dtype=np.float64),
+            })
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning('Bad encoding for %s: %s', row.get('person'), e)
+    return gallery
+
+
+def load_pool_gallery(gw_codes, staff_keys):
+    """
+    Every enrolled face of ONE mandor's attendance pool: the GW assigned or
+    allocated to them on the report date, plus the staff standing with them.
+
+    This is the gallery that should answer almost every face in a muster photo,
+    and it is ~200x smaller than the full one, which is the entire point.
+    """
+    if not gw_codes and not staff_keys:
+        return []
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        gallery = []
+
+        if gw_codes:
+            placeholders = ','.join(['%s'] * len(gw_codes))
+            cursor.execute(
+                "SELECT monthly_assign_gw_code AS person, '" + GROUP_COMP_ID + "' AS comp_id, "
+                "       monthly_assign_gw_id AS mymk_id, encoding "
+                "FROM gw_face_encodings "
+                "WHERE deleted = '0' AND monthly_assign_gw_code IN (" + placeholders + ")",
+                tuple(gw_codes))
+            gallery.extend(_rows_to_gallery(cursor.fetchall(), 1))
+
+        if staff_keys:
+            clause = ' OR '.join(['(person = %s AND comp_id = %s)'] * len(staff_keys))
+            params = []
+            for k in staff_keys:
+                params.extend([k.get('person'), str(k.get('comp_id', GROUP_COMP_ID))])
+            cursor.execute(
+                "SELECT person, comp_id, mymk_id, encoding "
+                "FROM staff_face_encodings "
+                "WHERE deleted = '0' AND (" + clause + ")",
+                tuple(params))
+            gallery.extend(_rows_to_gallery(cursor.fetchall(), 0))
+
+        cursor.close()
+        return gallery
+    except mysql.connector.Error as e:
+        logger.error('DB error loading pool gallery: %s', e)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_wide_gw_gallery():
+    """Every enrolled GW. GW exist only in company 1, so no comp filter applies."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT monthly_assign_gw_code AS person, '" + GROUP_COMP_ID + "' AS comp_id, "
+            "       monthly_assign_gw_id AS mymk_id, encoding "
+            "FROM gw_face_encodings "
+            "WHERE deleted = '0' AND monthly_assign_gw_code IS NOT NULL "
+            "  AND monthly_assign_gw_code <> ''")
+        gallery = _rows_to_gallery(cursor.fetchall(), 1)
+        cursor.close()
+        return gallery
+    except mysql.connector.Error as e:
+        logger.error('DB error loading wide GW gallery: %s', e)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_wide_staff_gallery(comp_id=GROUP_COMP_ID):
+    """Enrolled staff of one company. Searched only after the GW gallery."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT person, comp_id, mymk_id, encoding "
+            "FROM staff_face_encodings "
+            "WHERE deleted = '0' AND person IS NOT NULL AND person <> '' "
+            "  AND comp_id = %s", (str(comp_id),))
+        gallery = _rows_to_gallery(cursor.fetchall(), 0)
+        cursor.close()
+        return gallery
+    except mysql.connector.Error as e:
+        logger.error('DB error loading wide staff gallery: %s', e)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def assign_faces(face_items, gallery, tolerance, taken):
+    """
+    Match a set of faces against one gallery, at most one face per identity.
+
+    face_items : list of (face_index, encoding) still looking for a name
+    taken      : set of (person, comp_id, is_gw) already claimed by an EARLIER
+                 stage; mutated here so a later stage cannot name the same
+                 person twice. Without it the wide search happily re-finds
+                 someone the pool search already placed.
+
+    Scoring runs for every face before anything is assigned, because the same
+    person is often the nearest neighbour of two different faces and only the
+    full score table shows which of the two is the real one. The closer face
+    keeps the name; the other is left for the next stage, or for "unknown".
+    """
+    if not gallery or not face_items:
+        return {}
+
+    gallery_encodings = np.array([g['encoding'] for g in gallery])
+
+    candidates = []
+    for face_index, encoding in face_items:
+        distances = np.linalg.norm(gallery_encodings - encoding, axis=1)
+        best_idx = int(np.argmin(distances))
+        candidates.append({
+            'face_index': face_index,
+            'best_idx': best_idx,
+            'distance': float(distances[best_idx]),
+        })
+
+    matches = {}
+    for cand in sorted(candidates, key=lambda c: c['distance']):
+        if cand['distance'] > tolerance:
+            continue
+        entry = gallery[cand['best_idx']]
+        person_key = (entry['person'], entry['comp_id'], entry['is_gw'])
+        if person_key in taken:
+            continue
+        taken.add(person_key)
+        matches[cand['face_index']] = (entry, cand['distance'])
+
+    return matches
+
+
+@app.route('/identify_group', methods=['POST'])
+def identify_group():
+    """
+    1:N identification for EVERY face in one photo - the muster/attendance
+    group shot a mandor uploads.
+
+    /identify answers "who is this one face"; it rejects a second face on
+    purpose, because a check-in must never be satisfied by whoever else walked
+    into frame. This endpoint answers "who is in this crowd", so many faces are
+    the point.
+
+    Matching runs in three stages, narrowest first:
+      1. the mandor's own pool (their GW + the staff with them)   tolerance 0.50
+      2. every enrolled GW, company 1                             tolerance 0.45
+      3. every enrolled staff member, company 1                   tolerance 0.45
+    GW come before staff in the wide search because these photos are mostly GW.
+    A face answered at an earlier stage never reaches a later one, and an
+    identity claimed at any stage cannot be claimed again.
+
+    Request JSON:
+    {
+        "image": "<base64 encoded image>",
+        "pool": {
+            "gw_codes": ["PPR-24", "PPR115"],              (optional)
+            "staff":    [{"person": "andrewjohnny", "comp_id": "1"}]   (optional)
+        },
+        "search_outside": true     (optional, default true)
+    }
+
+    An empty pool is allowed and simply means every face goes to the wide
+    search, which is the old whole-gallery behaviour.
+    """
+    data = request.get_json(silent=True) or {}
+
+    if 'image' not in data:
+        return jsonify({'success': False, 'error': 'Missing "image" field'}), 400
+
+    image = decode_base64_image_group(data['image'])
+    if image is None:
+        return jsonify({'success': False, 'error': 'Invalid image data'}), 400
+
+    img_h, img_w = image.shape[0], image.shape[1]
+
+    # upsample=1 roughly doubles the image before scanning, which is what pulls
+    # the back row of a group shot above HOG's minimum face size.
+    face_locations = face_recognition.face_locations(image, number_of_times_to_upsample=1, model='hog')
+
+    if len(face_locations) == 0:
+        return jsonify({
+            'success': True, 'faces_detected': 0, 'matched_count': 0,
+            'unmatched_count': 0, 'results': [],
+            'error': 'No face detected in this photo.'
+        })
+
+    # Biggest faces first, so a truncated crowd shot keeps the people actually
+    # in frame rather than whichever specks HOG happened to list first.
+    if len(face_locations) > GROUP_MAX_FACES:
+        logger.warning('identify_group: %d faces detected, capping at %d',
+                       len(face_locations), GROUP_MAX_FACES)
+        face_locations = sorted(
+            face_locations,
+            key=lambda b: (b[2] - b[0]) * (b[1] - b[3]),
+            reverse=True)[:GROUP_MAX_FACES]
+
+    encodings = face_recognition.face_encodings(image, face_locations)
+    if len(encodings) == 0:
+        return jsonify({
+            'success': True, 'faces_detected': len(face_locations), 'matched_count': 0,
+            'unmatched_count': len(face_locations), 'results': [],
+            'error': 'Faces were found but none could be read. Try a sharper photo.'
+        })
+
+    pool = data.get('pool') or {}
+    gw_codes = [c for c in (pool.get('gw_codes') or []) if c]
+    staff_keys = [s for s in (pool.get('staff') or []) if s and s.get('person')]
+    search_outside = bool(data.get('search_outside', True))
+
+    pending = list(enumerate(encodings))
+    taken = set()
+    found = {}        # face_index -> (gallery entry, distance)
+    in_pool = set()   # face indexes answered by the pool stage
+
+    # ---- Stage 1: the mandor's own pool ----
+    pool_gallery = load_pool_gallery(gw_codes, staff_keys)
+    if pool_gallery:
+        hits = assign_faces(pending, pool_gallery, POOL_TOLERANCE, taken)
+        found.update(hits)
+        in_pool.update(hits.keys())
+        pending = [item for item in pending if item[0] not in hits]
+
+    # ---- Stage 2: every enrolled GW ----
+    wide_gw = 0
+    if pending and search_outside:
+        gallery = load_wide_gw_gallery()
+        wide_gw = len(gallery)
+        hits = assign_faces(pending, gallery, OUTSIDE_TOLERANCE, taken)
+        found.update(hits)
+        pending = [item for item in pending if item[0] not in hits]
+
+    # ---- Stage 3: every enrolled staff member of company 1 ----
+    wide_staff = 0
+    if pending and search_outside:
+        gallery = load_wide_staff_gallery(GROUP_COMP_ID)
+        wide_staff = len(gallery)
+        hits = assign_faces(pending, gallery, OUTSIDE_TOLERANCE, taken)
+        found.update(hits)
+        pending = [item for item in pending if item[0] not in hits]
+
+    results = []
+    for face_index, box in enumerate(face_locations):
+        if face_index >= len(encodings):
+            break
+        top, right, bottom, left = box
+        entry = {
+            'face_index': face_index,
+            # Pixel coordinates in the PROCESSED image, sent with its size so a
+            # caller can scale the box onto whatever copy it is displaying.
+            'box': {'top': int(top), 'right': int(right),
+                    'bottom': int(bottom), 'left': int(left)},
+        }
+        if face_index in found:
+            best, distance = found[face_index]
+            entry.update({
+                'matched': True,
+                'in_pool': face_index in in_pool,
+                'person': best['person'],
+                'comp_id': best['comp_id'],
+                'is_gw': best['is_gw'],
+                'mymk_id': str(best['mymk_id']) if best['mymk_id'] else None,
+                'confidence': round(max(0.0, 1.0 - distance), 4),
+                'distance': round(distance, 4),
+            })
+        else:
+            entry.update({
+                'matched': False, 'in_pool': False, 'person': None, 'comp_id': None,
+                'is_gw': None, 'mymk_id': None, 'confidence': 0, 'distance': None,
+            })
+        results.append(entry)
+
+    # Reading order (left to right) so the list lines up with the photo.
+    results.sort(key=lambda r: r['box']['left'])
+
+    matched_count = sum(1 for r in results if r['matched'])
+    pool_count = sum(1 for r in results if r.get('in_pool'))
+
+    logger.info('identify_group: faces=%d matched=%d (pool=%d outside=%d) '
+                'pool_gallery=%d wide_gw=%d wide_staff=%d',
+                len(results), matched_count, pool_count, matched_count - pool_count,
+                len(pool_gallery), wide_gw, wide_staff)
+
+    return jsonify({
+        'success': True,
+        'faces_detected': len(results),
+        'matched_count': matched_count,
+        'pool_matched_count': pool_count,
+        'outside_matched_count': matched_count - pool_count,
+        'unmatched_count': len(results) - matched_count,
+        'pool_size': len(pool_gallery),
+        'searched_outside': wide_gw + wide_staff,
+        'pool_tolerance': POOL_TOLERANCE,
+        'outside_tolerance': OUTSIDE_TOLERANCE,
+        'image_width': int(img_w),
+        'image_height': int(img_h),
+        'results': results,
+    })
+
 
 @app.route('/enroll', methods=['POST'])
 def enroll():
