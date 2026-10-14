@@ -22,6 +22,9 @@ header('Content-Type: application/json; charset=UTF-8');
  *                  id < 97  : me OR 'all' in staff_memo_to_staff_id (index.php)
  *                  id >= 97 : a live staff_memo_receivers To/CC row for me,
  *                             'all' of my company, or 'all' of the group
+ *                  either era: OR the memo is MINE — I am its named sender
+ *                             (staff_memo_from_staff_id) or I uploaded it
+ *                             (staff_memo_uploaded_by). Flagged as is_mine.
  *   performance -> my records, not deleted, [date LIKE 'YEAR%']
  * Both newest-first. Recipient/staff names resolved in ONE batched lookup (no N+1).
  *
@@ -147,7 +150,26 @@ class StaffRecordsRepository
                               AND (r.staff_memo_receiver_staff_id = :rid
                                 OR (r.staff_memo_receiver_staff_id = 'all'
                                     AND r.staff_memo_receiver_comp_id IN ('all', :rcomp)))))
+                    OR " . self::mineClause(':mfrom', ':mupl') . "
                 )";
+    }
+
+    /**
+     * A memo is mine if I am its named sender, or if I uploaded it on someone
+     * else's behalf — on the web an assistant types the memo under the boss's
+     * name, so staff_memo_uploaded_by is the only trace that it was theirs.
+     * Both columns are varchar and blank on the oldest memos, hence the TRIM
+     * and the '' guard (a blank column must never match a real id).
+     *
+     * Placeholders are passed in because PDO is prepared without emulation here:
+     * every named placeholder in a statement has to be distinct.
+     */
+    private static function mineClause($fromParam, $uploadedParam)
+    {
+        return "(TRIM(IFNULL(m.staff_memo_from_staff_id, '')) <> ''
+                     AND TRIM(m.staff_memo_from_staff_id) = {$fromParam}
+                 OR TRIM(IFNULL(m.staff_memo_uploaded_by, '')) <> ''
+                     AND TRIM(m.staff_memo_uploaded_by) = {$uploadedParam})";
     }
 
     private static function bindVisibility(PDOStatement $stmt, $userId, $compId)
@@ -155,13 +177,16 @@ class StaffRecordsRepository
         $stmt->bindValue(':id', (int)$userId, PDO::PARAM_INT);
         $stmt->bindValue(':rid', (string)(int)$userId, PDO::PARAM_STR);
         $stmt->bindValue(':rcomp', (string)(int)$compId, PDO::PARAM_STR);
+        $stmt->bindValue(':mfrom', (string)(int)$userId, PDO::PARAM_STR);
+        $stmt->bindValue(':mupl', (string)(int)$userId, PDO::PARAM_STR);
     }
 
-    /** Memos addressed to me, not deleted, newest first. */
+    /** Memos addressed to me OR sent by me, not deleted, newest first. */
     public function memos($userId, $compId)
     {
         $sql = "SELECT m.staff_memo_id, m.staff_memo_ref, m.staff_memo_date,
-                       m.staff_memo_to_staff_id, m.staff_memo_from, m.staff_memo_subject
+                       m.staff_memo_to_staff_id, m.staff_memo_from, m.staff_memo_subject,
+                       m.staff_memo_from_staff_id, m.staff_memo_uploaded_by
                 FROM staff_memo m
                 WHERE " . self::visibleClause() . "
                 ORDER BY m.staff_memo_id DESC";
@@ -176,7 +201,8 @@ class StaffRecordsRepository
     {
         $sql = "SELECT m.staff_memo_id, m.staff_memo_ref, m.staff_memo_date,
                        m.staff_memo_to_staff_id, m.staff_memo_cc_staff_id,
-                       m.staff_memo_from, m.staff_memo_subject, m.staff_memo_content
+                       m.staff_memo_from, m.staff_memo_subject, m.staff_memo_content,
+                       m.staff_memo_from_staff_id, m.staff_memo_uploaded_by
                 FROM staff_memo m
                 WHERE m.staff_memo_id = :mid
                   AND " . self::visibleClause() . "
@@ -387,6 +413,23 @@ class StaffRecordsService
         return implode(', ', $out);
     }
 
+    /**
+     * Query: did this user send the memo (named sender, or uploader standing in
+     * for them)? Same test as the SQL in StaffRecordsRepository::mineClause —
+     * keep the two together, the flag is what tells the app "you sent this".
+     */
+    private static function isMine(array $row, $userId)
+    {
+        $me = (string)(int)$userId;
+        foreach (array('staff_memo_from_staff_id', 'staff_memo_uploaded_by') as $column) {
+            $value = isset($row[$column]) ? trim((string)$row[$column]) : '';
+            if ($value !== '' && $value === $me) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public function memos($person, $comp)
     {
         $userId = $this->repo->resolveUserId($person, $comp);
@@ -423,6 +466,7 @@ class StaffRecordsService
                 'to_name' => self::labelOf($toLists[$i], $names, $codes),
                 'from'    => properName($r['staff_memo_from']),
                 'subject' => $r['staff_memo_subject'],
+                'is_mine' => self::isMine($r, $userId),
             );
         }
         return array('me_name' => $meName, 'memos' => $out);
@@ -494,6 +538,7 @@ class StaffRecordsService
             'from'        => properName($row['staff_memo_from']),
             'subject'     => $row['staff_memo_subject'],
             'content'     => $row['staff_memo_content'],
+            'is_mine'     => self::isMine($row, $userId),
             'attachments' => $attachments,
         );
     }
