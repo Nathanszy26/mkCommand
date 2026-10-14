@@ -1,0 +1,1933 @@
+<?php
+/**
+ * Staff Headcount Report.
+ *
+ * MUST be hosted on globportal.com, same folder as jobspecReport.php —
+ * staff_portal2 (users) and evaluation (monthly_assign_gw) are both local
+ * there under prog4. The mkcommand <-> globportal 3306 path is firewalled.
+ *
+ * WHAT IT ANSWERS
+ *   Per company, who is in the active staff pool today, and which of them are
+ *   exempted from KPI/Scorecard, MK Command and MK Academy.
+ *
+ * THE POOL (the row set — see StaffPoolRepository)
+ *   staff: staff_portal2.users, status = '1' AND deleted = '0'
+ *   GW:    evaluation.monthly_assign_gw, monthly_assign_gw_status = '1',
+ *          comp_id 1 and 4 only — GW exist nowhere else. ONE ROW PER CODE:
+ *          that table stores a row per reporting line, so a GW under two
+ *          superiors appears twice and would be counted twice.
+ *   test_user = 1 is dropped from both. A test account is not a head count.
+ *   users.is_gw = 1 is dropped from the staff side: those 31 rows are GW
+ *   login accounts, and the GW half of this report already counts that
+ *   population from monthly_assign_gw. Leaving them in counted them twice.
+ *
+ * TRILLIUM (comp_id 16)
+ *   Trillium Group has no users rows of its own. Its people are stored under
+ *   Globinaco (comp_id 1) and marked users.is_trillium = 1. This report lifts
+ *   them out of Globinaco's figures and reports them as company 16, so the
+ *   two never double-count, and keys their overrides under 16 as well.
+ *   Anyone who may see or edit Globinaco may see or edit Trillium — see
+ *   withTrillium() — and nobody is granted Trillium on its own.
+ *
+ * TWO POPULATIONS, reported separately, exactly as jobspecReport.php does:
+ * a GW's code is a monthly_assign_gw_code, a different namespace from
+ * users.person, and the two CAN collide. They never share a table or a key.
+ *
+ * THE TICK BOXES — READ THIS BEFORE CHANGING ANYTHING
+ *   Nothing on this page writes to users or monthly_assign_gw. Those stay the
+ *   source of every value. A tick writes to staff_portal2.staff_flag_override
+ *   instead (see sql/staff_flag_override.sql), and the value a cell shows is:
+ *
+ *       effective = override row, if one exists
+ *                   otherwise the source column
+ *
+ *   So an override, once set, PINS that person's flag: a later edit to
+ *   users.kpi_excluded will not move it. That is the point — this report is
+ *   the authority once someone has touched a row — and it is why a cell whose
+ *   override disagrees with its source carries a small "pinned" marker.
+ *
+ *   Every tick also appends to staff_flag_override_log, which is what the
+ *   change log at the foot of the page reads. The log is how "who turned this
+ *   person off, and when" stays answerable after the tick has been put back.
+ *
+ * ACCESS
+ *   View : any logged-in user, their own company. Super admins see every
+ *          company and "All companies"; a company admin sees the companies
+ *          they administer (kpi_company_admins.comp_id, which is NOT always
+ *          their own — user 1082 administers 3 and 17).
+ *   Edit : active kpi_super_admins anywhere; active kpi_company_admins within
+ *          the companies they administer. Everyone else is read-only and the
+ *          boxes render disabled.
+ *   Both checks fail closed, and the save endpoint re-checks the company of
+ *   every single change rather than trusting the form.
+ *
+ * Query string:
+ *   comp_id  int     one company, or empty for all   (all = super admins only)
+ *   q        string  name or code search
+ *   dept     string  department / district filter
+ *   group    0|1     group rows by department        (default 1)
+ *   changed  0|1     only rows whose flags were overridden away from source
+ *   ajax     save    POST endpoint for the tick boxes
+ *
+ * PHP 7.2 compatible.
+ */
+
+session_start();
+
+require_once '../includes/UnifiedAuth.php';
+
+if (!UnifiedAuth::isLoggedIn()) {
+    header('Location: /accounts/mkPortal/user_validation.php');
+    exit;
+}
+
+$currentUser = UnifiedAuth::getLoggedInUser();
+
+/* ---------- DB ------------------------------------------------------------ */
+
+class Db
+{
+    private static $pdo = null;
+
+    /** One shared PDO. Both schemas are on this host. */
+    public static function get()
+    {
+        if (self::$pdo === null) {
+            $pdo = new PDO(
+                'mysql:host=localhost;charset=utf8mb4',
+                'prog4',
+                'prog42023',
+                array(PDO::ATTR_TIMEOUT => 5)
+            );
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+            self::$pdo = $pdo;
+        }
+        return self::$pdo;
+    }
+}
+
+/* ---------- access -------------------------------------------------------- */
+
+/** Query: is this user an active KPI super admin?
+ *  kpi_super_admins.user_id is staff_portal2.users.id — the same id
+ *  UnifiedAuth puts in the session. status is TINYINT, 1 = active. */
+function isSuperAdmin(PDO $pdo, $userId)
+{
+    if ($userId === null || $userId === '') {
+        return false;
+    }
+    $stmt = $pdo->prepare(
+        "SELECT 1 FROM staff_portal2.kpi_super_admins
+          WHERE user_id = :uid AND status = 1 LIMIT 1"
+    );
+    $stmt->bindValue(':uid', (int)$userId, PDO::PARAM_INT);
+    $stmt->execute();
+    return $stmt->fetchColumn() !== false;
+}
+
+/** Query: the companies this user administers, as ints.
+ *  kpi_company_admins carries its OWN comp_id, which is not always the admin's
+ *  own company — so this is read from that column and never from the session.
+ *  A user may hold several rows. */
+function companyAdminComps(PDO $pdo, $userId)
+{
+    if ($userId === null || $userId === '') {
+        return array();
+    }
+    $stmt = $pdo->prepare(
+        "SELECT DISTINCT comp_id FROM staff_portal2.kpi_company_admins
+          WHERE user_id = :uid AND status = 1"
+    );
+    $stmt->bindValue(':uid', (int)$userId, PDO::PARAM_INT);
+    $stmt->execute();
+    $out = array();
+    foreach ($stmt->fetchAll() as $r) {
+        $out[] = (int)$r['comp_id'];
+    }
+    return $out;
+}
+
+/** Query: the same list with Trillium added if Globinaco is on it.
+ *
+ *  Trillium's people ARE Globinaco's people under another banner — they are
+ *  stored under comp_id 1 and only marked is_trillium — so the right to see
+ *  or change Globinaco carries to Trillium. Nobody is ever granted Trillium
+ *  on its own, and kpi_company_admins needs no row for comp 16. */
+function withTrillium(array $comps)
+{
+    $home = StaffPoolRepository::TRILLIUM_HOME_COMP_ID;
+    $t    = StaffPoolRepository::TRILLIUM_COMP_ID;
+    if (in_array($home, $comps, true) && !in_array($t, $comps, true)) {
+        $comps[] = $t;
+    }
+    return $comps;
+}
+
+/* ---------- the four flags ------------------------------------------------ */
+
+/** The column set, in display order. `key` is what the override table stores,
+ *  `base` is the row key the repositories put the source value under. */
+function flagDefs()
+{
+    return array(
+        'in_pool'    => array('label' => 'Total Staff',             'base' => 'base_in_pool'),
+        'kpi'        => array('label' => 'KPI/Scorecard Exempted',  'base' => 'base_kpi'),
+        'mk_command' => array('label' => 'MK Command Exempted',     'base' => 'base_mk_command'),
+        'mk_academy' => array('label' => 'MK Academy Exempted',     'base' => 'base_mk_academy'),
+    );
+}
+
+/** The key one override row is stored under in the in-memory map. Unit
+ *  separator, because a department or a code could contain anything printable
+ *  but never this. */
+function overrideKey($type, $compId, $person, $flag)
+{
+    return $type . "\x1f" . (int)$compId . "\x1f" . $person . "\x1f" . $flag;
+}
+
+/* ---------- repository ---------------------------------------------------- */
+
+class StaffPoolRepository
+{
+    /** Trillium Group is reported as its own company although it has no users
+     *  rows of its own: its people are stored under Globinaco and marked with
+     *  users.is_trillium = 1. So the two ids travel together everywhere — the
+     *  rows come out of HOME, are relabelled as COMP, and are taken out of
+     *  HOME's own figures so nobody is counted twice. */
+    const TRILLIUM_COMP_ID = 16;
+    const TRILLIUM_HOME_COMP_ID = 1;
+
+    private $db;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    private function bind($sql, array $args)
+    {
+        $stmt = $this->db->prepare($sql);
+        foreach ($args as $k => $v) {
+            $stmt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
+        $stmt->execute();
+        return $stmt;
+    }
+
+    private function run($sql, array $args)
+    {
+        return $this->bind($sql, $args)->fetchAll();
+    }
+
+    /** Writes go here, not through run(): fetchAll() on an INSERT or a DELETE
+     *  has no result set to read and is not worth depending on. */
+    private function exec($sql, array $args)
+    {
+        return $this->bind($sql, $args)->rowCount();
+    }
+
+    /** Query: the companies this report covers — the weekly-reporting group
+     *  (subsidiaries.weekly_report_status = 1), and only those of them that
+     *  actually hold pool rows.
+     *
+     *  This list is the report's scope, not just the filter's options: it is
+     *  also what "All companies" totals up, so the group figure is always the
+     *  sum of what the dropdown offers. A company outside the group is still
+     *  reachable by an explicit comp_id — someone whose own company has left
+     *  the group keeps seeing their own head count — it is simply never
+     *  offered in the list and never folded into the group total. */
+    public function companies()
+    {
+        $sql = "SELECT u.comp_id,
+                       COALESCE(NULLIF(TRIM(s.name), ''),
+                                NULLIF(TRIM(s.code), ''),
+                                CONCAT('Company ', u.comp_id)) AS display_name
+                FROM staff_portal2.users u
+                INNER JOIN staff_portal2.subsidiaries s ON s.id = u.comp_id
+                WHERE u.status = '1' AND u.deleted = '0'
+                  AND IFNULL(u.test_user, 0) <> 1
+                  AND IFNULL(u.is_gw, 0) <> 1
+                  AND IFNULL(u.is_trillium, 0) <> 1
+                  AND s.weekly_report_status = 1
+                GROUP BY u.comp_id, display_name
+                ORDER BY display_name";
+        $rows = $this->run($sql, array());
+
+        /* Trillium cannot come out of that query — subsidiaries row 16 is
+         * inactive and files no weekly report, and no users row carries
+         * comp_id 16 — so it is added by hand, and only while it actually has
+         * people. Its name still comes from subsidiaries, with the same
+         * fallbacks, so it reads like every other entry. */
+        $t = $this->run(
+            "SELECT (SELECT COUNT(*)
+                       FROM staff_portal2.users u
+                      WHERE u.status = '1' AND u.deleted = '0'
+                        AND IFNULL(u.test_user, 0) <> 1
+                        AND IFNULL(u.is_gw, 0) <> 1
+                        AND u.comp_id = :home
+                        AND IFNULL(u.is_trillium, 0) = 1) AS n,
+                    (SELECT COALESCE(NULLIF(TRIM(s.name), ''),
+                                     NULLIF(TRIM(s.code), ''),
+                                     CONCAT('Company ', :id2))
+                       FROM staff_portal2.subsidiaries s
+                      WHERE s.id = :id) AS display_name",
+            array(
+                ':home' => (int)self::TRILLIUM_HOME_COMP_ID,
+                ':id'   => (int)self::TRILLIUM_COMP_ID,
+                ':id2'  => (int)self::TRILLIUM_COMP_ID,
+            )
+        );
+
+        if (!empty($t) && (int)$t[0]['n'] > 0) {
+            $name = $t[0]['display_name'];
+            $rows[] = array(
+                'comp_id'      => self::TRILLIUM_COMP_ID,
+                'display_name' => ($name === null || trim((string)$name) === '')
+                    ? 'Company ' . self::TRILLIUM_COMP_ID
+                    : $name,
+            );
+            usort($rows, function ($a, $b) {
+                return strcasecmp($a['display_name'], $b['display_name']);
+            });
+        }
+        return $rows;
+    }
+
+    /** Query: an IN list for the "all companies" case, or '' when there is
+     *  nothing to limit. Ids come from companies() — they are already ints out
+     *  of the database — so they inline safely and keep the two populations
+     *  from each needing their own bound list. */
+    private function scopeIn($column, array $comps = null)
+    {
+        if ($comps === null || empty($comps)) {
+            return '';
+        }
+        $ids = array();
+        foreach ($comps as $c) {
+            $ids[] = (int)$c;
+        }
+        return " AND " . $column . " IN (" . implode(',', $ids) . ")";
+    }
+
+    /** The columns every staff row is built from. $compExpr is what the row
+     *  reports as its company: normally u.comp_id, but a literal for Trillium,
+     *  whose people are stored under Globinaco. */
+    private function staffSelect($compExpr)
+    {
+        return "SELECT u.person,
+                       {$compExpr} AS comp_id,
+                       u.fullname,
+                       u.department,
+                       u.position,
+                       (IFNULL(u.kpi_excluded, '0') = '1')   AS base_kpi,
+                       (IFNULL(u.mk_command_excluded, 0) = 1) AS base_mk_command,
+                       (IFNULL(u.mk_academy_excluded, 0) = 1) AS base_mk_academy
+                FROM staff_portal2.users u
+                WHERE u.status = '1' AND u.deleted = '0'
+                  AND IFNULL(u.test_user, 0) <> 1
+                  AND IFNULL(u.is_gw, 0) <> 1";
+    }
+
+    /** The leading term is what puts "No department" at the BOTTOM: it is 1
+     *  for a blank or NULL department and 0 for a real one, so the named
+     *  departments come first and the unassigned trail them. */
+    private function staffOrder()
+    {
+        return " ORDER BY (TRIM(IFNULL(u.department, '')) = '') ASC,
+                          u.department, u.fullname, u.person";
+    }
+
+    /** Query: ordinary staff — everyone except the Trillium block, which is
+     *  reported under its own company and would otherwise appear twice. */
+    private function plainStaff($compId, array $scopeComps = null)
+    {
+        $args = array();
+        $sql  = $this->staffSelect('u.comp_id')
+              . " AND IFNULL(u.is_trillium, 0) <> 1";
+        if ($compId !== null) {
+            $sql .= " AND u.comp_id = :comp";
+            $args[':comp'] = (int)$compId;
+        } else {
+            $sql .= $this->scopeIn('u.comp_id', $scopeComps);
+        }
+        return $this->decorate($this->run($sql . $this->staffOrder(), $args), 'staff');
+    }
+
+    /** Query: the Trillium block, relabelled as its own company.
+     *  The relabelling is not cosmetic — comp_id is part of an override's key,
+     *  so these people are keyed under 16 and can never collide with a
+     *  Globinaco row for the same person. */
+    private function trilliumStaff()
+    {
+        $sql = $this->staffSelect((int)self::TRILLIUM_COMP_ID)
+             . " AND u.comp_id = " . (int)self::TRILLIUM_HOME_COMP_ID
+             . " AND IFNULL(u.is_trillium, 0) = 1"
+             . $this->staffOrder();
+        return $this->decorate($this->run($sql, array()), 'staff');
+    }
+
+    /** Query: the staff half of the pool.
+     *
+     *  No search or department predicate here on purpose. The whole company is
+     *  loaded once, the summary tiles are counted off the whole of it, and the
+     *  filters are applied in PHP for display — otherwise the tiles would move
+     *  every time someone typed in the search box and stop being a head count.
+     *  Worst case (All companies) is well under 1,000 rows. */
+    public function staff($compId, array $scopeComps = null)
+    {
+        if ($compId !== null) {
+            return (int)$compId === self::TRILLIUM_COMP_ID
+                ? $this->trilliumStaff()
+                : $this->plainStaff((int)$compId);
+        }
+
+        /* All companies: the plain rows, then the Trillium block appended as
+         * its own company — the same shape the GW block has. */
+        $rows = $this->plainStaff(null, $scopeComps);
+        if ($scopeComps === null
+            || in_array(self::TRILLIUM_COMP_ID, $scopeComps, true)) {
+            $rows = array_merge($rows, $this->trilliumStaff());
+        }
+        return $rows;
+    }
+
+    /** Query: the GW half of the pool.
+     *
+     *  comp_id is VARCHAR on monthly_assign_gw, so it binds as a string — the
+     *  same quirk jobspecReport.php works around with CAST. GW exist only at
+     *  Globinaco (1) and Arus Sawit (4); the IN clause says so rather than
+     *  leaving it to the data. */
+    public function gw($compId, array $scopeComps = null)
+    {
+        if ($compId !== null && !in_array((int)$compId, array(1, 4), true)) {
+            return array();
+        }
+        $args = array();
+        /* ONE ROW PER CODE. monthly_assign_gw holds a row per GW per REPORTING
+         * LINE, so a worker assigned under two superiors is in there twice —
+         * 17 of them at Globinaco today. The code is what identifies the
+         * person, so the group is (comp_id, code) and the duplicates collapse.
+         *
+         * MAX() on the three flags means "exempted if any row says so", which
+         * is the safe direction for an exemption. All 17 groups currently
+         * agree on name, district and every flag — only boss_id differs — so
+         * this changes the count, not anybody's values. */
+        $sql = "SELECT g.monthly_assign_gw_code            AS person,
+                       g.comp_id,
+                       MAX(g.monthly_assign_gw_fullname)   AS fullname,
+                       MAX(g.monthly_assign_gw_district)   AS department,
+                       '' AS position,
+                       MAX(IFNULL(g.kpi_scorecard_exclude, '0') = '1') AS base_kpi,
+                       MAX(IFNULL(g.mk_command_excluded, 0) = 1)       AS base_mk_command,
+                       MAX(IFNULL(g.mk_academy_excluded, 0) = 1)       AS base_mk_academy
+                FROM evaluation.monthly_assign_gw g
+                WHERE g.monthly_assign_gw_status = '1'
+                  AND IFNULL(g.test_user, 0) <> 1
+                  AND g.comp_id IN ('1', '4')";
+        if ($compId !== null) {
+            $sql .= " AND g.comp_id = :comp";
+            $args[':comp'] = (string)(int)$compId;
+        } else {
+            /* comp_id is VARCHAR here, but every id is numeric and MySQL
+             * compares the two sides numerically, so the inlined int list is
+             * still the right filter. */
+            $sql .= $this->scopeIn('g.comp_id', $scopeComps);
+        }
+        /* The aggregates are REPEATED in ORDER BY rather than referred to by
+         * their aliases: MySQL 5.6 rejects an aggregate alias used inside an
+         * expression there ("Reference 'department' not supported (reference
+         * to group function)"), which is what a plain ORDER BY department
+         * would hide until the TRIM wrapper went round it. */
+        $sql .= " GROUP BY g.comp_id, g.monthly_assign_gw_code
+                  ORDER BY (TRIM(IFNULL(MAX(g.monthly_assign_gw_district), '')) = '') ASC,
+                           MAX(g.monthly_assign_gw_district),
+                           MAX(g.monthly_assign_gw_fullname),
+                           g.monthly_assign_gw_code";
+        return $this->decorate($this->run($sql, $args), 'gw');
+    }
+
+    /** Everything in the pool is in the pool — base_in_pool is 1 by
+     *  construction, and only an override can take someone out of it. Stamping
+     *  it here keeps the four flags uniform from this point on. */
+    private function decorate(array $rows, $type)
+    {
+        foreach ($rows as &$r) {
+            $r['person_type']     = $type;
+            $r['comp_id']         = (int)$r['comp_id'];
+            $r['base_in_pool']    = 1;
+            $r['base_kpi']        = (int)$r['base_kpi'];
+            $r['base_mk_command'] = (int)$r['base_mk_command'];
+            $r['base_mk_academy'] = (int)$r['base_mk_academy'];
+        }
+        unset($r);
+        return $rows;
+    }
+
+    /** Query: every override in scope, as a flat map.
+     *  Merged in PHP rather than joined: users is utf8, monthly_assign_gw is
+     *  latin1, and joining a utf8 override table to both would hit an illegal
+     *  mix of collations on 5.6. The map is tens of rows per company. */
+    public function overrides($compId)
+    {
+        $args = array();
+        $sql = "SELECT person_type, comp_id, person, flag, value,
+                       updated_by, updated_date
+                FROM staff_portal2.staff_flag_override";
+        if ($compId !== null) {
+            $sql .= " WHERE comp_id = :comp";
+            $args[':comp'] = (int)$compId;
+        }
+        $map = array();
+        foreach ($this->run($sql, $args) as $r) {
+            $map[overrideKey($r['person_type'], $r['comp_id'], $r['person'], $r['flag'])] = array(
+                'value'        => (int)$r['value'],
+                'updated_by'   => $r['updated_by'],
+                'updated_date' => $r['updated_date'],
+            );
+        }
+        return $map;
+    }
+
+    /** Query: the change log, newest first. */
+    public function log($compId, $limit = 200)
+    {
+        $args = array();
+        $sql = "SELECT person_type, comp_id, person, person_name, flag,
+                       old_value, new_value, changed_by, changed_date
+                FROM staff_portal2.staff_flag_override_log";
+        if ($compId !== null) {
+            $sql .= " WHERE comp_id = :comp";
+            $args[':comp'] = (int)$compId;
+        }
+        $sql .= " ORDER BY changed_date DESC, id DESC LIMIT " . (int)$limit;
+        return $this->run($sql, $args);
+    }
+
+    /** Command: apply one tick.
+     *
+     *  $value null clears the override, putting the cell back under its source
+     *  column — that is what Undo does when the log says there was no override
+     *  before. Anything else upserts.
+     *
+     *  State and log are written together: the log row is the record of who
+     *  did it, and a state change without one would be unattributable. */
+    public function applyChange($type, $compId, $person, $personName, $flag, $value,
+                                $byName, $byId)
+    {
+        $key = array(
+            ':t' => $type,
+            ':c' => (int)$compId,
+            ':p' => (string)$person,
+            ':f' => $flag,
+        );
+
+        $stmt = $this->db->prepare(
+            "SELECT value FROM staff_portal2.staff_flag_override
+              WHERE person_type = :t AND comp_id = :c AND person = :p AND flag = :f"
+        );
+        foreach ($key as $k => $v) {
+            $stmt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
+        $stmt->execute();
+        $found = $stmt->fetchColumn();
+        $old   = ($found === false) ? null : (int)$found;
+
+        if ($value === null && $old === null) {
+            return $old;                       // nothing to clear, nothing to log
+        }
+        if ($value !== null && $old === (int)$value) {
+            return $old;                       // already there; no phantom log row
+        }
+
+        $this->db->beginTransaction();
+        try {
+            if ($value === null) {
+                $this->exec(
+                    "DELETE FROM staff_portal2.staff_flag_override
+                      WHERE person_type = :t AND comp_id = :c AND person = :p AND flag = :f",
+                    $key
+                );
+            } else {
+                $this->exec(
+                    "INSERT INTO staff_portal2.staff_flag_override
+                            (person_type, comp_id, person, flag, value, updated_by, updated_by_id)
+                     VALUES (:t, :c, :p, :f, :v, :by, :byid)
+                     ON DUPLICATE KEY UPDATE value = VALUES(value),
+                                             updated_by = VALUES(updated_by),
+                                             updated_by_id = VALUES(updated_by_id),
+                                             updated_date = CURRENT_TIMESTAMP",
+                    $key + array(
+                        ':v'    => (int)$value,
+                        ':by'   => (string)$byName,
+                        ':byid' => (int)$byId,
+                    )
+                );
+            }
+
+            /* new_value on a clear records what the cell fell back to, so the
+             * log reads as a value and not as a hole. is_clear tells the two
+             * apart for the reader. */
+            $this->exec(
+                "INSERT INTO staff_portal2.staff_flag_override_log
+                        (person_type, comp_id, person, person_name, flag,
+                         old_value, new_value, changed_by, changed_by_id)
+                 VALUES (:t, :c, :p, :pn, :f, :ov, :nv, :by, :byid)",
+                $key + array(
+                    ':pn'   => (string)$personName,
+                    ':ov'   => $old,
+                    ':nv'   => ($value === null ? -1 : (int)$value),
+                    ':by'   => (string)$byName,
+                    ':byid' => (int)$byId,
+                )
+            );
+            $this->db->commit();
+        } catch (Exception $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
+        return $old;
+    }
+}
+
+/* ---------- view helpers -------------------------------------------------- */
+
+function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+
+/** Query: this page's URL with some params replaced. A null value drops one. */
+function selfUrl(array $changes)
+{
+    $q = $_GET;
+    foreach ($changes as $k => $v) {
+        if ($v === null) { unset($q[$k]); } else { $q[$k] = $v; }
+    }
+    unset($q['ajax']);
+    $qs = http_build_query($q);
+    return basename(__FILE__) . ($qs === '' ? '' : '?' . $qs);
+}
+
+/** Query: a name in Title Case, however it was typed.
+ *
+ *  The source records are inconsistent — every one of the 959 GW names is
+ *  upper case, staff names run from "BOON SHU HARN" to "chen kin yee" — and
+ *  this only changes how they READ. Nothing is written back to users or
+ *  monthly_assign_gw.
+ *
+ *  Two kinds of word are left exactly as typed, because title case would
+ *  damage them:
+ *    - anything bracketed, e.g. "(QMR)", "(ISO22000-DCC)" — a qualifier, not
+ *      a name, and "(Qmr)" would be wrong
+ *    - anything containing a digit
+ *
+ *  Everything else is lower-cased and then capitalised at the start of each
+ *  run of letters, so the separators inside a word carry too:
+ *    O'BRIEN -> O'Brien,  AL-NAJIR -> Al-Najir,  AZMAN B. FAIZAL -> Azman B. Faizal
+ *
+ *  Only ASCII letter runs are touched, which leaves any UTF-8 byte sequence
+ *  untouched without needing mbstring. Whitespace is preserved as typed. */
+function normaliseName($name)
+{
+    /* Nine GW records carry a non-breaking space (U+00A0) where a plain one
+     * was meant — a paste artefact, e.g. monthly_assign_gw_code C2:544. It
+     * is a space, so it is treated as one here: left alone it neither splits
+     * two words nor trims, and those names render joined up or indented. */
+    $name = str_replace("\xc2\xa0", ' ', (string)$name);
+
+    $parts = preg_split('/(\s+)/', $name, -1, PREG_SPLIT_DELIM_CAPTURE);
+    foreach ($parts as $i => $part) {
+        if ($part === '' || preg_match('/^\s+$/', $part)) {
+            continue;
+        }
+        if (preg_match('/[0-9()\[\]]/', $part)) {
+            continue;
+        }
+        $parts[$i] = preg_replace_callback(
+            '/[A-Za-z]+/',
+            function ($m) { return ucfirst(strtolower($m[0])); },
+            $part
+        );
+    }
+    return implode('', $parts);
+}
+
+/** Query: the name to print, with the code as the fallback. The code is a
+ *  login or a GW code, not a name, so it is printed as it is stored. */
+function displayName($name, $code)
+{
+    /* Normalise first, then trim: that is what lets the trim reach a leading
+     * non-breaking space, which normaliseName has by then turned into a
+     * plain one. */
+    $name = trim(normaliseName($name));
+    return $name !== '' ? $name : (string)$code;
+}
+
+/** Query: a blank department is still a group — it just needs a name. */
+function deptLabel($dept)
+{
+    $dept = trim((string)$dept);
+    return $dept === '' ? 'No department' : $dept;
+}
+
+function fmtDateTime($v)
+{
+    if ($v === null || $v === '' || $v === '0000-00-00 00:00:00') { return '—'; }
+    $t = strtotime($v);
+    return $t ? date('j M Y, H:i', $t) : (string)$v;
+}
+
+/** Query: the head count over a set of rows — what the tiles show.
+ *  Someone taken out of the pool counts nowhere: an exemption only means
+ *  anything for a person who is in the pool to begin with. */
+function summarise(array $rows, array $overrides)
+{
+    $out = array('total' => 0, 'kpi' => 0, 'mk_command' => 0, 'mk_academy' => 0,
+                 'staff' => 0, 'gw' => 0, 'removed' => 0);
+    foreach ($rows as $row) {
+        list($inPool) = effective($row, 'in_pool', $overrides);
+        if (!$inPool) { $out['removed']++; continue; }
+        $out['total']++;
+        $out[$row['person_type'] === 'gw' ? 'gw' : 'staff']++;
+        foreach (array('kpi', 'mk_command', 'mk_academy') as $flag) {
+            list($v) = effective($row, $flag, $overrides);
+            if ($v) { $out[$flag]++; }
+        }
+    }
+    return $out;
+}
+
+/** Query: the per-column totals for the table foot. Same counting rule as
+ *  summarise(), keyed by column instead. */
+function footTotals(array $rows, array $overrides)
+{
+    $sum = summarise($rows, $overrides);
+    return array(
+        'in_pool'    => $sum['total'],
+        'kpi'        => $sum['kpi'],
+        'mk_command' => $sum['mk_command'],
+        'mk_academy' => $sum['mk_academy'],
+    );
+}
+
+/** Query: the effective value of one flag, and where it came from.
+ *  Returns array(value, pinned) — pinned means an override exists AND it
+ *  disagrees with the source column, which is the only case worth marking. */
+function effective(array $row, $flag, array $overrides)
+{
+    $defs = flagDefs();
+    $base = (int)$row[$defs[$flag]['base']];
+    $key  = overrideKey($row['person_type'], $row['comp_id'], $row['person'], $flag);
+    if (!isset($overrides[$key])) {
+        return array($base, false, null);
+    }
+    $o = $overrides[$key];
+    return array((int)$o['value'], (int)$o['value'] !== $base, $o);
+}
+
+/** Query: the set of values ?flag= may take — each column, and each column
+ *  negated. "not_kpi" is the people the "after exemption" figure counts. */
+function flagFilterValues()
+{
+    $out = array();
+    foreach (array_keys(flagDefs()) as $f) {
+        $out[] = $f;
+        $out[] = 'not_' . $f;
+    }
+    return $out;
+}
+
+/** Query: how an active ?flag= reads on screen, or null if there is none. */
+function flagFilterLabel($flagWant)
+{
+    if ($flagWant === '') {
+        return null;
+    }
+    $negate = strpos($flagWant, 'not_') === 0;
+    $base   = $negate ? substr($flagWant, 4) : $flagWant;
+    $defs   = flagDefs();
+    if (!isset($defs[$base])) {
+        return null;
+    }
+    if ($base === 'in_pool') {
+        return $negate ? 'Taken out of the pool' : 'In the staff pool';
+    }
+    $what = trim(str_replace('Exempted', '', $defs[$base]['label']));
+    return $negate ? 'Not exempted — ' . $what : $defs[$base]['label'];
+}
+
+/** Query: does this row belong to the tile that was clicked?
+ *
+ *  Every tile counts only people who are in the pool, so this filter does too
+ *  — otherwise clicking "13" could show 14 rows. The one exception is
+ *  "not_in_pool", which is how the people taken OUT of the pool are listed. */
+function matchesFlagFilter(array $row, $flagWant, array $overrides)
+{
+    if ($flagWant === '') {
+        return true;
+    }
+    $negate = strpos($flagWant, 'not_') === 0;
+    $base   = $negate ? substr($flagWant, 4) : $flagWant;
+    $defs   = flagDefs();
+    if (!isset($defs[$base])) {
+        return true;
+    }
+
+    list($inPool) = effective($row, 'in_pool', $overrides);
+    if ($base === 'in_pool') {
+        return $negate ? !$inPool : (bool)$inPool;
+    }
+    if (!$inPool) {
+        return false;
+    }
+    list($v) = effective($row, $base, $overrides);
+    return $negate ? !$v : (bool)$v;
+}
+
+/** Query: does this row differ from what users / monthly_assign_gw say? */
+function rowIsChanged(array $row, array $overrides)
+{
+    foreach (array_keys(flagDefs()) as $flag) {
+        list($v, $pinned) = effective($row, $flag, $overrides);
+        if ($pinned) { return true; }
+    }
+    return false;
+}
+
+/* ---------- controller ---------------------------------------------------- */
+
+$error    = null;
+$staff    = array();
+$gw       = array();
+$overrides = array();
+$companies = array();
+$logRows  = array();
+
+/* The session's own company. UnifiedAuth joins users -> subsidiaries at login,
+ * so comp_id is already there. */
+$ownCompId = isset($currentUser['comp_id']) && $currentUser['comp_id'] !== ''
+    ? (int)$currentUser['comp_id']
+    : null;
+$userId    = isset($currentUser['id']) ? (int)$currentUser['id'] : null;
+$userName  = isset($currentUser['person']) ? (string)$currentUser['person'] : '';
+
+/* Both lookups fail closed: a dead database makes everyone a read-only viewer
+ * of their own company rather than an editor of all of them. */
+$isSuper    = false;
+$adminComps = array();
+try {
+    $isSuper    = isSuperAdmin(Db::get(), $userId);
+    $adminComps = withTrillium(companyAdminComps(Db::get(), $userId));
+} catch (Exception $e) {
+    error_log('staffHeadcountReport access: ' . $e->getMessage());
+}
+
+/** Viewable: own company, plus anything administered. Editable: administered
+ *  companies only — being able to see a company is not being able to change
+ *  it, and a company admin's own company is not automatically theirs to edit
+ *  unless kpi_company_admins says so. */
+$viewComps = $adminComps;
+if ($ownCompId !== null && !in_array($ownCompId, $viewComps, true)) {
+    $viewComps[] = $ownCompId;
+}
+$viewComps = withTrillium($viewComps);
+sort($viewComps);
+
+/** Query: may this user tick a row belonging to $compId? */
+function canEditComp($compId, $isSuper, array $adminComps)
+{
+    if ($isSuper) { return true; }
+    return in_array((int)$compId, $adminComps, true);
+}
+
+/* Which company is on screen. A super admin may ask for any of them, or for
+ * all; everyone else is held to $viewComps, and an unrecognised comp_id falls
+ * back to their own rather than erroring. */
+$defaultCompId = $ownCompId;
+if ($defaultCompId === null && !empty($viewComps)) {
+    $defaultCompId = $viewComps[0];
+}
+
+if (!isset($_GET['comp_id'])) {
+    $compId = $defaultCompId;
+} elseif ($_GET['comp_id'] === '') {
+    $compId = $isSuper ? null : $defaultCompId;
+} else {
+    $want = (int)$_GET['comp_id'];
+    if ($isSuper || in_array($want, $viewComps, true)) {
+        $compId = $want;
+    } else {
+        $compId = $defaultCompId;
+    }
+}
+
+$noScope = (!$isSuper && $defaultCompId === null);
+if ($noScope) {
+    $error = 'Your account is not linked to a company, so this report has '
+           . 'nothing to show. Ask HR to set your company.';
+}
+
+/* Anyone who can edit at least one visible company gets live check boxes. The
+ * save endpoint re-checks every row's company regardless, so this only decides
+ * whether to render them enabled. */
+$canEditAny = $isSuper || !empty($adminComps);
+
+/* One token per session, checked on every save. The endpoint is a POST that a
+ * logged-in browser would happily make from another origin otherwise. */
+if (empty($_SESSION['sfr_token'])) {
+    $_SESSION['sfr_token'] = bin2hex(random_bytes(16));
+}
+$token = $_SESSION['sfr_token'];
+
+/* ---------- save endpoint ------------------------------------------------- */
+
+/** Command: apply a batch of ticks and answer in JSON. Everything below this
+ *  block is skipped. A batch is one array of changes, so the bulk bar and a
+ *  single check box use the same path. */
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'save') {
+    header('Content-Type: application/json; charset=UTF-8');
+
+    $reply = function ($ok, $msg, $extra = array()) {
+        echo json_encode(array('ok' => $ok, 'message' => $msg) + $extra);
+        exit;
+    };
+
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        $reply(false, 'POST only.');
+    }
+    if (!isset($_POST['token']) || !hash_equals($token, (string)$_POST['token'])) {
+        http_response_code(403);
+        $reply(false, 'Your session expired. Reload the page and try again.');
+    }
+    if (!$canEditAny || $noScope) {
+        http_response_code(403);
+        $reply(false, 'You do not have permission to change these.');
+    }
+
+    $items = json_decode(isset($_POST['payload']) ? $_POST['payload'] : '[]', true);
+    if (!is_array($items) || empty($items)) {
+        http_response_code(400);
+        $reply(false, 'Nothing to save.');
+    }
+    if (count($items) > 2000) {
+        http_response_code(400);
+        $reply(false, 'Too many changes in one batch. Select fewer rows.');
+    }
+
+    $scope = json_decode(isset($_POST['scope']) ? $_POST['scope'] : '{}', true);
+    if (!is_array($scope)) { $scope = array(); }
+
+    $viewComp = (!isset($scope['comp_id']) || $scope['comp_id'] === ''
+                 || $scope['comp_id'] === null) ? null : (int)$scope['comp_id'];
+    if ($viewComp === null) {
+        if (!$isSuper) { $viewComp = $defaultCompId; }
+    } elseif (!$isSuper && !in_array($viewComp, $viewComps, true)) {
+        $viewComp = $defaultCompId;
+    }
+    $viewQ       = isset($scope['q']) ? trim((string)$scope['q']) : '';
+    $viewDept    = isset($scope['dept']) ? trim((string)$scope['dept']) : '';
+    $viewChanged = !empty($scope['changed']);
+    $viewFlag    = isset($scope['flag']) ? trim((string)$scope['flag']) : '';
+    if (!in_array($viewFlag, flagFilterValues(), true)) {
+        $viewFlag = '';
+    }
+
+    try {
+        $repo  = new StaffPoolRepository(Db::get());
+        $defs  = flagDefs();
+
+        /* The rows of the view being edited, loaded ONCE and used twice: to
+         * validate every change against a real person, and afterwards to
+         * recount the tiles and the table foot. Person, company and type all
+         * have to line up with a row here, so a hand-made POST cannot invent
+         * an override for somebody who is not in the report — or for a company
+         * this user may not touch. */
+        $scopeComps = array();
+        foreach ($repo->companies() as $c) {
+            $scopeComps[] = (int)$c['comp_id'];
+        }
+        $viewRows = array_merge($repo->staff($viewComp, $scopeComps),
+                                $repo->gw($viewComp, $scopeComps));
+
+        $pool = array();
+        $seenComps = array();
+        foreach ($viewRows as $r) {
+            $pool[$r['person_type'] . "\x1f" . $r['comp_id'] . "\x1f" . $r['person']] = $r;
+            $seenComps[$r['comp_id']] = true;
+        }
+
+        /* An Undo from the change log can name a company the current view does
+         * not cover, so anything still unaccounted for is loaded on top. */
+        $extraComps = array();
+        foreach ($items as $it) {
+            $c = isset($it['c']) ? (int)$it['c'] : 0;
+            if (!isset($seenComps[$c])) { $extraComps[$c] = true; }
+        }
+        if (count($extraComps) > 25) {
+            http_response_code(400);
+            $reply(false, 'Too many companies in one batch.');
+        }
+        foreach (array_keys($extraComps) as $cmp) {
+            foreach (array_merge($repo->staff($cmp), $repo->gw($cmp)) as $r) {
+                $pool[$r['person_type'] . "\x1f" . $r['comp_id'] . "\x1f" . $r['person']] = $r;
+            }
+        }
+
+        $saved   = 0;
+        $refused = 0;
+        foreach ($items as $it) {
+            $type   = isset($it['t']) ? (string)$it['t'] : '';
+            $comp   = isset($it['c']) ? (int)$it['c'] : 0;
+            $person = isset($it['p']) ? (string)$it['p'] : '';
+            $flag   = isset($it['f']) ? (string)$it['f'] : '';
+            $value  = (!isset($it['v']) || $it['v'] === null || $it['v'] === '')
+                ? null : (int)$it['v'];
+
+            if (!isset($defs[$flag]) || ($type !== 'staff' && $type !== 'gw')) {
+                $refused++;
+                continue;
+            }
+            if ($value !== null && $value !== 0 && $value !== 1) {
+                $refused++;
+                continue;
+            }
+            if (!canEditComp($comp, $isSuper, $adminComps)) {
+                $refused++;
+                continue;
+            }
+            $pk = $type . "\x1f" . $comp . "\x1f" . $person;
+            if (!isset($pool[$pk])) {
+                $refused++;
+                continue;
+            }
+
+            $repo->applyChange(
+                $type, $comp, $person,
+                displayName($pool[$pk]['fullname'], $person),
+                $flag, $value, $userName, $userId
+            );
+            $saved++;
+        }
+
+        /* Recount from the database rather than from what was just posted:
+         * the page's numbers then come from the same code a reload would run,
+         * and a change someone else made in the meantime shows up too. */
+        $freshOv = $repo->overrides($viewComp);
+        $shown   = filterRows($viewRows, $viewQ, $viewDept, $viewChanged, $freshOv,
+                              $viewFlag);
+
+        $msg = $saved . ($saved === 1 ? ' change saved' : ' changes saved');
+        if ($refused > 0) {
+            $msg .= ', ' . $refused . ' refused';
+        }
+        $reply($refused === 0, $msg, array(
+            'saved'   => $saved,
+            'refused' => $refused,
+            'totals'  => array(
+                'summary' => summarise($viewRows, $freshOv),
+                'foot'    => footTotals($shown, $freshOv),
+                'shown'   => count($shown),
+            ),
+        ));
+    } catch (Exception $e) {
+        error_log('staffHeadcountReport save: ' . $e->getMessage());
+        http_response_code(500);
+        $reply(false, 'Could not save. Check the error log.');
+    }
+}
+
+/* ---------- load ---------------------------------------------------------- */
+
+/** The change log panel at the foot of the page, hidden for now.
+ *  Set this to true to bring it back. staff_flag_override_log keeps recording
+ *  every tick either way, so nothing is lost while it is off — and the Undo
+ *  buttons live inside that panel, so they go with it. */
+$showChangeLog = false;
+
+$search    = isset($_GET['q']) ? trim((string)$_GET['q']) : '';
+$deptWant  = isset($_GET['dept']) ? trim((string)$_GET['dept']) : '';
+$groupBy   = !isset($_GET['group']) || $_GET['group'] === '1';   // default on
+$onlyChanged = isset($_GET['changed']) && $_GET['changed'] === '1';
+
+/* Which tile was clicked. Anything unrecognised is dropped rather than
+ * erroring, so a stale bookmark just shows the unfiltered report. */
+$flagWant = isset($_GET['flag']) ? trim((string)$_GET['flag']) : '';
+if (!in_array($flagWant, flagFilterValues(), true)) {
+    $flagWant = '';
+}
+$flagLabel = flagFilterLabel($flagWant);
+
+try {
+    if ($noScope) {
+        throw new RuntimeException('Viewer has no company');
+    }
+    $repo      = new StaffPoolRepository(Db::get());
+    $companies = $repo->companies();
+
+    /* "All companies" means the companies in the list above, so the group
+     * total is the sum of the per-company figures and never a larger number
+     * nobody can reproduce by adding the dropdown up. */
+    $scopeComps = array();
+    foreach ($companies as $c) {
+        $scopeComps[] = (int)$c['comp_id'];
+    }
+
+    $staff     = $repo->staff($compId, $scopeComps);
+    $gw        = $repo->gw($compId, $scopeComps);
+    $overrides = $repo->overrides($compId);
+    if ($showChangeLog) {
+        $logRows = $repo->log($compId);
+    }
+} catch (Exception $e) {
+    error_log('staffHeadcountReport: ' . $e->getMessage());
+    if ($error === null) {
+        /* First run says so plainly rather than hiding behind the generic
+         * message — neither table exists until the DDL has been run. */
+        $error = (strpos($e->getMessage(), 'staff_flag_override') !== false)
+            ? 'The tick-box tables are not installed yet. Run '
+              . 'mkCommand_API/sql/staff_flag_override.sql on globportal, then reload.'
+            : 'Could not load the report. Check the error log.';
+    }
+}
+
+/** Query: the company label for a pinned viewer and for the page subtitle. */
+$compLabel = 'All companies';
+if ($compId !== null) {
+    $compLabel = 'Company ' . $compId;
+    foreach ($companies as $c) {
+        if ((int)$c['comp_id'] === (int)$compId) {
+            $compLabel = $c['display_name'];
+            break;
+        }
+    }
+    if ($compLabel === 'Company ' . $compId
+        && isset($currentUser['company_name'])
+        && trim((string)$currentUser['company_name']) !== ''
+        && (int)$compId === (int)$ownCompId) {
+        $compLabel = $currentUser['company_name'];
+    }
+}
+
+/** Only "All companies" needs this: with one company on screen the name is
+ *  already in the heading, and repeating it under every row is noise. */
+if ($compId === null) {
+    $compNames = array();
+    foreach ($companies as $c) {
+        $compNames[(int)$c['comp_id']] = $c['display_name'];
+    }
+    foreach (array('staff', 'gw') as $setName) {
+        foreach ($$setName as &$row) {
+            $row['company_name'] = isset($compNames[$row['comp_id']])
+                ? $compNames[$row['comp_id']]
+                : 'Company ' . $row['comp_id'];
+        }
+        unset($row);
+    }
+}
+
+/* The companies the select may offer: everything for a super admin, otherwise
+ * only what this user may view. */
+$pickable = array();
+foreach ($companies as $c) {
+    if ($isSuper || in_array((int)$c['comp_id'], $viewComps, true)) {
+        $pickable[] = $c;
+    }
+}
+
+/* Over the WHOLE company, before the search and department filters, so the
+ * tiles stay a head count instead of following the search box. */
+$summary = summarise(array_merge($staff, $gw), $overrides);
+
+/** The department list offered by the filter, from both populations. GW have
+ *  no department — their district stands in for one, which is the only
+ *  grouping GW rows carry. */
+$deptOptions = array();
+foreach (array($staff, $gw) as $set) {
+    foreach ($set as $row) {
+        $deptOptions[deptLabel($row['department'])] = true;
+    }
+}
+$deptOptions = array_keys($deptOptions);
+sort($deptOptions);
+/* Keep the dropdown in the same order as the table: named departments first,
+ * the unassigned group at the end. */
+$noDept = array_search(deptLabel(''), $deptOptions, true);
+if ($noDept !== false) {
+    array_splice($deptOptions, $noDept, 1);
+    $deptOptions[] = deptLabel('');
+}
+
+/** Command: apply the on-screen filters to one population. */
+function filterRows(array $rows, $search, $deptWant, $onlyChanged, array $overrides,
+                    $flagWant = '')
+{
+    $needle = $search === '' ? null : $search;
+    $out = array();
+    foreach ($rows as $row) {
+        if ($deptWant !== '' && deptLabel($row['department']) !== $deptWant) {
+            continue;
+        }
+        if ($needle !== null) {
+            /* stripos, not mb_*: no extension to depend on, and these are
+             * names and codes, not text that needs locale-aware folding. */
+            $hay = $row['fullname'] . ' ' . $row['person'];
+            if (stripos($hay, $needle) === false) { continue; }
+        }
+        if ($onlyChanged && !rowIsChanged($row, $overrides)) {
+            continue;
+        }
+        if (!matchesFlagFilter($row, $flagWant, $overrides)) {
+            continue;
+        }
+        $out[] = $row;
+    }
+    return $out;
+}
+
+$staffShown = filterRows($staff, $search, $deptWant, $onlyChanged, $overrides, $flagWant);
+$gwShown    = filterRows($gw, $search, $deptWant, $onlyChanged, $overrides, $flagWant);
+$filtered   = ($search !== '' || $deptWant !== '' || $onlyChanged || $flagWant !== '');
+$shownCount = count($staffShown) + count($gwShown);
+$poolCount  = count($staff) + count($gw);
+
+/* ---------- row rendering ------------------------------------------------- */
+
+/** Command: one check box cell.
+ *
+ *  The "1" sits in the DOM after the input so `input:checked ~ .n` can show
+ *  it, and the cell is laid out row-reverse so it still READS "1 [x]" the way
+ *  the spec's mock-up does. Unticked prints nothing — a column of zeroes was
+ *  explicitly not wanted. */
+function renderFlagCell(array $row, $flag, array $overrides, $editable)
+{
+    list($value, $pinned, $o) = effective($row, $flag, $overrides);
+
+    $title = '';
+    if ($o !== null) {
+        $title = 'Set by ' . $o['updated_by'] . ' on ' . fmtDateTime($o['updated_date']);
+        if ($pinned) {
+            $title .= ' — differs from the source record, so it is pinned here';
+        }
+    }
+
+    echo '<td class="flagcell' . ($pinned ? ' pinned' : '') . '">';
+    echo '<label class="flag"' . ($title !== '' ? ' title="' . h($title) . '"' : '') . '>';
+    echo '<input type="checkbox"';
+    echo ' data-type="' . h($row['person_type']) . '"';
+    echo ' data-comp="' . (int)$row['comp_id'] . '"';
+    echo ' data-person="' . h($row['person']) . '"';
+    echo ' data-flag="' . h($flag) . '"';
+    echo $value ? ' checked' : '';
+    echo $editable ? '' : ' disabled';
+    echo '>';
+    echo '<span class="n">1</span>';
+    if ($pinned) { echo '<span class="pindot" aria-hidden="true"></span>'; }
+    echo '</label></td>';
+}
+
+/** Command: the rows of one population, grouped or flat. */
+function renderRows(array $rows, $groupBy, array $overrides, $isSuper, array $adminComps,
+                    $canEditAny, $colspan)
+{
+    if (empty($rows)) {
+        echo '<tr><td colspan="' . (int)$colspan . '"><div class="empty">Nobody matches these filters.</div></td></tr>';
+        return;
+    }
+
+    $flags    = array_keys(flagDefs());
+    $i        = 0;
+    $lastDept = null;
+
+    foreach ($rows as $row) {
+        $editable = $canEditAny && canEditComp($row['comp_id'], $isSuper, $adminComps);
+
+        if ($groupBy) {
+            $dept = deptLabel($row['department']);
+            $key  = $row['person_type'] . "\x1f" . $dept;
+            if ($key !== $lastDept) {
+                $lastDept = $key;
+                echo '<tr class="grouphdr"><td colspan="' . (int)$colspan . '">';
+                if ($canEditAny) {
+                    echo '<label class="selall"><input type="checkbox" class="groupsel"> </label>';
+                }
+                echo h($dept);
+                if ($row['person_type'] === 'gw') { echo ' <span class="gwtag">GW</span>'; }
+                echo '</td></tr>';
+            }
+        }
+
+        list($inPool) = effective($row, 'in_pool', $overrides);
+        $i++;
+        echo '<tr class="personrow' . ($inPool ? '' : ' outofpool') . '"'
+           . ' data-dept="' . h(deptLabel($row['department'])) . '">';
+        echo '<td class="idx">' . $i . '</td>';
+        if ($canEditAny) {
+            echo '<td class="selcell">'
+               . '<input type="checkbox" class="rowsel"' . ($editable ? '' : ' disabled') . '>'
+               . '</td>';
+        }
+        echo '<td><span class="nm">' . h(displayName($row['fullname'], $row['person'])) . '</span>';
+        echo '<div class="muted">' . h($row['person']);
+        if (trim((string)$row['position']) !== '') {
+            echo ' · ' . h($row['position']);
+        }
+        if (!$groupBy) {
+            echo ' · ' . h(deptLabel($row['department']));
+        }
+        if (isset($row['company_name'])) {
+            echo ' · ' . h($row['company_name']);
+        }
+        if ($row['person_type'] === 'gw') { echo ' · GW'; }
+        echo '</div></td>';
+        foreach ($flags as $flag) {
+            renderFlagCell($row, $flag, $overrides, $editable);
+        }
+        echo '</tr>';
+    }
+}
+
+/** Command: one population's table, head and body. */
+function renderTable(array $rows, $groupBy, array $overrides, $isSuper, array $adminComps,
+                     $canEditAny)
+{
+    $defs    = flagDefs();
+    $colspan = 2 + count($defs) + ($canEditAny ? 1 : 0);
+
+    /* Footer totals count the rows ON SCREEN, so they follow the filters —
+     * the tiles above are the whole company and do not. */
+    $foot = footTotals($rows, $overrides);
+    ?>
+    <div class="card">
+        <table>
+            <thead>
+            <tr>
+                <th class="idx">No.</th>
+                <?php if ($canEditAny): ?><th class="selcell"></th><?php endif; ?>
+                <th>Staff Name</th>
+                <?php foreach ($defs as $key => $d): ?>
+                    <th class="flagcol"><?php echo h($d['label']); ?></th>
+                <?php endforeach; ?>
+            </tr>
+            </thead>
+            <tbody>
+            <?php renderRows($rows, $groupBy, $overrides, $isSuper, $adminComps,
+                             $canEditAny, $colspan); ?>
+            </tbody>
+            <?php if (!empty($rows)): ?>
+            <tfoot>
+            <tr class="totalrow">
+                <td class="idx"></td>
+                <?php if ($canEditAny): ?><td class="selcell"></td><?php endif; ?>
+                <td>Total</td>
+                <?php foreach (array_keys($defs) as $f): ?>
+                    <td class="flagcell" id="f_<?php echo h($f); ?>"><?php
+                        echo (int)$foot[$f]; ?></td>
+                <?php endforeach; ?>
+            </tr>
+            </tfoot>
+            <?php endif; ?>
+        </table>
+    </div>
+    <?php
+}
+
+/** Query: how one log row reads. new_value -1 is the Undo case — the override
+ *  was removed and the cell went back to whatever its source record says. */
+function logPhrase($old, $new)
+{
+    $word = function ($v) { return $v ? 'ticked' : 'unticked'; };
+    if ((int)$new === -1) {
+        return 'override removed — back to the source record';
+    }
+    if ($old === null) {
+        return 'set to ' . $word($new);
+    }
+    return $word($old) . ' → ' . $word($new);
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Staff Headcount Report</title>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+<style>
+    :root {
+        --bg:#f1f5f9; --surface:#fff; --primary:#2563eb; --success:#059669;
+        --danger:#dc2626; --warn:#b45309; --text:#1e293b; --muted:#64748b; --border:#e2e8f0;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:24px; background:var(--bg); color:var(--text);
+           font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; }
+    .wrap { max-width:1180px; margin:0 auto; }
+    .main-content { margin-left:260px; transition:margin-left .3s ease; }
+    .main-content.sidebar-collapsed { margin-left:60px; }
+    @media (max-width:1024px) { .main-content { margin-left:60px; } }
+    @media (max-width:768px)  { .main-content { margin-left:0 !important; } body { padding:12px; } }
+    h1 { font-size:20px; margin:0 0 4px; }
+    .sub { color:var(--muted); font-size:13px; margin-bottom:20px; }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+            padding:16px; margin-bottom:16px; }
+    .filters { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+    input[type=search], input[type=text], select, .btn {
+        font:inherit; padding:7px 12px; border-radius:8px;
+        border:1px solid var(--border); background:var(--surface); color:var(--text); }
+    .btn { text-decoration:none; display:inline-block; cursor:pointer; }
+    .btn.on { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:600; }
+    .btn:disabled { opacity:.5; cursor:default; }
+    .check { display:inline-flex; align-items:center; gap:6px; font-size:13px;
+             padding:7px 2px; white-space:nowrap; }
+    .tiles { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
+    .tile { flex:1; min-width:170px; background:var(--surface); border:1px solid var(--border);
+            border-radius:12px; padding:14px; }
+    .tile .n { font-size:26px; font-weight:700; line-height:1.1; }
+    .tile .l { font-size:12px; color:var(--muted); margin-top:2px; }
+    .n.kpi { color:var(--warn); }
+    .n.mkc { color:var(--primary); }
+    .n.mka { color:var(--success); }
+    .tile { padding:0; overflow:hidden; }
+    .tilemain { display:block; padding:14px 14px 10px; color:inherit; text-decoration:none; }
+    .tilemain:hover { background:rgba(37,99,235,.05); }
+    .tile.active { border-color:var(--primary); box-shadow:0 0 0 1px var(--primary) inset; }
+    .tile .after { display:block; font-size:12px; color:var(--muted);
+                   padding:8px 14px; border-top:1px solid var(--border);
+                   text-decoration:none; }
+    a.after:hover { background:rgba(37,99,235,.05); color:var(--text); }
+    a.after.on { background:rgba(37,99,235,.08); color:var(--primary); font-weight:600; }
+    .chip { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11.5px;
+            font-weight:700; background:rgba(37,99,235,.10); color:var(--primary); }
+    .chip a { text-decoration:none; margin-left:4px; }
+    .scopeline { color:var(--muted); font-size:12px; margin-bottom:16px; }
+    .totalrow td { font-weight:700; background:#f8fafc; border-top:2px solid var(--border);
+                   border-bottom:none; }
+    .totalrow .flagcell { font-variant-numeric:tabular-nums; }
+    table { width:100%; border-collapse:collapse; }
+    th { text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:.03em;
+         color:var(--muted); padding:8px 10px; border-bottom:2px solid var(--border); }
+    th.flagcol { text-align:center; width:150px; }
+    td { padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:middle; }
+    tr:last-child td { border-bottom:none; }
+    .idx { color:var(--muted); font-variant-numeric:tabular-nums; width:42px; }
+    .selcell { width:34px; text-align:center; }
+    .nm { font-weight:500; }
+    .muted { color:var(--muted); font-size:12px; }
+    .empty { color:var(--muted); text-align:center; padding:26px 0; }
+    a { color:var(--primary); }
+    .warnbox { border-left:4px solid var(--danger); background:rgba(220,38,38,.06); }
+
+    /* flag cell: input first in the DOM so `:checked ~ .n` works, reversed in
+       the layout so it reads "1 [x]". */
+    .flagcell { text-align:center; }
+    .flag { display:inline-flex; flex-direction:row-reverse; align-items:center;
+            gap:7px; cursor:pointer; position:relative; }
+    .flag input[disabled] { cursor:default; }
+    .flag .n { visibility:hidden; font-weight:700; font-variant-numeric:tabular-nums;
+               min-width:8px; text-align:right; }
+    .flag input:checked ~ .n { visibility:visible; }
+    .flag input { width:16px; height:16px; accent-color:var(--primary); }
+    .pindot { position:absolute; top:-3px; right:-7px; width:6px; height:6px;
+              border-radius:50%; background:var(--warn); }
+    .flagcell.pinned .n { color:var(--warn); }
+
+    .grouphdr td { background:#f8fafc; font-weight:700; font-size:12.5px;
+                   text-transform:uppercase; letter-spacing:.03em; color:var(--muted); }
+    .selall { display:inline-flex; align-items:center; margin-right:8px; vertical-align:middle; }
+    .outofpool .nm { text-decoration:line-through; }
+    .outofpool td { background:rgba(100,116,139,.05); }
+    .rowbusy td { background:rgba(37,99,235,.07); }
+    .rowsaved td { background:rgba(5,150,105,.09); }
+
+    .sectionhead { display:flex; align-items:baseline; gap:10px; margin:30px 0 4px;
+                   padding-top:22px; border-top:2px solid var(--border); }
+    .sectionhead h2 { font-size:18px; margin:0; }
+    .gwtag { display:inline-block; padding:2px 9px; border-radius:99px; font-size:11.5px;
+             font-weight:700; background:rgba(202,138,4,.12); color:#ca8a04; }
+
+    /* bulk bar: only in the flow once something is selected */
+    .bulk { position:sticky; bottom:12px; z-index:5; display:none; gap:10px; flex-wrap:wrap;
+            align-items:center; background:var(--text); color:#fff; padding:10px 14px;
+            border-radius:12px; margin:12px 0; box-shadow:0 6px 24px rgba(15,23,42,.25); }
+    .bulk.show { display:flex; }
+    .bulk select { background:#fff; color:var(--text); }
+    .bulk .count { font-weight:700; }
+    .bulk .btn { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:600; }
+    .bulk .btn.ghost { background:transparent; border-color:rgba(255,255,255,.45); color:#fff; }
+
+    details.logcard { background:var(--surface); border:1px solid var(--border);
+                      border-radius:12px; padding:0 16px; margin-bottom:16px; }
+    details.logcard > summary { cursor:pointer; padding:14px 0; font-weight:600;
+                                list-style:none; display:flex; align-items:center; gap:8px; }
+    details.logcard > summary::-webkit-details-marker { display:none; }
+    details.logcard > summary::before { content:'\25B8'; color:var(--muted); }
+    details.logcard[open] > summary::before { content:'\25BE'; }
+    details.logcard table { margin-bottom:14px; }
+    .logflag { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px;
+               font-weight:700; background:rgba(37,99,235,.08); color:var(--primary); }
+    .undo { font-size:12px; }
+
+    #toast { position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(20px);
+             background:var(--text); color:#fff; padding:10px 16px; border-radius:10px;
+             font-size:13px; opacity:0; pointer-events:none; transition:all .18s ease; z-index:50; }
+    #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+    #toast.bad { background:var(--danger); }
+
+    @media print {
+        body { padding:0; background:#fff; }
+        .filters, .btn, .bulk, .selcell, details.logcard { display:none !important; }
+    }
+</style>
+</head>
+<body>
+<?php include '../includes/sidebar.php'; ?>
+<div class="main-content">
+<div class="wrap">
+
+<h1>Staff Headcount Report</h1>
+
+<?php if ($error !== null): ?>
+    <div class="card warnbox"><?php echo h($error); ?></div>
+<?php else: ?>
+
+<form method="get" class="filters" id="filterform">
+    <?php if ($isSuper || count($pickable) > 1): ?>
+        <select name="comp_id" onchange="this.form.submit()">
+            <?php if ($isSuper): ?>
+                <option value="" <?php echo ($compId === null ? 'selected' : ''); ?>>All companies</option>
+            <?php endif; ?>
+            <?php foreach ($pickable as $c): ?>
+                <option value="<?php echo (int)$c['comp_id']; ?>"
+                    <?php echo ($compId === (int)$c['comp_id'] ? 'selected' : ''); ?>>
+                    <?php echo h($c['display_name']); ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
+    <?php else: ?>
+        <!-- One company and no right to pick another: a disabled select keeps
+             the filter row looking the same and says why. -->
+        <select disabled title="Only KPI super admins and company admins can change the company">
+            <option><?php echo h($compLabel); ?></option>
+        </select>
+    <?php endif; ?>
+
+    <input type="search" name="q" value="<?php echo h($search); ?>"
+           placeholder="Search name or code" style="min-width:200px">
+
+    <select name="dept" onchange="this.form.submit()">
+        <option value="">All departments</option>
+        <?php foreach ($deptOptions as $d): ?>
+            <option value="<?php echo h($d); ?>" <?php echo ($deptWant === $d ? 'selected' : ''); ?>>
+                <?php echo h($d); ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
+
+    <!-- The hidden partner is what makes unticking these work: an unchecked
+         box submits nothing at all, and PHP keeps the LAST value of a repeated
+         name, so unchecked arrives as 0 and checked as 1. -->
+    <input type="hidden" name="group" value="0">
+    <label class="check">
+        <input type="checkbox" name="group" value="1" <?php echo $groupBy ? 'checked' : ''; ?>
+               onchange="this.form.submit()">
+        Group by department
+    </label>
+
+    <input type="hidden" name="changed" value="0">
+    <label class="check">
+        <input type="checkbox" name="changed" value="1" <?php echo $onlyChanged ? 'checked' : ''; ?>
+               onchange="this.form.submit()">
+        Only show changed rows
+    </label>
+
+    <button type="submit" class="btn">Apply</button>
+    <?php if ($filtered): ?>
+        <a class="btn" href="<?php echo h(selfUrl(array(
+            'q' => null, 'dept' => null, 'changed' => null, 'flag' => null))); ?>">Clear</a>
+    <?php endif; ?>
+</form>
+
+<?php
+/* Every tile is a link that filters the table to the people it counted, so a
+ * number can always be opened up and read. Clicking the one already applied
+ * takes the filter off again. */
+function tileUrl($flag, $flagWant)
+{
+    return selfUrl(array('flag' => $flagWant === $flag ? null : $flag));
+}
+?>
+<div class="tiles">
+    <div class="tile<?php echo $flagWant === 'in_pool' ? ' active' : ''; ?>">
+        <a class="tilemain" href="<?php echo h(tileUrl('in_pool', $flagWant)); ?>"
+           title="List everyone counted here">
+            <div class="n" id="t_total"><?php echo (int)$summary['total']; ?></div>
+            <div class="l">Total Staff (including exempted)</div>
+        </a>
+    </div>
+    <?php
+    /* The headline is how many are exempted; the line under it is the head
+       count still measured once that exemption is applied, which is the figure
+       the KPI and MK Command reports themselves work from. Both are links —
+       the first to the exempted people, the second to everyone else. */
+    $tileDefs = array(
+        'kpi'        => array('KPI/Scorecard Exempted', 'kpi'),
+        'mk_command' => array('MK Command Exempted',    'mkc'),
+        'mk_academy' => array('MK Academy Exempted',    'mka'),
+    );
+    foreach ($tileDefs as $flag => $t): ?>
+    <div class="tile<?php echo ($flagWant === $flag || $flagWant === 'not_' . $flag)
+        ? ' active' : ''; ?>">
+        <a class="tilemain" href="<?php echo h(tileUrl($flag, $flagWant)); ?>"
+           title="List the <?php echo (int)$summary[$flag]; ?> exempted">
+            <div class="n <?php echo h($t[1]); ?>" id="t_<?php echo h($flag); ?>"><?php
+                echo (int)$summary[$flag]; ?></div>
+            <div class="l"><?php echo h($t[0]); ?></div>
+        </a>
+        <a class="after<?php echo $flagWant === 'not_' . $flag ? ' on' : ''; ?>"
+           href="<?php echo h(tileUrl('not_' . $flag, $flagWant)); ?>"
+           title="List everyone still counted">
+            <span id="a_<?php echo h($flag); ?>"><?php
+                echo (int)$summary['total'] - (int)$summary[$flag]; ?></span> after exemption</a>
+    </div>
+    <?php endforeach; ?>
+</div>
+
+<div class="scopeline">
+    <?php echo h($compLabel); ?> —
+    <span id="s_staff"><?php echo (int)$summary['staff']; ?></span> staff<span
+        id="s_gw_wrap"<?php echo $summary['gw'] > 0 ? '' : ' hidden'; ?>>
+        + <span id="s_gw"><?php echo (int)$summary['gw']; ?></span> GW</span>
+    in the pool<span id="s_removed_wrap"<?php echo $summary['removed'] > 0 ? '' : ' hidden'; ?>>,
+        <a href="<?php echo h(tileUrl('not_in_pool', $flagWant)); ?>"
+           title="List the people taken out of the pool"><span
+            id="s_removed"><?php echo (int)$summary['removed']; ?></span>
+        taken out of it here</a></span>.
+    Totals cover the whole company, not the filters.
+    <?php if ($filtered): ?>
+        Showing <span id="s_shown"><?php echo (int)$shownCount; ?></span>
+        of <?php echo (int)$poolCount; ?> rows.
+    <?php endif; ?>
+    <?php if ($flagLabel !== null): ?>
+        <span class="chip"><?php echo h($flagLabel); ?>
+            <a href="<?php echo h(selfUrl(array('flag' => null))); ?>"
+               title="Remove this filter">&times;</a></span>
+    <?php endif; ?>
+    <?php if (!$canEditAny): ?>
+        <br>Read-only: ticking is for KPI super admins and company admins.
+    <?php endif; ?>
+</div>
+
+<?php
+/* Staff and GW in ONE table, numbered straight through. They are still two
+ * populations with two key namespaces - every row carries its own person_type,
+ * and a GW row is marked as one - but they are no longer split into two
+ * tables, so the last number on the page is the head count. */
+renderTable(array_merge($staffShown, $gwShown), $groupBy, $overrides,
+            $isSuper, $adminComps, $canEditAny);
+?>
+
+<?php if ($canEditAny): ?>
+<div class="bulk" id="bulkbar">
+    <span class="count" id="bulkcount">0 selected</span>
+    <span>Set</span>
+    <select id="bulkflag">
+        <?php foreach (flagDefs() as $key => $d): ?>
+            <option value="<?php echo h($key); ?>"><?php echo h($d['label']); ?></option>
+        <?php endforeach; ?>
+    </select>
+    <span>to</span>
+    <select id="bulkvalue">
+        <option value="1">Ticked (1)</option>
+        <option value="0">Unticked</option>
+    </select>
+    <button type="button" class="btn" id="bulkapply">Apply</button>
+    <button type="button" class="btn ghost" id="bulkclear">Clear selection</button>
+</div>
+<?php endif; ?>
+
+<?php if ($showChangeLog): ?>
+<details class="logcard" <?php echo $onlyChanged ? 'open' : ''; ?>>
+    <summary>Change log (<?php echo count($logRows); ?><?php echo count($logRows) >= 200 ? '+' : ''; ?>)</summary>
+    <?php if (empty($logRows)): ?>
+        <div class="empty">Nothing has been ticked or unticked yet.</div>
+    <?php else: ?>
+    <table>
+        <thead>
+        <tr>
+            <th style="width:150px">When</th>
+            <th style="width:120px">By</th>
+            <th>Who</th>
+            <th style="width:170px">Column</th>
+            <th>Change</th>
+            <th style="width:60px"></th>
+        </tr>
+        </thead>
+        <tbody>
+        <?php $defs = flagDefs(); foreach ($logRows as $l): ?>
+            <tr>
+                <td class="muted"><?php echo h(fmtDateTime($l['changed_date'])); ?></td>
+                <td><?php echo h($l['changed_by']); ?></td>
+                <td>
+                    <?php echo h(displayName($l['person_name'], $l['person'])); ?>
+                    <div class="muted"><?php echo h($l['person']); ?><?php
+                        echo $l['person_type'] === 'gw' ? ' · GW' : ''; ?></div>
+                </td>
+                <td><span class="logflag"><?php
+                    echo h(isset($defs[$l['flag']]) ? $defs[$l['flag']]['label'] : $l['flag']); ?></span></td>
+                <td><?php echo h(logPhrase(
+                        $l['old_value'] === null ? null : (int)$l['old_value'],
+                        (int)$l['new_value'])); ?></td>
+                <td>
+                    <?php if ($canEditAny && canEditComp($l['comp_id'], $isSuper, $adminComps)): ?>
+                        <a href="#" class="undo"
+                           data-type="<?php echo h($l['person_type']); ?>"
+                           data-comp="<?php echo (int)$l['comp_id']; ?>"
+                           data-person="<?php echo h($l['person']); ?>"
+                           data-flag="<?php echo h($l['flag']); ?>"
+                           data-value="<?php echo $l['old_value'] === null ? '' : (int)$l['old_value']; ?>">Undo</a>
+                    <?php endif; ?>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+    <?php endif; ?>
+</details>
+<?php endif; /* $showChangeLog */ ?>
+
+<?php endif; /* $error */ ?>
+
+</div><!-- /wrap -->
+</div><!-- /main-content -->
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+/* Ticking saves straight away — one box or a whole selection, both through the
+ * same POST, because the server treats a batch as a list of single changes.
+ *
+ * Without JS the boxes do nothing: this page is a report first, and the server
+ * never reads a form full of check boxes, only the JSON payload below. The
+ * filters above are a plain GET form and keep working either way. */
+(function () {
+    'use strict';
+
+    var TOKEN    = <?php echo json_encode($token); ?>;
+    var SAVE_URL = <?php echo json_encode(basename(__FILE__) . '?ajax=save'); ?>;
+    var CAN_EDIT = <?php echo $canEditAny ? 'true' : 'false'; ?>;
+
+    /* The view the server must recount after a save. It is sent with every
+     * save because the save URL carries no filters of its own. */
+    var SCOPE = <?php echo json_encode(array(
+        'comp_id' => $compId === null ? '' : (int)$compId,
+        'q'       => $search,
+        'dept'    => $deptWant,
+        'changed' => $onlyChanged ? 1 : 0,
+        'flag'    => $flagWant,
+    )); ?>;
+
+    /* With "only show changed" on, or a tile filter applied, a tick can move a
+     * row in or out of the list — which no amount of recounting can show, so
+     * those reload instead. */
+    var RELOAD_ON_SAVE = <?php echo ($onlyChanged || $flagWant !== '') ? 'true' : 'false'; ?>;
+
+    if (!window.fetch || !document.documentElement.closest) { return; }
+
+    var toastEl = document.getElementById('toast');
+    var toastTimer = null;
+
+    function toast(msg, bad) {
+        toastEl.textContent = msg;
+        toastEl.className = 'show' + (bad ? ' bad' : '');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () { toastEl.className = ''; }, 2600);
+    }
+
+    function setNum(id, value) {
+        var el = document.getElementById(id);
+        if (el) { el.textContent = String(value); }
+    }
+
+    function show(id, on) {
+        var el = document.getElementById(id);
+        if (el) { if (on) { el.removeAttribute('hidden'); } else { el.setAttribute('hidden', ''); } }
+    }
+
+    /* The tiles, the scope line and the table foot are rendered by PHP, so
+     * after a save they are stale until these numbers — recounted by the same
+     * PHP — are written back over them. */
+    function applyTotals(t) {
+        if (!t || !t.summary) { return; }
+        var s = t.summary, f = t.foot || {};
+
+        setNum('t_total', s.total);
+        ['kpi', 'mk_command', 'mk_academy'].forEach(function (k) {
+            setNum('t_' + k, s[k]);
+            setNum('a_' + k, s.total - s[k]);
+        });
+
+        setNum('s_staff', s.staff);
+        setNum('s_gw', s.gw);
+        show('s_gw_wrap', s.gw > 0);
+        setNum('s_removed', s.removed);
+        show('s_removed_wrap', s.removed > 0);
+        setNum('s_shown', t.shown);
+
+        ['in_pool', 'kpi', 'mk_command', 'mk_academy'].forEach(function (k) {
+            setNum('f_' + k, f[k]);
+        });
+    }
+
+    /* One POST, any number of changes. onDone(ok) so a caller can roll its own
+     * check boxes back when the server refuses. */
+    function save(items, rows, onDone) {
+        rows.forEach(function (r) { r.classList.add('rowbusy'); });
+
+        var body = new FormData();
+        body.append('token', TOKEN);
+        body.append('payload', JSON.stringify(items));
+        body.append('scope', JSON.stringify(SCOPE));
+
+        fetch(SAVE_URL, { method: 'POST', body: body, credentials: 'same-origin' })
+            .then(function (res) { return res.json(); })
+            .then(function (data) {
+                rows.forEach(function (r) {
+                    r.classList.remove('rowbusy');
+                    if (data.ok) {
+                        r.classList.add('rowsaved');
+                        setTimeout(function () { r.classList.remove('rowsaved'); }, 900);
+                    }
+                });
+                /* Totals come back even on a partial refusal, because whatever
+                 * did save has already moved them. */
+                applyTotals(data.totals);
+                toast(data.message || (data.ok ? 'Saved' : 'Not saved'), !data.ok);
+                if (data.ok && RELOAD_ON_SAVE) { location.reload(); return; }
+                onDone(!!data.ok);
+            })
+            .catch(function (err) {
+                rows.forEach(function (r) { r.classList.remove('rowbusy'); });
+                toast('Could not reach the server — nothing was saved.', true);
+                onDone(false);
+            });
+    }
+
+    function itemOf(box, value) {
+        return {
+            t: box.getAttribute('data-type'),
+            c: parseInt(box.getAttribute('data-comp'), 10),
+            p: box.getAttribute('data-person'),
+            f: box.getAttribute('data-flag'),
+            v: value
+        };
+    }
+
+    /* A row that leaves the pool is struck through at once rather than waiting
+     * for a reload, so the effect of unticking Total Staff is visible. */
+    function reflectPool(box) {
+        if (box.getAttribute('data-flag') !== 'in_pool') { return; }
+        var row = box.closest('tr');
+        if (row) { row.classList.toggle('outofpool', !box.checked); }
+    }
+
+    /* --- single tick ---------------------------------------------------- */
+    document.addEventListener('change', function (e) {
+        var box = e.target;
+        if (!CAN_EDIT || box.type !== 'checkbox' || !box.hasAttribute('data-flag')) { return; }
+
+        var was = !box.checked;
+        reflectPool(box);
+        save([itemOf(box, box.checked ? 1 : 0)], [box.closest('tr')], function (ok) {
+            if (!ok) { box.checked = was; reflectPool(box); }
+        });
+    });
+
+    if (!CAN_EDIT) { return; }
+
+    /* --- selection ------------------------------------------------------ */
+    var bar   = document.getElementById('bulkbar');
+    var count = document.getElementById('bulkcount');
+
+    function selected() {
+        return Array.prototype.slice.call(
+            document.querySelectorAll('tr.personrow .rowsel:checked')
+        );
+    }
+
+    function refreshBar() {
+        var n = selected().length;
+        count.textContent = n + ' selected';
+        bar.classList.toggle('show', n > 0);
+    }
+
+    document.addEventListener('change', function (e) {
+        if (e.target.classList.contains('rowsel')) { refreshBar(); return; }
+
+        /* A department header's box takes every enabled row under it, down to
+         * the next header. */
+        if (e.target.classList.contains('groupsel')) {
+            var row = e.target.closest('tr');
+            var on  = e.target.checked;
+            for (var n = row.nextElementSibling; n; n = n.nextElementSibling) {
+                if (n.classList.contains('grouphdr')) { break; }
+                var sel = n.querySelector('.rowsel');
+                if (sel && !sel.disabled) { sel.checked = on; }
+            }
+            refreshBar();
+        }
+    });
+
+    document.getElementById('bulkclear').addEventListener('click', function () {
+        selected().forEach(function (s) { s.checked = false; });
+        document.querySelectorAll('.groupsel').forEach(function (s) { s.checked = false; });
+        refreshBar();
+    });
+
+    /* --- bulk apply ------------------------------------------------------ */
+    document.getElementById('bulkapply').addEventListener('click', function () {
+        var flag  = document.getElementById('bulkflag').value;
+        var value = parseInt(document.getElementById('bulkvalue').value, 10);
+        var rows  = selected().map(function (s) { return s.closest('tr'); });
+
+        var items = [], boxes = [], undo = [];
+        rows.forEach(function (row) {
+            var box = row.querySelector('input[data-flag="' + flag + '"]');
+            if (!box || box.disabled) { return; }
+            undo.push(box.checked);
+            box.checked = !!value;
+            reflectPool(box);
+            boxes.push(box);
+            items.push(itemOf(box, value));
+        });
+
+        if (!items.length) { toast('Nothing to change in that column.', true); return; }
+
+        save(items, rows, function (ok) {
+            if (ok) { return; }
+            boxes.forEach(function (b, i) { b.checked = undo[i]; reflectPool(b); });
+        });
+    });
+
+    /* --- undo from the change log ---------------------------------------- */
+    document.addEventListener('click', function (e) {
+        var link = e.target.closest('a.undo');
+        if (!link) { return; }
+        e.preventDefault();
+
+        var raw = link.getAttribute('data-value');
+        var item = {
+            t: link.getAttribute('data-type'),
+            c: parseInt(link.getAttribute('data-comp'), 10),
+            p: link.getAttribute('data-person'),
+            f: link.getAttribute('data-flag'),
+            /* empty means there was no override before this change, so undoing
+               it removes the override rather than setting a value. */
+            v: raw === '' ? null : parseInt(raw, 10)
+        };
+
+        save([item], [link.closest('tr')], function (ok) {
+            if (ok) { location.reload(); }
+        });
+    });
+}());
+</script>
+</body>
+</html>

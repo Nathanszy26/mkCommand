@@ -22,8 +22,15 @@
  * They never mix: a GW's `person` is a monthly_assign_gw_code, which is a
  * different namespace from users.person and can collide with one.
  *
+ * Access: any logged-in user may open this, but only active KPI super admins
+ * (staff_portal2.kpi_super_admins, status = 1) may choose the company. Everyone
+ * else is pinned to their session's own comp_id, on the page and on its AJAX
+ * endpoints alike — see canPickCompany() and the $compId block in the
+ * controller.
+ *
  * Query string:
- *   comp_id  int     restrict to one company            (default: all)
+ *   comp_id  int     one company, or empty for all      (super admins only;
+ *                                                        ignored for the rest)
  *   boss     string  boss_id to expand in the detail    (default: none)
  *   gwboss   string  boss_id to expand in the GW detail (default: none)
  *
@@ -67,6 +74,32 @@ class Db
         }
         return self::$pdo;
     }
+}
+
+/* ---------- access -------------------------------------------------------- */
+
+/** Query: may this user choose which company to look at?
+ *
+ *  Only active KPI super admins may. Everyone else is pinned to the comp_id
+ *  their session was built with, so the report answers "my company" and
+ *  nothing else. kpi_super_admins.user_id is staff_portal2.users.id — the same
+ *  id UnifiedAuth puts in the session — and status is TINYINT (1 = active).
+ *
+ *  Fails closed: the caller treats a DB error as "not a super admin". */
+function canPickCompany(PDO $pdo, $userId)
+{
+    if ($userId === null || $userId === '') {
+        return false;
+    }
+    $stmt = $pdo->prepare(
+        "SELECT 1
+           FROM staff_portal2.kpi_super_admins
+          WHERE user_id = :uid AND status = 1
+          LIMIT 1"
+    );
+    $stmt->bindValue(':uid', (int)$userId, PDO::PARAM_INT);
+    $stmt->execute();
+    return $stmt->fetchColumn() !== false;
 }
 
 /* ---------- repository ---------------------------------------------------- */
@@ -268,14 +301,24 @@ class ApprovalReportRepository
 
     /** Query: the task list of one version, in display order.
      *  Not population-specific — job_spec_version_item is keyed on version_id
-     *  alone, so staff and GW share this. */
-    public function itemsFor($versionId)
+     *  alone, so staff and GW share this.
+     *
+     *  $compId joins back to job_spec_version so a pinned viewer cannot read
+     *  another company's tasks by guessing a version id: the item table itself
+     *  carries no comp_id, and this is the one query reachable by id alone. */
+    public function itemsFor($versionId, $compId = null)
     {
-        $sql = "SELECT sort_order, category, task
-                FROM mkPortal.job_spec_version_item
-                WHERE version_id = :v
-                ORDER BY sort_order ASC, id ASC";
-        return $this->run($sql, array(':v' => (int)$versionId));
+        $args = array(':v' => (int)$versionId);
+        $sql = "SELECT i.sort_order, i.category, i.task
+                FROM mkPortal.job_spec_version_item i
+                INNER JOIN mkPortal.job_spec_version v ON v.id = i.version_id
+                WHERE i.version_id = :v";
+        if ($compId !== null) {
+            $sql .= " AND v.comp_id = :comp";
+            $args[':comp'] = (int)$compId;
+        }
+        $sql .= " ORDER BY i.sort_order ASC, i.id ASC";
+        return $this->run($sql, $args);
     }
 
     /** Query: companies for the filter — the live, weekly-reporting group only
@@ -675,22 +718,50 @@ $gwDetail  = array();
 /** The company the report opens on: the viewer's own, straight off the session.
  *  UnifiedAuth joins users -> subsidiaries at login and stores comp_id
  *  (subsidiaries.id) with the rest of the session data, so there is nothing to
- *  look up here.
- *
- *  Absent comp_id in the query string (a bare first load) falls back to that;
- *  an EXPLICITLY empty comp_id means "all companies". The two must stay
- *  distinguishable, or picking All companies would bounce straight back to the
- *  default and the option would be unreachable. */
+ *  look up here. */
 $defaultCompId = isset($currentUser['comp_id']) && $currentUser['comp_id'] !== ''
     ? (int)$currentUser['comp_id']
     : null;
 
-if (!isset($_GET['comp_id'])) {
+/** Who may change it: active KPI super admins only. The check fails closed, so
+ *  a dead database pins everyone rather than opening the report up. */
+try {
+    $canPick = canPickCompany(
+        Db::get(),
+        isset($currentUser['id']) ? $currentUser['id'] : null
+    );
+} catch (Exception $e) {
+    error_log('jobSpecApprovalReport super admin check: ' . $e->getMessage());
+    $canPick = false;
+}
+
+/** For a super admin: absent comp_id in the query string (a bare first load)
+ *  falls back to their own company; an EXPLICITLY empty comp_id means "all
+ *  companies". The two must stay distinguishable, or picking All companies
+ *  would bounce straight back to the default and the option would be
+ *  unreachable.
+ *
+ *  For everyone else the query string is ignored outright — not validated
+ *  against a list, just not read — so neither a hand-typed ?comp_id= nor a
+ *  bookmarked link can move them off their own company. This runs ahead of the
+ *  AJAX branches below, so those inherit the same pin. */
+if (!$canPick) {
+    $compId = $defaultCompId;
+} elseif (!isset($_GET['comp_id'])) {
     $compId = $defaultCompId;
 } elseif ($_GET['comp_id'] === '') {
     $compId = null;
 } else {
     $compId = (int)$_GET['comp_id'];
+}
+
+/** A pinned viewer with no company on their session has no scope to report on.
+ *  Leaving $compId null here would hand them every company, which is exactly
+ *  what the pin exists to prevent, so the report is withheld instead. */
+$noScope = (!$canPick && $defaultCompId === null);
+if ($noScope) {
+    $error = 'Your account is not linked to a company, so this report has '
+           . 'nothing to show. Ask HR to set your company.';
 }
 $boss   = (isset($_GET['boss']) && $_GET['boss'] !== '') ? trim($_GET['boss']) : null;
 $gwBoss = (isset($_GET['gwboss']) && $_GET['gwboss'] !== '') ? trim($_GET['gwboss']) : null;
@@ -702,11 +773,14 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'tasks') {
     header('Content-Type: text/html; charset=UTF-8');
     $ajaxVersion = isset($_GET['version']) ? (int)$_GET['version'] : 0;
     try {
+        if ($noScope) {
+            throw new RuntimeException('Viewer has no company');
+        }
         if ($ajaxVersion <= 0) {
             throw new RuntimeException('Missing version');
         }
         $ajaxRepo = new ApprovalReportRepository(Db::get());
-        renderTasks($ajaxRepo->itemsFor($ajaxVersion), 7, 'v-' . $ajaxVersion);
+        renderTasks($ajaxRepo->itemsFor($ajaxVersion, $compId), 7, 'v-' . $ajaxVersion);
     } catch (Exception $e) {
         error_log('jobSpecApprovalReport ajax tasks: ' . $e->getMessage());
         http_response_code(500);
@@ -721,6 +795,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail') {
     $ajaxIsGw = (isset($_GET['is_gw']) && (int)$_GET['is_gw'] === 1);
     $ajaxBoss = isset($_GET['for']) ? trim($_GET['for']) : '';
     try {
+        if ($noScope) {
+            throw new RuntimeException('Viewer has no company');
+        }
         if ($ajaxBoss === '') {
             throw new RuntimeException('Missing superior');
         }
@@ -739,6 +816,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail') {
 }
 
 try {
+    if ($noScope) {
+        throw new RuntimeException('Viewer has no company');
+    }
     $repo      = new ApprovalReportRepository(Db::get());
     $companies = withOwnCompany(
         $repo->companies(),
@@ -761,8 +841,19 @@ try {
     }
 } catch (Exception $e) {
     error_log('jobSpecApprovalReport: ' . $e->getMessage());
-    $error = 'Could not load the report. Check the error log.';
+    /* Keeps a message already set above — the no-company case says
+       something useful, the generic one does not. */
+    if ($error === null) {
+        $error = 'Could not load the report. Check the error log.';
+    }
 }
+
+/** Label for the pinned filter: the session's own company name, with the same
+ *  fallback withOwnCompany() uses so the two never disagree. */
+$ownCompanyLabel = (isset($currentUser['company_name'])
+                    && trim((string)$currentUser['company_name']) !== '')
+    ? $currentUser['company_name']
+    : ($defaultCompId !== null ? 'Company ' . $defaultCompId : '—');
 
 $totalVersions = $totals['pending'] + $totals['approved'] + $totals['rejected'];
 $done          = $totals['approved'] + $totals['rejected'];
@@ -869,6 +960,7 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
 <?php else: ?>
 
 <div class="filters">
+    <?php if ($canPick): ?>
     <form method="get" style="display:inline">
         <select name="comp_id" onchange="this.form.submit()">
             <option value="" <?php echo ($compId === null ? 'selected' : ''); ?>>All companies</option>
@@ -880,6 +972,13 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <?php endforeach; ?>
         </select>
     </form>
+    <?php else: ?>
+    <!-- Pinned viewer: a disabled select keeps the filter row looking the same
+         while making it plain the company is not theirs to change. -->
+    <select disabled title="Only KPI super admins can change the company">
+        <option><?php echo h($ownCompanyLabel); ?></option>
+    </select>
+    <?php endif; ?>
 </div>
 
 <div class="tiles">
