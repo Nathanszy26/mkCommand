@@ -1,0 +1,520 @@
+<?php
+header('Content-Type: application/json; charset=UTF-8');
+
+/**
+ * STAFF POOL API — the staff listing other applications read.
+ *
+ * Same figures as staffHeadcountReport.php, by construction and not by
+ * agreement: the pool, the four flags, the overrides and the counting all come
+ * out of staffPoolCore.php, which that report includes too. Change a rule
+ * there and the report, this endpoint and every application reading it move
+ * together. There is no rule in this file — it authenticates, it filters, it
+ * prints JSON.
+ *
+ * MUST be hosted on globportal.com, same folder as staffHeadcountReport.php.
+ * Read-only: every query behind it is a SELECT.
+ *
+ * IN  (GET or POST — POST for long filters, same names):
+ *   comp_id     int     the company to report. '' or 'all' means every company
+ *                       in the weekly-reporting group, which only a super
+ *                       admin (or an API key) may ask for. Absent means the
+ *                       CALLER'S OWN company, which is what the report opens
+ *                       on as well.
+ *   action      string  pool (default) | companies
+ *                       companies = the list the report's dropdown offers,
+ *                       for an application that wants to let someone choose.
+ *
+ *   -- who is asking: NOTHING, normally --
+ *   (nothing)           the open path. ?comp_id=1 on its own answers for
+ *                       company 1, which is how this endpoint is called:
+ *
+ *                         https://globportal.com/accounts/mkPortal/hr/
+ *                                 staffPoolAPI.php?comp_id=1
+ *
+ *                       Every company is readable this way, and so is the
+ *                       whole group with comp_id=all. See $ALLOW_ANONYMOUS
+ *                       below for what that means and how to close it.
+ *   person      string  ask AS somebody instead, and the answer is narrowed
+ *                       to the companies that person may see — the same
+ *                       identity staffDirectory.php and staffRecords.php
+ *                       take. comid (alias caller_comp_id) goes with it when
+ *                       the same login exists at more than one company.
+ *   api_key     string  server to server, for an application that has no
+ *                       staff to speak for. Off until a key is put in
+ *                       API_KEYS below; a key sees every company.
+ *   (session)           a logged-in globportal session is used only when the
+ *                       open path is turned off — otherwise one URL would
+ *                       answer differently depending on whose browser it was
+ *                       opened in.
+ *
+ *   -- optional, and they NEVER move the summary (see below) --
+ *   q           string  name or code search
+ *   dept        string  one department / district, as the label it is reported
+ *                       under ("No department" selects the people with none)
+ *   staff_type  string  staff | gw
+ *   excluded    0|1     include the excluded_staff list      (default 1)
+ *   summary_only 0|1    the figures alone, no lists          (default 0)
+ *
+ * OUT:
+ *   { success, comp_id, company_name, generated_at,
+ *     staff[],            everyone in the pool
+ *     excluded_staff[],   everyone an override has taken OUT of the pool
+ *     summary{},          company_total_*, over the WHOLE company
+ *     by_company[],       per-company summaries, when comp_id is every company
+ *     filters{}, counts{}, caller{} }
+ *
+ * Each person in both lists:
+ *   comp_id, company_name, person, fullname, email, mobile_no, position,
+ *   department, staff_type, total_staff, kpi_scorecard_exempted,
+ *   mk_command_exempted, mk_academy_exempted
+ * — see publicRow() in staffPoolCore.php, which defines that shape.
+ *
+ * THE SUMMARY IS THE WHOLE COMPANY, the lists are what you filtered.
+ *   This is the report's own behaviour: its tiles are a head count and do not
+ *   follow the search box, or they would stop being one. So with no filters,
+ *   count(staff) == summary.company_total_staff and summing a flag over
+ *   staff[] gives the matching company_total_*; with a filter, counts{} tells
+ *   you what the lists hold and summary{} still tells you the company.
+ *
+ * ACCESS
+ *   Open by default — see $ALLOW_ANONYMOUS. When a person IS named, or the
+ *   open path is turned off and a session is used, the scope is the one the
+ *   report grants that same user, out of the same code: own company always;
+ *   administered companies (kpi_company_admins) on top; active
+ *   kpi_super_admins get every company and "all". A company asked for but not
+ *   allowed falls back to their own, exactly as the report falls back, and the
+ *   answer then carries requested_comp_id and a notice saying so.
+ *
+ * PHP 7.2 compatible.
+ */
+
+require_once __DIR__ . '/staffPoolCore.php';
+
+/** Server-to-server keys. EMPTY ON PURPOSE: with no key in here the only ways
+ *  in are a globportal session and a staff login, and nothing changes for the
+ *  applications that use those. Add a long random string per calling
+ *  application — never one key shared by all of them, or a withdrawal means
+ *  reissuing to everybody — and the holder reads every company. */
+$API_KEYS = array(
+    // 'mymk'    => 'put-a-long-random-string-here',
+    // 'academy' => 'another-one',
+);
+
+/** OPEN TO ANYONE WHO HAS THE URL. true is what makes
+ *
+ *      staffPoolAPI.php?comp_id=1
+ *
+ *  answer on its own, with no login, no person and no key — which is how this
+ *  endpoint is meant to be called.
+ *
+ *  Know what that means before changing it back and forth: the answer carries
+ *  every name, email and mobile number in the company, so with this on, and
+ *  the folder reachable from the internet, that listing is public to anyone
+ *  who learns the address. Nothing can be WRITTEN through here under any
+ *  setting — every query behind this file is a SELECT.
+ *
+ *  Two ways to tighten it without changing anything else:
+ *    - $ANON_ALLOW_IPS below, to let only your own servers call it, or
+ *    - false, which puts it back to a globportal session, a person, or a key.
+ */
+$ALLOW_ANONYMOUS = true;
+
+/** The addresses the open path above accepts, as plain IPv4/IPv6 strings.
+ *  EMPTY MEANS ANYWHERE, which is the setting that matches $ALLOW_ANONYMOUS
+ *  being on. Name your calling servers here and everybody else has to
+ *  authenticate, which is the cheapest way to keep a machine-to-machine
+ *  endpoint off the open internet. A browser on somebody's laptop is not a
+ *  fixed address — this is for server-to-server. */
+$ANON_ALLOW_IPS = array(
+    // '203.0.113.10',
+);
+
+/* ---------- plumbing ------------------------------------------------------ */
+
+/** No Access-Control-Allow-Origin header on purpose: this answers with names,
+ *  emails and mobile numbers, so it is not opened to every page on the
+ *  internet by default. A browser application on another domain needs one
+ *  line here naming THAT origin — never '*' — and a server-side caller
+ *  (PHP, the mobile app) needs nothing. */
+
+function respond(array $payload, $status = 200)
+{
+    http_response_code($status);
+    $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        /* A byte that is not valid UTF-8 somewhere in the data would otherwise
+         * answer with an empty body and no explanation. The two GW tables are
+         * latin1, so this is a real possibility, and a partial answer that
+         * says which person is at fault beats silence. */
+        error_log('staffPoolAPI json: ' . json_last_error_msg());
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+                                      | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        if ($json === false) {
+            http_response_code(500);
+            $json = '{"success":false,"message":"Could not encode the answer. '
+                  . 'Check the error log."}';
+        }
+    }
+    echo $json;
+    exit;
+}
+
+function fail($message, $status = 400, array $extra = array())
+{
+    respond(array('success' => false, 'message' => $message) + $extra, $status);
+}
+
+/** Query: one input, from the query string or the body, POST first. */
+function input($keys, $default = null)
+{
+    foreach ((array)$keys as $key) {
+        if (isset($_POST[$key]) && $_POST[$key] !== '') { return trim((string)$_POST[$key]); }
+        if (isset($_GET[$key])  && $_GET[$key]  !== '') { return trim((string)$_GET[$key]); }
+    }
+    /* Told apart from absent: ?comp_id= is "every company", and that is not
+     * the same request as no comp_id at all. */
+    foreach ((array)$keys as $key) {
+        if (isset($_POST[$key]) || isset($_GET[$key])) { return ''; }
+    }
+    return $default;
+}
+
+/** Query: a 0|1 switch, with a default for when it was not asked. */
+function flagInput($key, $default)
+{
+    $v = input($key);
+    if ($v === null || $v === '') { return $default; }
+    return in_array(strtolower($v), array('1', 'true', 'yes', 'y'), true);
+}
+
+/* ---------- who is asking ------------------------------------------------- */
+
+/** Query: may THIS request use the open path?
+ *
+ *  An empty list is any address — that is the setting the open path ships
+ *  with. A non-empty one is matched against REMOTE_ADDR and nothing else:
+ *  X-Forwarded-For is a header the caller writes, so trusting it would make
+ *  the list decoration rather than a check. */
+function anonAllowed(array $allowIps)
+{
+    if (empty($allowIps)) {
+        return true;
+    }
+    $ip = isset($_SERVER['REMOTE_ADDR']) ? (string)$_SERVER['REMOTE_ADDR'] : '';
+    return $ip !== '' && in_array($ip, $allowIps, true);
+}
+
+/** Query: the caller from a globportal session, or null.
+ *
+ *  No session is STARTED for this: a machine caller has no cookie and has no
+ *  business being given one. Only a request that already carries the session
+ *  cookie gets this far. */
+function sessionCaller()
+{
+    $auth = __DIR__ . '/../includes/UnifiedAuth.php';
+    if (!isset($_COOKIE[session_name()]) || !file_exists($auth)) {
+        return null;
+    }
+    try {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        require_once $auth;
+        if (!class_exists('UnifiedAuth') || !UnifiedAuth::isLoggedIn()) {
+            return null;
+        }
+        $u = UnifiedAuth::getLoggedInUser();
+        if (!is_array($u) || !isset($u['id'])) {
+            return null;
+        }
+        return array(
+            'via'     => 'session',
+            'id'      => (int)$u['id'],
+            'person'  => isset($u['person']) ? (string)$u['person'] : '',
+            'comp_id' => (isset($u['comp_id']) && $u['comp_id'] !== '')
+                ? (int)$u['comp_id'] : null,
+        );
+    } catch (Exception $e) {
+        error_log('staffPoolAPI session: ' . $e->getMessage());
+        return null;
+    }
+}
+
+/** Query: the caller from a login, re-resolved against users — the identity
+ *  staffDirectory.php and staffRecords.php already take from the mobile app.
+ *
+ *  The id is never taken from the request: only the login is, and everything
+ *  that decides what may be seen is read from the row it matches. An inactive
+ *  or deleted login is nobody.
+ *
+ *  A login that exists at more than one company is refused rather than
+ *  guessed — comid says which one. */
+function loginCaller(PDO $pdo, $person, $ownComp)
+{
+    $sql = "SELECT id, person, comp_id
+              FROM staff_portal2.users
+             WHERE person = :p AND status = '1' AND deleted = '0'";
+    $args = array(':p' => (string)$person);
+    if ($ownComp !== null && $ownComp !== '') {
+        $sql .= " AND comp_id = :c";
+        $args[':c'] = (int)$ownComp;
+    }
+    $stmt = $pdo->prepare($sql . " LIMIT 5");
+    foreach ($args as $k => $v) {
+        $stmt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
+    }
+    $stmt->execute();
+    $rows = $stmt->fetchAll();
+
+    if (empty($rows)) {
+        return null;
+    }
+    if (count($rows) > 1) {
+        fail('That login exists at more than one company. Pass comid as well.', 409);
+    }
+    return array(
+        'via'     => 'login',
+        'id'      => (int)$rows[0]['id'],
+        'person'  => (string)$rows[0]['person'],
+        'comp_id' => ($rows[0]['comp_id'] === null || $rows[0]['comp_id'] === '')
+            ? null : (int)$rows[0]['comp_id'],
+    );
+}
+
+/* ---------- the request --------------------------------------------------- */
+
+try {
+    $pdo = Db::get();
+} catch (Exception $e) {
+    error_log('staffPoolAPI db: ' . $e->getMessage());
+    fail('Could not reach the database.', 503);
+}
+
+$apiKey = input('api_key');
+$keyName = null;
+if ($apiKey !== null && $apiKey !== '') {
+    foreach ($API_KEYS as $name => $secret) {
+        if ($secret !== '' && hash_equals((string)$secret, (string)$apiKey)) {
+            $keyName = $name;
+            break;
+        }
+    }
+    if ($keyName === null) {
+        fail('Unknown API key.', 403);
+    }
+}
+
+if ($keyName !== null) {
+    /* A key speaks for an application, not a person: no user id, and the same
+     * every-company reach a super admin has. Read-only either way — nothing in
+     * this file writes. */
+    $caller  = array('via' => 'api_key:' . $keyName, 'id' => null,
+                     'person' => '', 'comp_id' => null);
+    $isSuper = true;
+    $viewComps = array();
+} else {
+    /* A person named in the request is answered as that person, whatever the
+     * open path below would allow — asking as somebody narrows the answer to
+     * what they may see, and that is worth honouring. */
+    $person = input('person');
+    $caller = null;
+    if ($person !== null && $person !== '') {
+        $caller = loginCaller($pdo, $person, input(array('comid', 'caller_comp_id')));
+        if ($caller === null) {
+            fail('Staff not found or inactive.', 404);
+        }
+    }
+
+    /* Nobody named: the open path, before the session is consulted, so that
+     * one URL answers the same thing to everybody who opens it instead of
+     * quietly narrowing for whoever happens to be logged in on that browser. */
+    if ($caller === null && $ALLOW_ANONYMOUS && anonAllowed($ANON_ALLOW_IPS)) {
+        $caller    = array('via' => 'open', 'id' => null, 'person' => '',
+                           'comp_id' => null);
+        $isSuper   = true;
+        $viewComps = array();
+    }
+
+    if (!isset($isSuper)) {
+        if ($caller === null) {
+            $caller = sessionCaller();
+        }
+        if ($caller === null) {
+            fail('Who is asking? Pass person (with comid), or an api_key, or '
+               . 'call this from a logged-in globportal session.', 401);
+        }
+
+        $access    = viewScope($pdo, $caller['id'], $caller['comp_id']);
+        $isSuper   = $access['is_super'];
+        $viewComps = $access['view_comps'];
+
+        if (!$isSuper && empty($viewComps)) {
+            fail('Your account is not linked to a company, so there is nothing '
+               . 'to report. Ask HR to set your company.', 403);
+        }
+    }
+}
+
+try {
+    $repo      = new StaffPoolRepository($pdo);
+    $companies = $repo->companies();
+
+    /* The report's own scope: "every company" is the companies in this list,
+     * so a group total is the sum of the per-company figures and never a
+     * larger number nobody can reproduce by adding them up. */
+    $scopeComps = array();
+    $compNames  = array();
+    foreach ($companies as $c) {
+        $scopeComps[] = (int)$c['comp_id'];
+        $compNames[(int)$c['comp_id']] = $c['display_name'];
+    }
+
+    if (input('action', 'pool') === 'companies') {
+        $out = array();
+        foreach ($companies as $c) {
+            if ($isSuper || in_array((int)$c['comp_id'], $viewComps, true)) {
+                $out[] = array(
+                    'comp_id'      => (int)$c['comp_id'],
+                    'company_name' => $c['display_name'],
+                );
+            }
+        }
+        respond(array(
+            'success'      => true,
+            'own_comp_id'  => $caller['comp_id'],
+            'all_allowed'  => (bool)$isSuper,
+            'companies'    => $out,
+            'caller'       => array('via' => $caller['via'], 'person' => $caller['person']),
+        ));
+    }
+
+    /* 'all' is spelt out for a human typing a URL; '' is what the report uses
+     * and both mean the same request. */
+    $rawComp = input('comp_id');
+    if ($rawComp !== null && strtolower($rawComp) === 'all') {
+        $rawComp = '';
+    }
+
+    $defaultCompId = $caller['comp_id'];
+    if ($defaultCompId === null && !empty($viewComps)) {
+        $defaultCompId = $viewComps[0];
+    }
+    /* An api_key has no own company, so no comp_id means every company. */
+    $compId = resolveCompId($rawComp, $isSuper, $viewComps, $defaultCompId);
+
+    /* The WHOLE company, unfiltered: the summary is counted off this, exactly
+     * as the report counts its tiles before its search box is applied. */
+    $rows = array_merge(
+        $repo->staff($compId, $scopeComps),
+        $repo->gw($compId, $scopeComps)
+    );
+    $rows      = $repo->withGwEmails($rows);
+    $overrides = $repo->overrides($compId);
+    $summary   = publicSummary($rows, $overrides);
+
+    /* The filters, through the report's own filterRows() so a q or a dept here
+     * selects exactly what it would select on screen. onlyChanged is not
+     * offered: this is a listing, not an audit of what was ticked. */
+    $q         = (string)input('q', '');
+    $dept      = (string)input('dept', '');
+    $staffType = strtolower((string)input('staff_type', ''));
+    if ($staffType !== '' && $staffType !== 'staff' && $staffType !== 'gw') {
+        fail('staff_type must be staff or gw.');
+    }
+    $withExcluded = flagInput('excluded', true);
+    $summaryOnly  = flagInput('summary_only', false);
+
+    $shown = filterRows($rows, $q, $dept, false, $overrides);
+    if ($staffType !== '') {
+        /* Filtered here and not in the loop below, so counts.filtered_out
+         * accounts for this filter too and the three numbers add up. */
+        $byType = array();
+        foreach ($shown as $row) {
+            if ($row['person_type'] === $staffType) { $byType[] = $row; }
+        }
+        $shown = $byType;
+    }
+
+    $staffOut    = array();
+    $excludedOut = array();
+    if (!$summaryOnly) {
+        foreach ($shown as $row) {
+            $public = publicRow($row, $overrides, $compNames);
+            if ($public['total_staff'] === 1) {
+                $staffOut[] = $public;
+            } elseif ($withExcluded) {
+                $excludedOut[] = $public;
+            }
+        }
+    }
+
+    $payload = array(
+        'success'      => true,
+        'comp_id'      => $compId,                       // null = every company
+        'company_name' => ($compId === null)
+            ? 'All companies'
+            : (isset($compNames[$compId]) ? $compNames[$compId] : 'Company ' . $compId),
+        'generated_at' => date('Y-m-d H:i:s'),
+        'staff'          => $staffOut,
+        'excluded_staff' => $excludedOut,
+        'summary'        => $summary,
+        'counts'       => array(
+            'staff_listed'    => count($staffOut),
+            'excluded_listed' => count($excludedOut),
+            /* What the filters left out, so a caller can tell a filtered
+             * listing from a company that really has nobody. */
+            'filtered_out'    => count($rows) - count($shown),
+        ),
+        'filters'      => array(
+            'q'            => $q,
+            'dept'         => $dept,
+            'staff_type'   => $staffType,
+            'excluded'     => $withExcluded ? 1 : 0,
+            'summary_only' => $summaryOnly ? 1 : 0,
+        ),
+        'caller'       => array(
+            'via'     => $caller['via'],
+            'person'  => $caller['person'],
+            'comp_id' => $caller['comp_id'],
+            'scope'   => $isSuper ? 'all' : $viewComps,
+        ),
+    );
+
+    /* The report falls back to the viewer's own company when it is asked for
+     * one they may not see, and this answers the same way so the two cannot
+     * disagree — but an application is not a person reading a heading, so it
+     * is told plainly that it is not holding what it asked for. */
+    if ($rawComp !== null && $rawComp !== '' && (int)$rawComp !== (int)$compId) {
+        $payload['requested_comp_id'] = (int)$rawComp;
+        $payload['notice'] = 'You may not see company ' . (int)$rawComp
+            . ', so this is company ' . (int)$compId . ' instead.';
+    }
+
+    /* Every company: the same figures per company, so switching the report's
+     * dropdown and adding this up agree. One pass over the rows already
+     * loaded — no second trip to the database. */
+    if ($compId === null) {
+        $byComp = array();
+        foreach ($rows as $row) {
+            $byComp[(int)$row['comp_id']][] = $row;
+        }
+        ksort($byComp);
+        $payload['by_company'] = array();
+        foreach ($byComp as $cid => $set) {
+            $payload['by_company'][] = array(
+                'comp_id'      => (int)$cid,
+                'company_name' => isset($compNames[$cid])
+                    ? $compNames[$cid] : 'Company ' . $cid,
+            ) + publicSummary($set, $overrides);
+        }
+    }
+
+    respond($payload);
+} catch (Exception $e) {
+    error_log('staffPoolAPI: ' . $e->getMessage());
+    /* The tick-box tables are the one failure worth naming: nothing works
+     * until the DDL has been run, and the message says which file to run. */
+    if (strpos($e->getMessage(), 'staff_flag_override') !== false) {
+        fail('The override tables are not installed yet. Run '
+           . 'mkCommand_API/sql/staff_flag_override.sql on globportal.', 500);
+    }
+    fail('Could not build the staff pool. Check the error log.', 500);
+}
