@@ -410,7 +410,7 @@ $summary = summarise(array_merge($staff, $gw), $overrides);
 $deptOptions = array();
 foreach (array($staff, $gw) as $set) {
     foreach ($set as $row) {
-        $deptOptions[deptLabel($row['department'])] = true;
+        $deptOptions[groupLabel($row)] = true;
     }
 }
 $deptOptions = array_keys($deptOptions);
@@ -481,7 +481,7 @@ function renderRows(array $rows, $groupBy, array $overrides, $isSuper, array $ad
         $editable = $canEditAny && canEditComp($row['comp_id'], $isSuper, $adminComps);
 
         if ($groupBy) {
-            $dept = deptLabel($row['department']);
+            $dept = groupLabel($row);
             $key  = $row['person_type'] . "\x1f" . $dept;
             if ($key !== $lastDept) {
                 $lastDept = $key;
@@ -498,7 +498,7 @@ function renderRows(array $rows, $groupBy, array $overrides, $isSuper, array $ad
         list($inPool) = effective($row, 'in_pool', $overrides);
         $i++;
         echo '<tr class="personrow' . ($inPool ? '' : ' outofpool') . '"'
-           . ' data-dept="' . h(deptLabel($row['department'])) . '">';
+           . ' data-dept="' . h(groupLabel($row)) . '">';
         echo '<td class="idx">' . $i . '</td>';
         if ($canEditAny) {
             echo '<td class="selcell">'
@@ -511,7 +511,7 @@ function renderRows(array $rows, $groupBy, array $overrides, $isSuper, array $ad
             echo ' · ' . h($row['position']);
         }
         if (!$groupBy) {
-            echo ' · ' . h(deptLabel($row['department']));
+            echo ' · ' . h(groupLabel($row));
         }
         if (isset($row['company_name'])) {
             echo ' · ' . h($row['company_name']);

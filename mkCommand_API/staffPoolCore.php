@@ -62,6 +62,15 @@
  *   GW login accounts — see that method. The report does not show contacts and
  *   does not call it; the API does.
  *
+ * DEPARTMENT AND DISTRICT — two columns, not one
+ *   A staff row carries users.department and users.district, either of which
+ *   may be blank. A GW row carries monthly_assign_gw_district and NO
+ *   department, because that table has no such column — so a GW's department
+ *   is empty and their district holds the location.
+ *   Both are reported as they are stored. How a row is GROUPED is a separate
+ *   question with one answer, groupLabel(): department for a staff, district
+ *   for a GW.
+ *
  * PHP 7.2 compatible.
  */
 
@@ -314,6 +323,7 @@ class StaffPoolRepository
                        {$compExpr} AS comp_id,
                        u.fullname,
                        u.department,
+                       u.district,
                        u.position,
                        u.email,
                        u.mobile_no,
@@ -413,7 +423,8 @@ class StaffPoolRepository
         $sql = "SELECT g.monthly_assign_gw_code            AS person,
                        g.comp_id,
                        MAX(g.monthly_assign_gw_fullname)   AS fullname,
-                       MAX(g.monthly_assign_gw_district)   AS department,
+                       '' AS department,
+                       MAX(g.monthly_assign_gw_district)   AS district,
                        '" . self::GW_POSITION . "' AS position,
                        '' AS email,
                        MAX(g.monthly_assign_gw_mobile_no)  AS mobile_no,
@@ -600,6 +611,11 @@ class StaffPoolRepository
             $r['email']           = trim((string)$r['email']);
             $r['mobile_no']       = trim((string)$r['mobile_no']);
             $r['position']        = trim((string)$r['position']);
+            /* A GW has a district and no department; a staff may have either,
+             * both or neither. Both are settled to a string here so nothing
+             * downstream has to ask which population it is holding. */
+            $r['department']      = trim((string)$r['department']);
+            $r['district']        = trim((string)$r['district']);
             $r['base_in_pool']    = 1;
             $r['base_kpi']        = (int)$r['base_kpi'];
             $r['base_mk_command'] = (int)$r['base_mk_command'];
@@ -795,6 +811,28 @@ function deptLabel($dept)
 {
     $dept = trim((string)$dept);
     return $dept === '' ? 'No department' : $dept;
+}
+
+/** Query: the heading one row is grouped and filtered under.
+ *
+ *  A GW is grouped by DISTRICT: monthly_assign_gw has no department column, so
+ *  the district is the only grouping a GW row carries and it stands in for one.
+ *  A staff is grouped by DEPARTMENT, and by nothing else — 103 of them have a
+ *  district and no department, and they belong in the blank group where the
+ *  report has always put them rather than being scattered across districts
+ *  because this function could see a second column.
+ *
+ *  The report groups its tables by this, its department filter selects by it,
+ *  and filterRows() below applies it — so the API's dept filter picks exactly
+ *  the rows the same filter picks on screen. The published row reports
+ *  department and district as they are STORED, which is a separate question
+ *  from how the row is grouped. */
+function groupLabel(array $row)
+{
+    if ($row['person_type'] === 'gw') {
+        return deptLabel(isset($row['district']) ? $row['district'] : '');
+    }
+    return deptLabel($row['department']);
 }
 
 function fmtDateTime($v)
@@ -998,7 +1036,7 @@ function filterRows(array $rows, $search, $deptWant, $onlyChanged, array $overri
     $needle = $search === '' ? null : $search;
     $out = array();
     foreach ($rows as $row) {
-        if ($deptWant !== '' && deptLabel($row['department']) !== $deptWant) {
+        if ($deptWant !== '' && groupLabel($row) !== $deptWant) {
             continue;
         }
         if ($needle !== null) {
@@ -1038,8 +1076,10 @@ function filterRows(array $rows, $search, $deptWant, $onlyChanged, array $overri
  *  the pool, so summing a field over the in-pool list and reading the matching
  *  company_total_* give the same number.
  *
- *  department is the label the report groups by, so a blank one reads
- *  "No department" rather than coming back empty. */
+ *  department and district are reported AS STORED — a GW has no department, so
+ *  theirs is empty and the district holds the location. What the report groups
+ *  the row under is groupLabel(), which is also what the dept filter selects
+ *  by, so filtering a GW by their district still works. */
 function publicRow(array $row, array $overrides, array $compNames = array())
 {
     list($inPool)   = effective($row, 'in_pool', $overrides);
@@ -1059,7 +1099,11 @@ function publicRow(array $row, array $overrides, array $compNames = array())
         'email'                  => (string)$row['email'],
         'mobile_no'              => (string)$row['mobile_no'],
         'position'               => (string)$row['position'],
-        'department'             => deptLabel($row['department']),
+        /* As STORED, not as grouped: a GW has no department, so theirs is
+         * empty and their district carries the location. groupLabel() is the
+         * other question — what heading the row is filed under. */
+        'department'             => (string)$row['department'],
+        'district'               => (string)$row['district'],
         'staff_type'             => $row['person_type'] === 'gw' ? 'gw' : 'staff',
         'total_staff'            => $inPool ? 1 : 0,
         'kpi_scorecard_exempted' => $kpi ? 1 : 0,
