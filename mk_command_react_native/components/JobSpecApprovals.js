@@ -8,11 +8,16 @@ import {
     TouchableOpacity,
     ActivityIndicator,
 } from 'react-native';
-import { fetchPending, reviewJobSpecVersion } from '../services/jobSpecApi';
+import { fetchPending, reviewJobSpecVersion, approveCapabilityVersion } from '../services/jobSpecApi';
 
 // A superior's pending-approval queue. Opened from the Job Spec header.
 // Self-contained: loads when it becomes visible, actions each card in place,
 // and reports the remaining count back via onChanged.
+//
+// Two kinds of card: a submitted pending version (Approve / Reject), and a
+// subordinate with no version yet whose capability list is awaiting approval
+// (Approve only — approving makes it their first version; to change it first,
+// use Edit on their job spec instead). The server sends both with their tasks.
 //
 // Props: { visible, boss, bossCompId, reviewer, reviewerCompId, onClose, onChanged }
 
@@ -43,6 +48,12 @@ const fmtDate = (dt) => {
     if (p.length < 3 || isNaN(mi) || mi < 0 || mi > 11) return dt;
     return parseInt(p[2], 10) + ' ' + months[mi] + ' ' + p[0] + (time ? ' \u00b7 ' + time : '');
 };
+
+const isCapability = (it) => it.source === 'capability';
+
+// Capability entries have no version_id, so they key on the staff instead.
+const keyOf = (it) =>
+    isCapability(it) ? 'cap|' + it.person + '|' + it.comp_id : 'v|' + it.version_id;
 
 export default class JobSpecApprovals extends Component {
     constructor(props) {
@@ -76,17 +87,27 @@ export default class JobSpecApprovals extends Component {
         }
     };
 
-    // Command: approve/reject one version, then drop it from the list.
-    act = async (versionId, action) => {
-        this.setState({ busyId: versionId, error: null });
+    // Command: approve/reject one entry, then drop it from the list.
+    act = async (it, action) => {
+        const key = keyOf(it);
+        this.setState({ busyId: key, error: null });
         try {
-            await reviewJobSpecVersion({
-                action: action,
-                versionId: versionId,
-                reviewer: this.props.reviewer,
-                reviewerCompId: this.props.reviewerCompId,
-            });
-            const remaining = this.state.items.filter((it) => it.version_id !== versionId);
+            if (isCapability(it)) {
+                await approveCapabilityVersion({
+                    person: it.person,
+                    compId: it.comp_id,
+                    reviewer: this.props.reviewer,
+                    reviewerCompId: this.props.reviewerCompId,
+                });
+            } else {
+                await reviewJobSpecVersion({
+                    action: action,
+                    versionId: it.version_id,
+                    reviewer: this.props.reviewer,
+                    reviewerCompId: this.props.reviewerCompId,
+                });
+            }
+            const remaining = this.state.items.filter((x) => keyOf(x) !== key);
             this.setState({ items: remaining, busyId: null });
             this.props.onChanged && this.props.onChanged(remaining.length);
         } catch (e) {
@@ -95,14 +116,17 @@ export default class JobSpecApprovals extends Component {
     };
 
     renderCard = (it) => {
-        const busy = this.state.busyId === it.version_id;
+        const cap = isCapability(it);
+        const busy = this.state.busyId === keyOf(it);
         const specs = it.job_specs || [];
         return (
-            <View key={it.version_id} style={styles.card}>
+            <View key={keyOf(it)} style={styles.card}>
                 <Text style={styles.cardName} numberOfLines={1}>{titleCase(it.person_name)}</Text>
                 <Text style={styles.cardMeta} numberOfLines={1}>
-                    {'Submitted ' + fmtDate(it.submitted_at) +
-                        (it.submitted_by_name ? ' \u00b7 by ' + titleCase(it.submitted_by_name) : '')}
+                    {cap
+                        ? 'Capability version \u00b7 not yet approved'
+                        : 'Submitted ' + fmtDate(it.submitted_at) +
+                            (it.submitted_by_name ? ' \u00b7 by ' + titleCase(it.submitted_by_name) : '')}
                 </Text>
 
                 <View style={styles.specBox}>
@@ -119,17 +143,19 @@ export default class JobSpecApprovals extends Component {
                 </View>
 
                 <View style={styles.actions}>
-                    <TouchableOpacity
-                        style={[styles.rejectBtn, busy && styles.btnDisabled]}
-                        onPress={() => this.act(it.version_id, 'reject')}
-                        disabled={busy}
-                        activeOpacity={0.7}
-                    >
-                        <Text style={styles.rejectText}>Reject</Text>
-                    </TouchableOpacity>
+                    {!cap && (
+                        <TouchableOpacity
+                            style={[styles.rejectBtn, busy && styles.btnDisabled]}
+                            onPress={() => this.act(it, 'reject')}
+                            disabled={busy}
+                            activeOpacity={0.7}
+                        >
+                            <Text style={styles.rejectText}>Reject</Text>
+                        </TouchableOpacity>
+                    )}
                     <TouchableOpacity
                         style={[styles.approveBtn, busy && styles.btnDisabled]}
-                        onPress={() => this.act(it.version_id, 'approve')}
+                        onPress={() => this.act(it, 'approve')}
                         disabled={busy}
                         activeOpacity={0.7}
                     >

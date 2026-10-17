@@ -58,12 +58,16 @@ export async function submitJobSpecVersion(args) {
     return { version_id: data.version_id, status: data.status };
 }
  
-// Pending versions awaiting this superior's review (enriched with names + tasks).
+// Everything awaiting this superior's review. Each entry has a source:
+//  'version'    a submitted pending version (enriched with names + tasks)
+//  'capability' a subordinate with no version yet but a capability list;
+//               version_id is null and job_specs is that list.
 export async function fetchPending(args) {
     const qs = buildQuery({
         action: 'pending',
         boss: args.boss,
         boss_comp_id: args.bossCompId,
+        include_capability: 1,
     });
     const res = await fetch(JOB_SPEC_WRITE_URL + '?' + qs);
     const data = await res.json();
@@ -81,6 +85,28 @@ export async function reviewJobSpecVersion(args) {
         reviewer: args.reviewer,
         reviewer_comp_id: args.reviewerCompId,
         note: args.note,
+    });
+    const res = await fetch(JOB_SPEC_WRITE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body,
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+        throw new Error(data.message || ('API error ' + res.status));
+    }
+    return { version_id: data.version_id, status: data.status };
+}
+
+// Approve a subordinate's capability list as their first version. The server
+// reads the list itself from the company portal; staff only (GW have none).
+export async function approveCapabilityVersion(args) {
+    const body = buildQuery({
+        action: 'approve_capability',
+        person: args.person,
+        comp_id: args.compId,
+        reviewer: args.reviewer,
+        reviewer_comp_id: args.reviewerCompId,
     });
     const res = await fetch(JOB_SPEC_WRITE_URL, {
         method: 'POST',

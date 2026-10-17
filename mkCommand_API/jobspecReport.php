@@ -10,6 +10,13 @@
  * are dropped after an import, and the report must also cover specs submitted
  * through the app.
  *
+ * A staff member with NO version at all but with a capability list (portal job
+ * descriptions) is waiting on a superior's approval (jobSpecWrite.php
+ * approve_capability), so they count as PENDING here — see specSource(). Staff
+ * with neither, and every GW without a version, have no job spec and are not
+ * counted. The capability lists live on mkcommand.mkgroup.my and are read over
+ * HTTPS from jobSpecs.php (CapabilityClient).
+ *
  * Both schemas live on the SAME mysqld, so one connection with fully-qualified
  * table names serves the whole report. jobSpecWrite.php uses two PDO handles
  * for its own reasons (pooling per logical repository); here a single handle is
@@ -102,6 +109,55 @@ function canPickCompany(PDO $pdo, $userId)
     return $stmt->fetchColumn() !== false;
 }
 
+/* ---------- capability lists (company portals, over HTTPS) ---------------- */
+
+/**
+ * The company portals' job descriptions — a staff member's capability list —
+ * live on mkcommand.mkgroup.my, and the DB port between the hosts is
+ * firewalled, so they are read from jobSpecs.php action=capability. Same
+ * client as jobSpecWrite.php and staffOverview.php.
+ */
+class CapabilityClient
+{
+    const URL = 'https://mkcommand.mkgroup.my/API/jobSpecs.php';
+
+    /** Query: holders of one company keyed strtolower(person) . '|' . comp =>
+     *  ['person','comp_id','items']. A company jobSpecs.php does not serve has
+     *  no holders. Throws when the endpoint is unreachable or answers badly. */
+    public static function forCompany($compId)
+    {
+        $ch = curl_init(self::URL . '?' . http_build_query(
+            array('action' => 'capability', 'comp_id' => (int)$compId)));
+        curl_setopt_array($ch, array(
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 10,
+        ));
+        $body = curl_exec($ch);
+        if ($body === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new RuntimeException('capability unreachable: ' . $err);
+        }
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($code === 400) {
+            return array();   // a company with no portal schema configured there
+        }
+        $data = json_decode($body, true);
+        if ($code < 200 || $code >= 300 || !is_array($data) || empty($data['success'])) {
+            throw new RuntimeException('capability bad response (HTTP ' . $code . ')');
+        }
+
+        $out = array();
+        foreach ($data['capability'] as $c) {
+            $out[strtolower($c['person']) . '|' . (int)$c['comp_id']] = $c;
+        }
+        return $out;
+    }
+}
+
 /* ---------- repository ---------------------------------------------------- */
 
 class ApprovalReportRepository
@@ -136,7 +192,27 @@ class ApprovalReportRepository
      *  comp_id. */
     const GLOB_COMP_ID = 1;
 
+    /** Capability holders in scope, from CapabilityClient: 'person|comp' => row.
+     *  Empty = nobody counts as pending-on-capability. */
+    protected $holders = array();
+
     public function __construct(PDO $db) { $this->db = $db; }
+
+    /** Command: who has a capability list (see specSource()). */
+    public function setCapabilityHolders(array $holders) { $this->holders = $holders; }
+
+    /** Command: give capability stubs their task count — the size of the list
+     *  awaiting approval, which only the portal knows. */
+    protected function withCapabilityItems(array $rows)
+    {
+        foreach ($rows as $i => $r) {
+            if ($r['version_id'] === null) {
+                $key = strtolower($r['person']) . '|' . (int)$r['comp_id'];
+                $rows[$i]['items'] = isset($this->holders[$key]) ? (int)$this->holders[$key]['items'] : 0;
+            }
+        }
+        return $rows;
+    }
 
     /**
      * Query: the chart to read, always aliased `oc` so ACTIVE_CLAUSE and
@@ -174,6 +250,49 @@ class ApprovalReportRepository
                  WHERE comp_id = " . self::GLOB_COMP_ID . ") oc";
     }
 
+    /**
+     * Query: the rows this report counts, always aliased `v` — every version,
+     * plus one 'pending' stub per live staff member who has no version at all
+     * but DOES have a capability list (it awaits a superior's approval). Staff
+     * with neither are not counted anywhere: they have no job spec.
+     *
+     * A stub has id NULL, so counts key on row_key instead of v.id. Its
+     * submitted_by is '' rather than NULL so NOT_SUBMITTER evaluates true for
+     * it instead of NULL. Stubs are drawn from the same population MK Command
+     * shows (active, undeleted, not mk_command_excluded). The holder list comes
+     * from another host, so it is inlined as quoted literals, not joined.
+     */
+    protected function specSource($compId)
+    {
+        if (empty($this->holders)) {
+            return "(" . self::VERSION_ROWS . ") v";
+        }
+        $tuples = array();
+        foreach ($this->holders as $h) {
+            $tuples[] = '(' . $this->db->quote($h['person']) . ', ' . (int)$h['comp_id'] . ')';
+        }
+        $comp = ($compId !== null) ? " AND u.comp_id = " . (int)$compId : "";
+        return "(" . self::VERSION_ROWS . "
+                 UNION ALL
+                 SELECT NULL, u.person, u.comp_id, 0, 'pending', '', 0,
+                        NULL, NULL, NULL, CONCAT('c', u.person, '|', u.comp_id)
+                 FROM staff_portal2.users u
+                 WHERE u.status = 1 AND IFNULL(u.deleted, 0) = 0
+                   AND IFNULL(u.mk_command_excluded, 0) <> 1{$comp}
+                   AND (u.person, u.comp_id) IN (" . implode(',', $tuples) . ")
+                   AND NOT EXISTS (SELECT 1 FROM mkPortal.job_spec_version x
+                                   WHERE x.person = u.person AND x.comp_id = u.comp_id
+                                     AND IFNULL(x.is_gw, 0) = 0)) v";
+    }
+
+    /** The real-version half of specSource(); its column list is the shape
+     *  every stub branch must match. */
+    const VERSION_ROWS = "
+        SELECT jv.id, jv.person, jv.comp_id, jv.is_gw, jv.status,
+               jv.submitted_by, jv.submitted_by_comp_id, jv.submitted_at,
+               jv.reviewed_at, jv.reviewed_by, CONCAT('v', jv.id) AS row_key
+        FROM mkPortal.job_spec_version jv";
+
     /** Build the company + population predicate and its bindings.
      *  Shared by every query here and by the GW subclass (DRY).
      *  $isGw: 0 = staff (is_gw NULL or 0), 1 = GW. Legacy rows predate the
@@ -204,7 +323,7 @@ class ApprovalReportRepository
     {
         list($where, $args) = $this->scopeSql($compId);
         $sql = "SELECT v.status, COUNT(*) AS n
-                FROM mkPortal.job_spec_version v
+                FROM " . $this->specSource($compId) . "
                 {$where}
                 GROUP BY v.status";
         $out = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
@@ -221,10 +340,10 @@ class ApprovalReportRepository
         $sql = "SELECT oc.boss_id, oc.boss_comp_id,
                        COALESCE(ub.fullname, oc.boss_id) AS boss_name,
                        ub.person IS NULL AS boss_missing,
-                       COUNT(DISTINCT CASE WHEN v.status = 'pending'  THEN v.id END) AS pending,
-                       COUNT(DISTINCT CASE WHEN v.status = 'approved' THEN v.id END) AS approved,
-                       COUNT(DISTINCT CASE WHEN v.status = 'rejected' THEN v.id END) AS rejected
-                FROM mkPortal.job_spec_version v
+                       COUNT(DISTINCT CASE WHEN v.status = 'pending'  THEN v.row_key END) AS pending,
+                       COUNT(DISTINCT CASE WHEN v.status = 'approved' THEN v.row_key END) AS approved,
+                       COUNT(DISTINCT CASE WHEN v.status = 'rejected' THEN v.row_key END) AS rejected
+                FROM " . $this->specSource($compId) . "
                 INNER JOIN " . self::chartSource($compId) . "
                     ON oc.staff_id = v.person AND oc.comp_id = v.comp_id
                    AND " . self::ACTIVE_CLAUSE . "
@@ -249,7 +368,7 @@ class ApprovalReportRepository
                        COALESCE(us.fullname, v.person) AS staff_name,
                        (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
                         WHERE vi.version_id = v.id) AS items
-                FROM mkPortal.job_spec_version v
+                FROM " . $this->specSource($compId) . "
                 INNER JOIN " . self::chartSource($compId) . "
                     ON oc.staff_id = v.person AND oc.comp_id = v.comp_id
                    AND " . self::ACTIVE_CLAUSE . "
@@ -259,10 +378,10 @@ class ApprovalReportRepository
                     ON us.person = v.person AND us.comp_id = v.comp_id
                 {$where}
                   AND oc.boss_id = :boss
-                GROUP BY v.id, v.person, v.comp_id, v.status,
+                GROUP BY v.row_key, v.id, v.person, v.comp_id, v.status,
                          v.reviewed_at, v.reviewed_by, us.fullname
                 ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
-        return $this->run($sql, $args);
+        return $this->withCapabilityItems($this->run($sql, $args));
     }
 
     /** Query: versions with no eligible reviewer — no live direct superior
@@ -285,7 +404,7 @@ class ApprovalReportRepository
                        COALESCE(us.fullname, v.person) AS staff_name,
                        (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
                         WHERE vi.version_id = v.id) AS items
-                FROM mkPortal.job_spec_version v
+                FROM " . $this->specSource($compId) . "
                 LEFT JOIN staff_portal2.users us
                     ON us.person = v.person AND us.comp_id = v.comp_id
                 {$where}
@@ -296,7 +415,7 @@ class ApprovalReportRepository
                         AND " . self::NOT_SUBMITTER . "
                         AND " . self::HAS_BOSS . ")
                 ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
-        return $this->run($sql, $args);
+        return $this->withCapabilityItems($this->run($sql, $args));
     }
 
     /** Query: the task list of one version, in display order.
@@ -401,6 +520,13 @@ class GwApprovalReportRepository extends ApprovalReportRepository
         g.monthly_assign_gw_code = v.person
         AND g.comp_id = CAST(v.comp_id AS CHAR)";
 
+    /** The GW flavour of specSource(): versions only. A GW has no portal row
+     *  and so no capability list — no version means no job spec. */
+    protected function specSource($compId)
+    {
+        return "(" . self::VERSION_ROWS . ") v";
+    }
+
     /** The GW flavour of scopeSql(): company + population, one definition,
      *  used by every query below so the tiles, the table and the no-reviewer
      *  card can never disagree about who exists. */
@@ -414,7 +540,7 @@ class GwApprovalReportRepository extends ApprovalReportRepository
     {
         list($where, $args) = $this->gwScope($compId);
         $sql = "SELECT v.status, COUNT(*) AS n
-                FROM mkPortal.job_spec_version v
+                FROM " . $this->specSource($compId) . "
                 {$where}
                 GROUP BY v.status";
         $out = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
@@ -433,10 +559,10 @@ class GwApprovalReportRepository extends ApprovalReportRepository
         $sql = "SELECT g.boss_id, g.boss_comp_id,
                        COALESCE(ub.fullname, g.boss_id) AS boss_name,
                        ub.person IS NULL AS boss_missing,
-                       COUNT(DISTINCT CASE WHEN v.status = 'pending'  THEN v.id END) AS pending,
-                       COUNT(DISTINCT CASE WHEN v.status = 'approved' THEN v.id END) AS approved,
-                       COUNT(DISTINCT CASE WHEN v.status = 'rejected' THEN v.id END) AS rejected
-                FROM mkPortal.job_spec_version v
+                       COUNT(DISTINCT CASE WHEN v.status = 'pending'  THEN v.row_key END) AS pending,
+                       COUNT(DISTINCT CASE WHEN v.status = 'approved' THEN v.row_key END) AS approved,
+                       COUNT(DISTINCT CASE WHEN v.status = 'rejected' THEN v.row_key END) AS rejected
+                FROM " . $this->specSource($compId) . "
                 INNER JOIN evaluation.monthly_assign_gw g
                     ON " . self::GW_JOIN . "
                    AND " . self::GW_ACTIVE_CLAUSE . "
@@ -463,7 +589,7 @@ class GwApprovalReportRepository extends ApprovalReportRepository
                        MAX(g.monthly_assign_gw_district) AS district,
                        (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
                         WHERE vi.version_id = v.id) AS items
-                FROM mkPortal.job_spec_version v
+                FROM " . $this->specSource($compId) . "
                 INNER JOIN evaluation.monthly_assign_gw g
                     ON " . self::GW_JOIN . "
                    AND " . self::GW_ACTIVE_CLAUSE . "
@@ -471,7 +597,7 @@ class GwApprovalReportRepository extends ApprovalReportRepository
                    AND " . self::GW_HAS_BOSS . "
                 {$where}
                   AND g.boss_id = :boss
-                GROUP BY v.id, v.person, v.comp_id, v.status,
+                GROUP BY v.row_key, v.id, v.person, v.comp_id, v.status,
                          v.submitted_at, v.reviewed_at, v.reviewed_by
                 ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
         return $this->run($sql, $args);
@@ -497,7 +623,7 @@ class GwApprovalReportRepository extends ApprovalReportRepository
                                 v.person) AS staff_name,
                        (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
                         WHERE vi.version_id = v.id) AS items
-                FROM mkPortal.job_spec_version v
+                FROM " . $this->specSource($compId) . "
                 {$where}
                   AND NOT EXISTS (
                       SELECT 1 FROM evaluation.monthly_assign_gw g
@@ -602,6 +728,22 @@ function withOwnCompany(array $companies, $compId, $name)
     return $companies;
 }
 
+/** Query: is this row a capability stub rather than a real version? */
+function isCapabilityRow(array $row)
+{
+    return $row['version_id'] === null;
+}
+
+/** Command: echo a row's status pill. A capability stub is pending like any
+ *  other, and says so beneath — it has no version for the task count to open. */
+function renderStatus(array $row)
+{
+    echo '<span class="pill ' . h($row['status']) . '">' . h($row['status']) . '</span>';
+    if (isCapabilityRow($row)) {
+        echo '<div class="muted">capability version</div>';
+    }
+}
+
 /** Command: echo one version's tasks, inline beneath its row. */
 function renderTasks(array $rows, $span, $anchor)
 {
@@ -648,9 +790,14 @@ function renderDetail(array $rows, $isGw, $span, $anchor)
         if ($isGw) {
             echo '<td class="muted">' . h(!empty($d['district']) ? $d['district'] : '—') . '</td>';
         }
-        echo '<td><span class="pill ' . h($d['status']) . '">' . h($d['status']) . '</span></td>';
+        echo '<td>';
+        renderStatus($d);
+        echo '</td>';
         $inner = $isGw ? 7 : 6;
-        if ((int)$d['items'] > 0) {
+        if (isCapabilityRow($d)) {
+            echo '<td class="num muted" title="Capability list — not yet approved in MK Command">'
+               . (int)$d['items'] . '</td>';
+        } elseif ((int)$d['items'] > 0) {
             echo '<td class="num"><a class="tasklink" href="' . h(taskUrl($d['version_id'])) . '"'
                . ' data-url="' . h(taskUrl($d['version_id'])) . '"'
                . ' data-span="' . $inner . '">' . (int)$d['items'] . '</a></td>';
@@ -691,7 +838,7 @@ function renderNoReviewer(array $rows, $isGw)
                 <td class="idx"><?php echo $n; ?></td>
                 <td><?php echo h(displayName($o['staff_name'], $o['person'])); ?>
                     <div class="muted"><?php echo h($o['person']); ?></div></td>
-                <td><span class="pill <?php echo h($o['status']); ?>"><?php echo h($o['status']); ?></span></td>
+                <td><?php renderStatus($o); ?></td>
                 <td class="num"><?php echo (int)$o['items']; ?></td>
             </tr>
             <?php endforeach; ?>
@@ -701,9 +848,36 @@ function renderNoReviewer(array $rows, $isGw)
     <?php
 }
 
+/** Query: capability holders for the companies in view — one company, or
+ *  unfiltered the group companies() offers. Null when the portal host could
+ *  not be read: the report then counts versions only and says so, rather than
+ *  silently showing every capability-only staff member as having nothing. */
+function capabilityHolders(ApprovalReportRepository $repo, $compId)
+{
+    $compIds = array();
+    if ($compId !== null) {
+        $compIds[] = (int)$compId;
+    } else {
+        foreach ($repo->companies() as $c) {
+            $compIds[] = (int)$c['comp_id'];
+        }
+    }
+    $out = array();
+    try {
+        foreach ($compIds as $cid) {
+            $out += CapabilityClient::forCompany($cid);
+        }
+    } catch (Exception $e) {
+        error_log('jobSpecApprovalReport capability: ' . $e->getMessage());
+        return null;
+    }
+    return $out;
+}
+
 /* ---------- controller ---------------------------------------------------- */
 
 $error = null;
+$capabilityDown = false;   // portal capability lists unreadable this load
 $totals = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
 $bosses = array();
 $noReviewer = array();
@@ -804,6 +978,10 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail') {
         $ajaxRepo = $ajaxIsGw
             ? new GwApprovalReportRepository(Db::get())
             : new ApprovalReportRepository(Db::get());
+        if (!$ajaxIsGw) {
+            $ajaxHolders = capabilityHolders($ajaxRepo, $compId);
+            $ajaxRepo->setCapabilityHolders($ajaxHolders === null ? array() : $ajaxHolders);
+        }
         renderDetail($ajaxRepo->staffForBoss($compId, $ajaxBoss), $ajaxIsGw, 7,
                      detailAnchor($ajaxIsGw, $ajaxBoss));
     } catch (Exception $e) {
@@ -825,6 +1003,9 @@ try {
         $defaultCompId,
         isset($currentUser['company_name']) ? $currentUser['company_name'] : null
     );
+    $holders   = capabilityHolders($repo, $compId);
+    $capabilityDown = ($holders === null);
+    $repo->setCapabilityHolders($capabilityDown ? array() : $holders);
     $totals    = $repo->totals($compId);
     $bosses    = $repo->byBoss($compId);
     $noReviewer = $repo->withoutReviewer($compId);
@@ -980,6 +1161,13 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
     </select>
     <?php endif; ?>
 </div>
+
+<?php if ($capabilityDown): ?>
+    <div class="card warnbox">
+        Capability lists could not be read from the company portals, so staff still on
+        their capability version are missing from the pending counts below.
+    </div>
+<?php endif; ?>
 
 <div class="tiles">
     <div class="tile"><div class="n pending"><?php echo (int)$totals['pending']; ?></div>
@@ -1205,4 +1393,4 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
 }());
 </script>
 </body>
-</html>
+</html>

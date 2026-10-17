@@ -412,6 +412,14 @@ class DirectoryRepository extends Repository
     /** What a staff member with no job spec row at all reads as. */
     const NO_JOB_SPEC = array('status' => null, 'items' => 0);
 
+    /** No job spec row, but a capability list (portal job descriptions) that a
+     *  superior has to approve before it becomes their first version
+     *  (jobSpecWrite.php approve_capability) — so pending, not none. */
+    public static function capabilitySpec($items)
+    {
+        return array('status' => 'pending', 'items' => (int)$items, 'capability' => true);
+    }
+
     /**
      * Query: which applications each staff is attached to.
      *
@@ -1598,6 +1606,78 @@ function absoluteBase()
     return ($secure ? 'https' : 'http') . '://' . $host;
 }
 
+/* ---------- capability lists (company portals, over HTTPS) ---------------- */
+
+/**
+ * The company portals' job descriptions — a staff member's capability list —
+ * live on mkcommand.mkgroup.my, and the DB port between the hosts is
+ * firewalled, so they are read from jobSpecs.php action=capability. Same
+ * client as jobSpecWrite.php and jobspecReport.php. GW have no capability list.
+ */
+class CapabilityClient
+{
+    const URL = 'https://mkcommand.mkgroup.my/API/jobSpecs.php';
+
+    /** Query: holders of one company keyed strtolower(person) . '|' . comp =>
+     *  ['person','comp_id','items'(,'job_specs')]. $persons null = the whole
+     *  company, counts only; otherwise those staff with their task lists.
+     *  A company jobSpecs.php does not serve has no holders. Throws when the
+     *  endpoint is unreachable or answers badly. */
+    public static function forCompany($compId, array $persons = null)
+    {
+        $q = array('action' => 'capability', 'comp_id' => (int)$compId);
+        if ($persons !== null) {
+            $q['persons'] = array_values($persons);
+        }
+
+        $ch = curl_init(self::URL . '?' . http_build_query($q));
+        curl_setopt_array($ch, array(
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 10,
+        ));
+        $body = curl_exec($ch);
+        if ($body === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new RuntimeException('capability unreachable: ' . $err);
+        }
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($code === 400) {
+            return array();   // a company with no portal schema configured there
+        }
+        $data = json_decode($body, true);
+        if ($code < 200 || $code >= 300 || !is_array($data) || empty($data['success'])) {
+            throw new RuntimeException('capability bad response (HTTP ' . $code . ')');
+        }
+
+        $out = array();
+        foreach ($data['capability'] as $c) {
+            $out[strtolower($c['person']) . '|' . (int)$c['comp_id']] = $c;
+        }
+        return $out;
+    }
+}
+
+/** Query: capability holders across some companies, or null when the portal
+ *  host could not be read — the page then says so instead of quietly showing
+ *  every capability-only staff member as "none". */
+function capabilityHolders(array $compIds)
+{
+    $out = array();
+    try {
+        foreach ($compIds as $cid) {
+            $out += CapabilityClient::forCompany($cid);
+        }
+    } catch (Exception $e) {
+        error_log('mkCommand staffOverview capability: ' . $e->getMessage());
+        return null;
+    }
+    return $out;
+}
+
 /* ---------- inline renderers ---------------------------------------------- */
 /* Shared by the full page and by the AJAX responses, so each block of markup
  * has exactly one definition and the JS never rebuilds it. */
@@ -1626,7 +1706,10 @@ function renderJobSpecCell(array $spec)
     if ($status === 'approved') {
         $label .= ' - ' . (int)$spec['items'];
     }
-    echo '<span class="pill ' . h($status) . '">' . h($label) . '</span>';
+    $title = !empty($spec['capability'])
+        ? ' title="Capability version awaiting superior approval"'
+        : '';
+    echo '<span class="pill ' . h($status) . '"' . $title . '>' . h($label) . '</span>';
 }
 
 /**
@@ -2065,6 +2148,9 @@ if (param('ajax') !== '') {
 /* --- page data ----------------------------------------------------------- */
 
 $staff        = null;   // the open staff member, when there is one
+$targetCapabilityItems = 0;   // their capability list size, when they have no version
+$targetCapabilityTasks = array();   // ...and the list itself, for the Tasks expander
+$capabilityDown = false;      // portal capability lists unreadable this load
 $superiors    = array();
 $subordinates = array();
 $hierarchy    = array('total_superiors' => 0, 'direct_superiors' => 0,
@@ -2125,6 +2211,23 @@ try {
             }
             if ($scope->sees('jobspec')) {
                 $versions = (new JobSpecRepository(Db::get()))->versions($targetPerson, $targetComp);
+                // No version yet: is there a capability list awaiting approval?
+                if (empty($versions)) {
+                    try {
+                        $cap = CapabilityClient::forCompany($targetComp, array($targetPerson));
+                        $capKey = strtolower($targetPerson) . '|' . (int)$targetComp;
+                        $targetCapabilityItems = isset($cap[$capKey]) ? (int)$cap[$capKey]['items'] : 0;
+                        // In renderTasks()' row shape, so the list renders like a version's.
+                        if (isset($cap[$capKey]['job_specs'])) {
+                            foreach ($cap[$capKey]['job_specs'] as $s) {
+                                $targetCapabilityTasks[] = array('category' => '', 'task' => $s['task'], 'apps' => '');
+                            }
+                        }
+                    } catch (Exception $e) {
+                        error_log('mkCommand staffOverview capability: ' . $e->getMessage());
+                        $capabilityDown = true;
+                    }
+                }
             }
             if ($scope->sees('app')) {
                 $apps = (new AppRepository(Db::get()))->appsFor($targetPerson, $targetComp);
@@ -2160,6 +2263,14 @@ try {
         $people = $dir->staff($activeCompIds, $search);
 
         $specs  = $scope->sees('jobspec') ? $dir->latestJobSpecs($activeCompIds) : array();
+        $capability = array();
+        if ($scope->sees('jobspec')) {
+            $capability = capabilityHolders($activeCompIds);
+            if ($capability === null) {
+                $capabilityDown = true;
+                $capability = array();
+            }
+        }
         $appN   = $scope->sees('app')     ? $dir->appCounts($activeCompIds)
                                       : array('personal' => array(), 'company' => array());
         $memoN  = $scope->sees('memo')    ? $dir->memoCounts()                  : array('per' => array(), 'broadcast' => 0);
@@ -2172,9 +2283,12 @@ try {
             $key = $p['person'] . '|' . (int)$p['comp_id'];
             $uid = (int)$p['id'];
 
+            $capKey = strtolower($p['person']) . '|' . (int)$p['comp_id'];
             $people[$i]['spec'] = isset($specs[$key])
                 ? $specs[$key]
-                : DirectoryRepository::NO_JOB_SPEC;
+                : (isset($capability[$capKey])
+                    ? DirectoryRepository::capabilitySpec($capability[$capKey]['items'])
+                    : DirectoryRepository::NO_JOB_SPEC);
             // Personal assignments unioned with the company-wide ones, so an app
             // held both ways counts once.
             $mine = isset($appN['personal'][$key]) ? $appN['personal'][$key] : array();
@@ -2245,6 +2359,9 @@ try {
 /* Detail totals, for the tiles at the top of the staff page. */
 $specTotals = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
 foreach ($versions as $v) { $specTotals[$v['status']]++; }
+/* No version at all but a capability list: that list is awaiting approval, so
+ * the tile reads 1 pending, matching the directory's Pending pill. */
+if ($staff !== null && empty($versions) && $targetCapabilityItems > 0) { $specTotals['pending'] = 1; }
 
 $meritCount = 0;
 $demeritCount = 0;
@@ -2416,6 +2533,13 @@ foreach ($performance as $p) {
 <?php include '../includes/sidebar.php'; ?>
 <div class="main-content">
 <div class="wrap">
+
+<?php if ($capabilityDown && $error === null): ?>
+    <div class="card warnbox">
+        Capability lists could not be read from the company portals, so staff still on
+        their capability version show as "none" instead of pending on this load.
+    </div>
+<?php endif; ?>
 
 <?php if ($error !== null): ?>
     <div class="card warnbox"><?php echo h($error); ?></div>
@@ -2616,7 +2740,30 @@ foreach ($performance as $p) {
                 <th>Submitted</th><th>By</th><th>Reviewed</th><th>By</th></tr>
             </thead>
             <tbody>
-            <?php if (empty($versions)): ?>
+            <?php if (empty($versions) && $targetCapabilityItems > 0): ?>
+                <tr>
+                    <td class="idx">—</td>
+                    <td>
+                        <span class="pill pending">pending</span>
+                        <div class="muted">capability version</div>
+                    </td>
+                    <td class="num">
+                        <?php /* The list is already on the page (hidden row below), so
+                           the shared toggle just shows it — data-url is never fetched. */ ?>
+                        <a class="explink" href="#" data-span="7" data-url="#"><?php echo (int)$targetCapabilityItems; ?></a>
+                    </td>
+                    <td colspan="4" class="muted">
+                        Still on the capability list — awaiting approval by a direct superior
+                        in MK Command.
+                    </td>
+                </tr>
+                <?php
+                ob_start();
+                renderTasks($targetCapabilityTasks, 7);
+                // Same markup as an AJAX-loaded version list, starting closed.
+                echo str_replace('<tr class="exprow">', '<tr class="exprow" hidden>', ob_get_clean());
+                ?>
+            <?php elseif (empty($versions)): ?>
                 <tr><td colspan="7" class="empty">No job spec submitted yet.</td></tr>
             <?php endif; ?>
             <?php $n = 0; foreach ($versions as $v): $n++; ?>

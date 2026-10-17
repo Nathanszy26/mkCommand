@@ -14,7 +14,8 @@ header('Content-Type: application/json; charset=UTF-8');
  *   submit          person, comp_id, [is_gw], submitter, submitter_comp_id, items (JSON array)
  *   approve         version_id, reviewer, reviewer_comp_id, [note]
  *   reject          version_id, reviewer, reviewer_comp_id, [note]
- *   pending         boss, boss_comp_id                 (a superior's actionable queue)
+ *   approve_capability person, comp_id, reviewer, reviewer_comp_id   (staff only)
+ *   pending         boss, boss_comp_id, [include_capability=1]  (a superior's actionable queue)
  *   latest_approved person, comp_id, [is_gw]            (consumed by jobSpecs.php over HTTPS)
  *
  * GW (is_gw=1) are a second target population: identity is
@@ -27,6 +28,16 @@ header('Content-Type: application/json; charset=UTF-8');
  * is NO eligible approver OTHER THAN the submitter — i.e. the submitter is the
  * target's sole current direct superior, OR the target has no direct superior
  * at all. Otherwise it stays 'pending' for a *different* direct superior.
+ *
+ * Capability versions: a staff member with NO job_spec_version row at all but
+ * with portal job descriptions is still reading that capability list
+ * (jobSpecs.php's fallback). It is pending by definition — the `pending` queue
+ * includes those subordinates (source 'capability', version_id null, with the
+ * list), and any current direct superior may approve_capability it, which
+ * snapshots the list into job_spec_version (+ items) as approved. The list is
+ * read from jobSpecs.php action=capability over HTTPS (CapabilityClient), both
+ * for the queue and at approval. Staff with neither a version nor a list have
+ * nothing to approve. GW never have a capability list.
  *
  * SECURITY NOTE (called out, not silently accepted): this stack has no server
  * session/token — exactly like staffHierarchy.php. Submitter/reviewer identity
@@ -446,6 +457,66 @@ class AppRepository
     }
 }
  
+/* ---------- capability lists (company portals, over HTTPS) ---------------- */
+
+/**
+ * The company portals' job descriptions — a staff member's capability list —
+ * live on mkcommand.mkgroup.my, and the DB port between the hosts is
+ * firewalled, so they are read from jobSpecs.php action=capability. Same
+ * client in jobspecReport.php and staffOverview.php.
+ *
+ * GW have no capability list: jobSpecs.php has no portal row for them.
+ */
+class CapabilityClient
+{
+    const URL = 'https://mkcommand.mkgroup.my/API/jobSpecs.php';
+
+    /** Query: holders of one company keyed strtolower(person) . '|' . comp =>
+     *  ['person','comp_id','items'(,'job_specs')]. $persons null = the whole
+     *  company, counts only; otherwise those staff with their task lists.
+     *  A company jobSpecs.php does not serve has no holders. Throws when the
+     *  endpoint is unreachable or answers badly — callers decide how loud. */
+    public static function forCompany($compId, array $persons = null)
+    {
+        $q = array('action' => 'capability', 'comp_id' => (int)$compId);
+        if ($persons !== null) {
+            if (empty($persons)) {
+                return array();
+            }
+            $q['persons'] = array_values($persons);
+        }
+
+        $ch = curl_init(self::URL . '?' . http_build_query($q));
+        curl_setopt_array($ch, array(
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 10,
+        ));
+        $body = curl_exec($ch);
+        if ($body === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new RuntimeException('capability unreachable: ' . $err);
+        }
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($code === 400) {
+            return array();   // a company with no portal schema configured there
+        }
+        $data = json_decode($body, true);
+        if ($code < 200 || $code >= 300 || !is_array($data) || empty($data['success'])) {
+            throw new RuntimeException('capability bad response (HTTP ' . $code . ')');
+        }
+
+        $out = array();
+        foreach ($data['capability'] as $c) {
+            $out[strtolower($c['person']) . '|' . (int)$c['comp_id']] = $c;
+        }
+        return $out;
+    }
+}
+
 /* ---------- mkPortal versions --------------------------------------------- */
  
 class VersionRepository
@@ -453,11 +524,31 @@ class VersionRepository
     private $db;
     public function __construct(PDO $db) { $this->db = $db; }
  
-    /** Atomic: insert header + all snapshot items in one transaction. Returns id. */
-    public function createVersion(array $h, array $items)
+    /** Atomic: insert header + all snapshot items in one transaction. Returns id.
+     *
+     *  $firstOnly: refuse (CAPABILITY_ALREADY_VERSIONED) if the target already
+     *  has any version. Checked inside the transaction with a locking read, so
+     *  two superiors approving the same capability list at once yield one
+     *  version, not two. */
+    public function createVersion(array $h, array $items, $firstOnly = false)
     {
         $this->db->beginTransaction();
         try {
+            if ($firstOnly) {
+                $chk = $this->db->prepare(
+                    "SELECT id FROM job_spec_version
+                     WHERE person = :p AND comp_id = :c AND IFNULL(is_gw, 0) = :g
+                     LIMIT 1 FOR UPDATE"
+                );
+                $chk->bindValue(':p', $h['person'], PDO::PARAM_STR);
+                $chk->bindValue(':c', (int)$h['comp_id'], PDO::PARAM_INT);
+                $chk->bindValue(':g', (int)$h['is_gw'], PDO::PARAM_INT);
+                $chk->execute();
+                if ($chk->fetchColumn() !== false) {
+                    throw new RuntimeException('CAPABILITY_ALREADY_VERSIONED');
+                }
+            }
+
             $sql = "INSERT INTO job_spec_version
                     (person, comp_id, is_gw, status, submitted_by, submitted_by_comp_id, submitted_at,
                      reviewed_by, reviewed_by_comp_id, reviewed_at, review_note)
@@ -644,7 +735,43 @@ class VersionRepository
         $stmt->execute();
         return $stmt->fetchAll();
     }
- 
+
+    /** The subset of $targets with no version at all (any status) — those still
+     *  on their capability list. Same key shape as pendingForTargets(). */
+    public function targetsWithoutVersion(array $targets)
+    {
+        if (empty($targets)) {
+            return array();
+        }
+        $tuples = implode(',', array_fill(0, count($targets), '(?, ?, ?)'));
+        $sql = "SELECT DISTINCT person, comp_id, IFNULL(is_gw, 0) AS is_gw
+                FROM job_spec_version
+                WHERE (person, comp_id, IFNULL(is_gw, 0)) IN ({$tuples})";
+        $stmt = $this->db->prepare($sql);
+        $i = 1;
+        foreach ($targets as $t) {
+            $stmt->bindValue($i++, $t['person'], PDO::PARAM_STR);
+            $stmt->bindValue($i++, (int)$t['comp_id'], PDO::PARAM_INT);
+            $stmt->bindValue($i++, (int)$t['is_gw'], PDO::PARAM_INT);
+        }
+        $stmt->execute();
+
+        // Lower-cased: the IN() above matched under a case-insensitive
+        // collation, so the PHP side must not be stricter than it.
+        $has = array();
+        foreach ($stmt->fetchAll() as $r) {
+            $has[strtolower($r['person']) . '|' . (int)$r['comp_id'] . '|' . (int)$r['is_gw']] = true;
+        }
+        $out = array();
+        foreach ($targets as $t) {
+            $key = strtolower($t['person']) . '|' . (int)$t['comp_id'] . '|' . (int)$t['is_gw'];
+            if (!isset($has[$key])) {
+                $out[$key] = $t;   // keyed: a target listed twice is returned once
+            }
+        }
+        return array_values($out);
+    }
+
     private function bindNullableStr($stmt, $name, $value)
     {
         if ($value === null || $value === '') {
@@ -795,7 +922,69 @@ class JobSpecWriteService
         }
         return array('version_id' => (int)$versionId, 'status' => $status);
     }
- 
+
+    /** Command: approve a subordinate's capability list — the one they read
+     *  while they have no job_spec_version at all — making it their first
+     *  version. Returns ['version_id','status'].
+     *
+     *  Any current direct superior may do this. There is no submitter to
+     *  exclude: the list was never submitted by anyone in MK Command, so it is
+     *  recorded as submitted by the staff themselves (the same shape a
+     *  self-submit has), and the reviewer is the superior who approved it.
+     *
+     *  The tasks are read here from the portal, not taken from the client, so
+     *  what is stored is exactly the capability list. Staff only — a GW has no
+     *  capability list. */
+    public function approveCapability($person, $comp, $rP, $rC)
+    {
+        if (!$this->org->staffExists($person, $comp)) {
+            throw new RuntimeException('TARGET_NOT_FOUND');
+        }
+        if (!$this->org->isDirectSuperior($rP, $rC, $person, $comp)) {
+            throw new RuntimeException('NOT_A_DIRECT_SUPERIOR');
+        }
+
+        try {
+            $lists = $this->capabilityLists(array(
+                array('person' => $person, 'comp_id' => (int)$comp, 'is_gw' => 0),
+            ));
+        } catch (RuntimeException $e) {
+            error_log('jobSpecWrite approve_capability: ' . $e->getMessage());
+            throw new RuntimeException('CAPABILITY_UNAVAILABLE');
+        }
+        $key = strtolower($person) . '|' . (int)$comp;
+        if (empty($lists[$key]['job_specs'])) {
+            throw new RuntimeException('NO_CAPABILITY_LIST');
+        }
+        $items = array();
+        foreach ($lists[$key]['job_specs'] as $i => $s) {
+            $items[] = array(
+                'task'                      => $s['task'],
+                'source_job_description_id' => $s['job_description_id'],
+                'sort_order'                => $i,
+                'apps'                      => array(),
+            );
+        }
+
+        $now = date('Y-m-d H:i:s');
+        $h = array(
+            'person'               => $person,
+            'comp_id'              => (int)$comp,
+            'is_gw'                => 0,
+            'status'               => 'approved',
+            'submitted_by'         => $person,
+            'submitted_by_comp_id' => (int)$comp,
+            'submitted_at'         => $now,
+            'reviewed_by'          => $rP,
+            'reviewed_by_comp_id'  => (int)$rC,
+            'reviewed_at'          => $now,
+            'review_note'          => 'Approved from capability version',
+        );
+
+        $versionId = $this->ver->createVersion($h, $items, true);
+        return array('version_id' => $versionId, 'status' => 'approved');
+    }
+
     /** Query: latest approved version + items for a staff or GW. */
     public function latestApproved($person, $comp, $isGw)
     {
@@ -815,9 +1004,30 @@ class JobSpecWriteService
         );
     }
  
-    /** Query: pending versions across a superior's current direct subordinates,
-     *  enriched with names and the proposed task list so they're reviewable. */
-    public function pendingForSuperior($bossP, $bossC)
+    /** Query: capability lists for some staff targets, one jobSpecs.php call per
+     *  company. Keyed like CapabilityClient; only staff who HAVE a list appear. */
+    private function capabilityLists(array $targets)
+    {
+        $byComp = array();
+        foreach ($targets as $t) {
+            if ((int)$t['is_gw'] === 0) {
+                $byComp[(int)$t['comp_id']][] = $t['person'];
+            }
+        }
+        $out = array();
+        foreach ($byComp as $comp => $persons) {
+            $out += CapabilityClient::forCompany($comp, $persons);
+        }
+        return $out;
+    }
+
+    /** Query: everything awaiting this superior — pending versions across their
+     *  current direct subordinates (source 'version', enriched with names and
+     *  the proposed task list), followed by staff subordinates with no version
+     *  at all who do have a capability list (source 'capability', version_id
+     *  null, job_specs = that list). Staff with neither are not pending: there
+     *  is nothing to approve. */
+    public function pendingForSuperior($bossP, $bossC, $withCapability = false)
     {
         // One queue, both populations: direct reports from the reporting line
         // and GW from monthly_assign_gw. is_gw is carried so the version lookup
@@ -831,14 +1041,36 @@ class JobSpecWriteService
         }
  
         $headers = $this->ver->pendingForTargets($targets);
-        if (empty($headers)) {
+
+        // The portal being unreachable must not hide the real pending versions,
+        // so a failure drops only the capability half of the queue.
+        $capability = array();
+        $noVersion  = $withCapability ? $this->ver->targetsWithoutVersion($targets) : array();
+        try {
+            $lists = $this->capabilityLists($noVersion);
+            foreach ($noVersion as $t) {
+                $key = strtolower($t['person']) . '|' . (int)$t['comp_id'];
+                if ((int)$t['is_gw'] === 0 && !empty($lists[$key]['job_specs'])) {
+                    $t['job_specs'] = $lists[$key]['job_specs'];
+                    $capability[] = $t;
+                }
+            }
+        } catch (Exception $e) {
+            error_log('jobSpecWrite capability lists: ' . $e->getMessage());
+        }
+
+        if (empty($headers) && empty($capability)) {
             return array();
         }
- 
+
         // Batched name lookups: targets from their own directory, submitters
         // always from the staff side (only staff accounts can submit).
         $staffPairs = array();
         $gwPairs    = array();
+        foreach ($capability as $t) {
+            $staffPairs[$t['person'] . '|' . (int)$t['comp_id']] =
+                array('person' => $t['person'], 'comp_id' => (int)$t['comp_id']);
+        }
         foreach ($headers as $h) {
             $key  = $h['person'] . '|' . (int)$h['comp_id'];
             $pair = array('person' => $h['person'], 'comp_id' => (int)$h['comp_id']);
@@ -858,6 +1090,7 @@ class JobSpecWriteService
             $pKey = $h['person'] . '|' . (int)$h['comp_id'];
             $sKey = $h['submitted_by'] . '|' . (int)$h['submitted_by_comp_id'];
             $out[] = array(
+                'source'               => 'version',
                 'version_id'           => (int)$h['id'],
                 'person'               => $h['person'],
                 'comp_id'              => (int)$h['comp_id'],
@@ -868,6 +1101,22 @@ class JobSpecWriteService
                 'submitted_by_name'    => isset($names[$sKey]) ? $names[$sKey] : $h['submitted_by'],
                 'submitted_at'         => $h['submitted_at'],
                 'job_specs'            => $this->withAppTitles($this->ver->versionItems($h['id'])),
+            );
+        }
+        foreach ($capability as $t) {
+            $pKey = $t['person'] . '|' . (int)$t['comp_id'];
+            $out[] = array(
+                'source'               => 'capability',
+                'version_id'           => null,
+                'person'               => $t['person'],
+                'comp_id'              => (int)$t['comp_id'],
+                'is_gw'                => 0,
+                'person_name'          => isset($names[$pKey]) ? $names[$pKey] : $t['person'],
+                'submitted_by'         => null,
+                'submitted_by_comp_id' => null,
+                'submitted_by_name'    => null,
+                'submitted_at'         => null,
+                'job_specs'            => $t['job_specs'],
             );
         }
         return $out;
@@ -937,6 +1186,9 @@ function errorStatus($code)
         'NOT_A_DIRECT_SUPERIOR'     => array('Only a current direct superior can review this', 403),
         'SUBMITTER_CANNOT_REVIEW_OWN' => array('The submitter cannot review their own version', 403),
         'VERSION_NOT_PENDING'       => array('This version is no longer pending', 409),
+        'CAPABILITY_ALREADY_VERSIONED' => array('This staff already has a job spec version — refresh the list', 409),
+        'NO_CAPABILITY_LIST'        => array('This staff has no capability list to approve', 404),
+        'CAPABILITY_UNAVAILABLE'    => array('Could not read the capability list right now — try again', 502),
     );
     if (isset($map[$code])) {
         return $map[$code];
@@ -984,6 +1236,18 @@ try {
         $result = $svc->review($versionId, $action, $rP, $rC, $note);
         respond(array('success' => true) + $result);
     }
+
+    if ($action === 'approve_capability') {
+        $person = input('person');
+        $comp   = input(array('comp_id', 'comid'));
+        $rP     = input(array('reviewer', 'reviewed_by'));
+        $rC     = input(array('reviewer_comp_id', 'reviewed_by_comp_id'));
+        if ($person === null || $comp === null || $rP === null || $rC === null) {
+            respond(array('success' => false, 'message' => 'person, comp_id, reviewer, reviewer_comp_id are required'), 400);
+        }
+        $result = $svc->approveCapability($person, $comp, $rP, $rC);
+        respond(array('success' => true) + $result);
+    }
  
     if ($action === 'pending') {
         $bP = input(array('boss', 'person'));
@@ -991,7 +1255,10 @@ try {
         if ($bP === null || $bC === null) {
             respond(array('success' => false, 'message' => 'boss and boss_comp_id are required'), 400);
         }
-        respond(array('success' => true, 'pending' => $svc->pendingForSuperior($bP, $bC)));
+        // Opt-in: app builds released before approve_capability cannot action a
+        // card with no version_id, so they keep getting versions only.
+        $withCapability = (int)input('include_capability') === 1;
+        respond(array('success' => true, 'pending' => $svc->pendingForSuperior($bP, $bC, $withCapability)));
     }
  
     if ($action === 'latest_approved') {
