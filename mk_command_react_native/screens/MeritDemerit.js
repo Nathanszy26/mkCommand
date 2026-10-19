@@ -113,13 +113,13 @@ const Summary = ({ records }) => {
     );
 };
 
-const RecordCard = ({ record, index }) => {
+const RecordCard = ({ record, index, onPress }) => {
     const demerit = isDemerit(record.merit_demerit);
     const tone = demerit ? C.danger : C.success;
     const toneSoft = demerit ? C.dangerSoft : C.successSoft;
     const sign = demerit ? '\u2212' : '+'; // − / +
     return (
-        <View style={styles.card}>
+        <TouchableOpacity style={styles.card} activeOpacity={0.75} onPress={onPress}>
             <View style={[styles.accent, { backgroundColor: tone }]} />
             <View style={styles.cardBody}>
                 <View style={styles.cardTop}>
@@ -154,7 +154,63 @@ const RecordCard = ({ record, index }) => {
                     )}
                 </View>
             </View>
-        </View>
+        </TouchableOpacity>
+    );
+};
+
+/* --- detail ---------------------------------------------------------------- */
+
+const DetailRow = ({ label, value, last }) => (
+    <View style={[styles.detailRow, last && styles.detailRowLast]}>
+        <Text style={styles.detailLabel}>{label}</Text>
+        <Text style={styles.detailValue}>{value || '—'}</Text>
+    </View>
+);
+
+/**
+ * One record in full. Everything shown here is already in the list payload,
+ * so this opens instantly and never fetches - which is what lets a push open
+ * straight onto it.
+ */
+const RecordDetail = ({ record, onClose }) => {
+    const demerit = isDemerit(record.merit_demerit);
+    const tone = demerit ? C.danger : C.success;
+    const toneSoft = demerit ? C.dangerSoft : C.successSoft;
+    const sign = demerit ? '−' : '+';
+
+    return (
+        <Modal visible animationType="slide" onRequestClose={onClose}>
+            <View style={styles.detailScreen}>
+                <View style={styles.detailHeader}>
+                    <TouchableOpacity
+                        onPress={onClose}
+                        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                    >
+                        <Text style={styles.detailClose}>Close</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.detailTitle}>{demerit ? 'Demerit' : 'Merit'}</Text>
+                    <View style={{ width: 46 }} />
+                </View>
+
+                <ScrollView contentContainerStyle={styles.detailBody}>
+                    <View style={[styles.detailHero, { backgroundColor: toneSoft }]}>
+                        <Text style={[styles.detailPoints, { color: tone }]}>
+                            {sign}{record.points || '0'}
+                        </Text>
+                        <Text style={styles.detailPointsLabel}>POINTS</Text>
+                    </View>
+
+                    <Text style={styles.detailHeading}>{record.title || '(Untitled)'}</Text>
+
+                    <View style={styles.detailCard}>
+                        <DetailRow label="Type" value={demerit ? 'Demerit' : 'Merit'} />
+                        <DetailRow label="Date" value={fmtDate(record.date)} />
+                        <DetailRow label="Staff" value={titleCase(record.staff_name)} />
+                        <DetailRow label="Ref." value={record.ref} last />
+                    </View>
+                </ScrollView>
+            </View>
+        </Modal>
     );
 };
 
@@ -201,11 +257,32 @@ export default class MeritDemerit extends Component {
             years: buildYears([]),
             year: String(new Date().getFullYear()), // defaults to current year, like index.php
             pickerOpen: false,
+            openRecordId: null,  // null => detail closed
+            pendingRecordId: null, // a push's record, waiting for its year to load
         };
     }
 
     componentDidMount() {
         this.init();
+    }
+
+    /**
+     * A second push while the screen is already mounted. The tab navigator
+     * keeps this screen alive behind the bar, so a tap arrives as new route
+     * params rather than a fresh mount; openedAt is what tells one tap from
+     * the next, including two taps on the same record.
+     */
+    componentDidUpdate(prevProps) {
+        const before = (prevProps.route && prevProps.route.params) || {};
+        const after = this.routeParams();
+
+        if (after.openedAt && after.openedAt !== before.openedAt) {
+            this.openFromRoute();
+        }
+    }
+
+    routeParams() {
+        return (this.props.route && this.props.route.params) || {};
     }
 
     init = async () => {
@@ -215,7 +292,19 @@ export default class MeritDemerit extends Component {
             if (!u || !u.person || !comp) {
                 throw new Error('Missing user session. Please log in again.');
             }
-            this.setState({ user: { person: u.person, compId: comp } }, () => this.load());
+
+            // Opened by a push: the record's own year comes with it, because
+            // this list is year-filtered and opens on the current one -- a
+            // demerit dated last December would otherwise land on a list that
+            // cannot contain it.
+            const params = this.routeParams();
+            const wanted = parseInt(params.recordId, 10) || null;
+
+            this.setState({
+                user: { person: u.person, compId: comp },
+                pendingRecordId: wanted,
+                year: params.year ? String(params.year) : this.state.year,
+            }, () => this.load());
         } catch (e) {
             this.setState({ loading: false, error: e.message });
         }
@@ -230,9 +319,51 @@ export default class MeritDemerit extends Component {
                 years: buildYears(records, prev.years),
                 loading: false,
                 refreshing: false,
-            }));
+            }), this.resolvePending);
         } catch (e) {
             this.setState({ loading: false, refreshing: false, error: e.message });
+        }
+    };
+
+    /**
+     * Command: honour a push once the records it asked for have arrived.
+     *
+     * The id is cleared whether or not it was found. A record that is not in
+     * the loaded year is one this person cannot be shown, and retrying on the
+     * next refresh would reopen the modal under someone who had closed it.
+     */
+    resolvePending = () => {
+        const wanted = this.state.pendingRecordId;
+        if (!wanted) {
+            return;
+        }
+        if (!this.openRecord(wanted)) {
+            this.setState({ pendingRecordId: null });
+        }
+    };
+
+    /** Open one record by id. False when the loaded list does not hold it. */
+    openRecord = (id) => {
+        const found = this.state.records.filter((r) => String(r.id) === String(id))[0];
+        if (!found) {
+            return false;
+        }
+        this.setState({ openRecordId: found.id, pendingRecordId: null });
+        return true;
+    };
+
+    /** Command: open whatever the current route params name, reloading if needed. */
+    openFromRoute = () => {
+        const params = this.routeParams();
+        const wanted = parseInt(params.recordId, 10);
+        if (!wanted) {
+            return;
+        }
+
+        const year = params.year ? String(params.year) : this.state.year;
+
+        if (year !== this.state.year || !this.openRecord(wanted)) {
+            this.setState({ pendingRecordId: wanted, year }, () => this.load());
         }
     };
 
@@ -244,7 +375,8 @@ export default class MeritDemerit extends Component {
     };
 
     render() {
-        const { loading, error, refreshing, records, year, years, pickerOpen } = this.state;
+        const { loading, error, refreshing, records, year, years, pickerOpen, openRecordId } = this.state;
+        const open = records.filter((r) => String(r.id) === String(openRecordId))[0];
 
         if (loading && !refreshing && records.length === 0 && !error) {
             return (
@@ -301,7 +433,12 @@ export default class MeritDemerit extends Component {
                         <>
                             <Summary records={records} />
                             {records.map((r, i) => (
-                                <RecordCard key={r.id || i} record={r} index={i + 1} />
+                                <RecordCard
+                                    key={r.id || i}
+                                    record={r}
+                                    index={i + 1}
+                                    onPress={() => this.setState({ openRecordId: r.id })}
+                                />
                             ))}
                         </>
                     )}
@@ -314,6 +451,13 @@ export default class MeritDemerit extends Component {
                     onSelect={this.selectYear}
                     onClose={() => this.setState({ pickerOpen: false })}
                 />
+
+                {open && (
+                    <RecordDetail
+                        record={open}
+                        onClose={() => this.setState({ openRecordId: null })}
+                    />
+                )}
             </View>
         );
     }
@@ -431,4 +575,62 @@ const styles = StyleSheet.create({
     sheetItemText: { fontSize: 16, color: C.text },
     sheetItemTextOn: { color: C.primary, fontWeight: '700' },
     sheetCheck: { fontSize: 16, color: C.primary, fontWeight: '800' },
+
+    /* detail -- deliberately the same header, close affordance and card
+       proportions as Memo's detail sheet, so the two tabs do not feel like
+       two different applications when a push drops you into one of them. */
+    detailScreen: { flex: 1, backgroundColor: C.bg },
+    detailHeader: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        paddingHorizontal: 16,
+        paddingVertical: 14,
+        backgroundColor: C.surface,
+        borderBottomWidth: 1,
+        borderBottomColor: C.border,
+    },
+    detailClose: { fontSize: 15, color: C.primary, fontWeight: '600', width: 46 },
+    detailTitle: { fontSize: 16, fontWeight: '700', color: C.text },
+    detailBody: { padding: 16, paddingBottom: 40 },
+    detailHero: {
+        alignItems: 'center',
+        paddingVertical: 22,
+        borderRadius: 14,
+        marginBottom: 18,
+    },
+    detailPoints: { fontSize: 40, fontWeight: '800', letterSpacing: -1 },
+    detailPointsLabel: {
+        fontSize: 11,
+        fontWeight: '700',
+        color: C.muted,
+        letterSpacing: 1,
+        marginTop: 2,
+    },
+    detailHeading: {
+        fontSize: 18,
+        fontWeight: '700',
+        color: C.text,
+        lineHeight: 25,
+        marginBottom: 14,
+    },
+    detailCard: {
+        backgroundColor: C.surface,
+        borderRadius: 14,
+        paddingHorizontal: 16,
+        paddingVertical: 4,
+        borderWidth: 1,
+        borderColor: C.border,
+        ...CARD_SHADOW,
+    },
+    detailRow: {
+        flexDirection: 'row',
+        alignItems: 'flex-start',
+        paddingVertical: 12,
+        borderBottomWidth: 1,
+        borderBottomColor: C.border,
+    },
+    detailRowLast: { borderBottomWidth: 0 },
+    detailLabel: { width: 76, fontSize: 12, color: C.muted, fontWeight: '600', paddingTop: 1 },
+    detailValue: { flex: 1, fontSize: 14, color: C.text, fontWeight: '600' },
 });

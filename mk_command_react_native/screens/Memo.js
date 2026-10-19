@@ -301,6 +301,25 @@ export default class Memo extends Component {
         this.init();
     }
 
+    /**
+     * A push arriving while the screen is already mounted. The tab navigator
+     * keeps this screen alive behind the bar, so a tap comes in as new route
+     * params rather than a fresh mount; openedAt is what tells one tap from
+     * the next, including two taps on the same memo.
+     */
+    componentDidUpdate(prevProps) {
+        const before = (prevProps.route && prevProps.route.params) || {};
+        const after = this.routeParams();
+
+        if (after.openedAt && after.openedAt !== before.openedAt) {
+            this.openFromRoute();
+        }
+    }
+
+    routeParams() {
+        return (this.props.route && this.props.route.params) || {};
+    }
+
     /** Command: resolve the stored session, then load memos. */
     init = async () => {
         try {
@@ -309,9 +328,23 @@ export default class Memo extends Component {
             if (!u || !u.person || !comp) {
                 throw new Error('Missing user session. Please log in again.');
             }
-            this.setState({ user: { person: u.person, compId: comp } }, () => this.load());
+            this.setState({ user: { person: u.person, compId: comp } }, () => {
+                this.load();
+                // Opened by a push. The detail sheet fetches the memo by id on
+                // its own, so it does not wait for the list -- but it does need
+                // the session, which is why this sits in the callback.
+                this.openFromRoute();
+            });
         } catch (e) {
             this.setState({ loading: false, error: e.message });
+        }
+    };
+
+    /** Command: open the memo the route names, if it names one. */
+    openFromRoute = () => {
+        const memoId = parseInt(this.routeParams().memoId, 10);
+        if (memoId && this.state.user) {
+            this.setState({ openMemoId: memoId });
         }
     };
 
@@ -344,6 +377,32 @@ export default class Memo extends Component {
         );
     }
 
+    /**
+     * The open memo, or nothing.
+     *
+     * Rendered from all three branches below rather than only from the list,
+     * because a memo opened by a push must appear whatever the list behind it
+     * is doing. The sheet fetches the memo by id itself, so it does not need
+     * the list to have arrived -- and if the list failed, one unreachable
+     * memo is still better than an error page where the memo should be.
+     */
+    renderDetail() {
+        if (this.state.openMemoId === null) {
+            return null;
+        }
+
+        const me = this.state.meName || (this.state.user && this.state.user.fullname) || '';
+
+        return (
+            <MemoDetail
+                user={this.state.user}
+                memoId={this.state.openMemoId}
+                me={me}
+                onClose={() => this.setState({ openMemoId: null })}
+            />
+        );
+    }
+
     render() {
         const { loading, error, refreshing } = this.state;
 
@@ -351,6 +410,7 @@ export default class Memo extends Component {
             return (
                 <View style={styles.center}>
                     <ActivityIndicator size="large" color={C.primary} />
+                    {this.renderDetail()}
                 </View>
             );
         }
@@ -362,6 +422,7 @@ export default class Memo extends Component {
                     <TouchableOpacity style={styles.retryBtn} onPress={() => this.load()}>
                         <Text style={styles.retryText}>Retry</Text>
                     </TouchableOpacity>
+                    {this.renderDetail()}
                 </View>
             );
         }
@@ -412,14 +473,7 @@ export default class Memo extends Component {
                     ))
                 )}
 
-                {this.state.openMemoId !== null && (
-                    <MemoDetail
-                        user={this.state.user}
-                        memoId={this.state.openMemoId}
-                        me={me}
-                        onClose={() => this.setState({ openMemoId: null })}
-                    />
-                )}
+                {this.renderDetail()}
             </ScrollView>
         );
     }

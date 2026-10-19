@@ -384,6 +384,28 @@ if ($runScript == "Submit Staff Memo") {
     $mirror = StaffMemo_Mirror($new_staff_memo_id);
     StaffMemo_MirrorLog($db_globportal, $new_staff_memo_id, $mirror);
 
+    /* --- tell the recipients ------------------------------------------
+     *
+     * Push and email for everybody the memo is addressed to or copied to,
+     * resolved from staff_memo_receivers - the same rule the app's Memo
+     * list uses to decide who may see it, so nobody is emailed a memo they
+     * cannot open and nobody on it is left out.
+     *
+     * Shared with the app's own issue endpoint rather than rewritten here:
+     * mkPortal/mkCommand/staffNotify.php owns the recipient rule, the
+     * wording and the sending. It opens its own PDO connection, so it does
+     * not care that this page speaks mysql_*.
+     *
+     * LAST, and after the mirror, for the same reason the mirror is last:
+     * the notification tells people to open the memo in the app, so the app
+     * inbox and the attachments have to be in place before it goes out.
+     * Nothing is actually sent inside this request - the recipients are
+     * queued and a background drain delivers them - so an all-staff memo
+     * costs this page two queries, not seven hundred emails.
+     * ------------------------------------------------------------------ */
+    require_once($_SERVER['DOCUMENT_ROOT'] . "/accounts/mkPortal/mkCommand/staffNotify.php");
+    staff_notify_memo($new_staff_memo_id);
+
     echo "<script type='text/javascript'>";
     // echo "alert('Staff Memo Uploaded!" . StaffMemo_MirrorNotice($mirror) . "');";
     echo "alert('Staff Memo Uploaded!');";

@@ -49,6 +49,13 @@ define('MK_ISSUE_DEBUG_ERRORS', true);
  */
 define('MK_ISSUE_SHOW_MIRROR_NOTICE', false);
 
+/**
+ * Push + email for whoever the record concerns. Shared with the two web
+ * upload pages, so a memo issued from a phone and a memo issued from the
+ * staff portal notify the same people in the same words.
+ */
+require_once __DIR__ . '/staffNotify.php';
+
 class DatabaseConfig
 {
     const HOST     = "localhost";
@@ -1023,10 +1030,16 @@ try {
         $mirror    = MemoMirrorClient::post($memoId);
         $logFailed = (new MemoMirrorLog($db))->record($memoId, $mirror);
 
+        // Push + email, queued AFTER the mirror: the notification tells people
+        // to open the memo in the app, so the app inbox has to have it first.
+        // Queueing only -- see staffNotify.php for why nothing is sent here.
+        $notify = staff_notify_memo($memoId);
+
         $response = array(
             'success'     => true,
             'id'          => $memoId,
             'recipients'  => count($toIds),
+            'notified'    => $notify['recipients'],
             'attachments' => array(
                 'saved'  => $attached['saved'],
                 'errors' => array_merge($posted['errors'], $attached['errors']),
@@ -1100,9 +1113,13 @@ try {
         $posted   = AttachmentStore::posted();
         $attached = AttachmentStore::forPerformance($db)->saveAll($recordIds, $posted['files']);
 
+        // One notification per row, which is one per recipient. Queued only.
+        $notify = staff_notify_performance($recordIds);
+
         respond(array(
             'success'     => true,
             'created'     => count($recordIds),
+            'notified'    => $notify['recipients'],
             'attachments' => array(
                 'saved'  => $attached['saved'],
                 'errors' => array_merge($posted['errors'], $attached['errors']),

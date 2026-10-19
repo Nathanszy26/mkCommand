@@ -106,7 +106,23 @@
 					StaffPerformance_AttachmentAdd($db_globportal, "attachment_" . $i, $new_staff_performance_id);
 				}
 			}
-			
+
+			/* --- tell the staff member ------------------------------------
+			 *
+			 * A push and an email to the one person the record is about.
+			 * Shared with the app's own issue endpoint rather than rewritten
+			 * here: mkPortal/mkCommand/staffNotify.php owns the wording and
+			 * the sending, so a demerit issued from a phone and one issued
+			 * from this page read identically.
+			 *
+			 * After the attachments, and never before the insert: the record
+			 * is already committed by this point, so a mail server that is
+			 * refusing connections cannot cost anybody the record they just
+			 * wrote. Nothing is sent inside this request - see staffNotify.php.
+			 * -------------------------------------------------------------- */
+			require_once($_SERVER['DOCUMENT_ROOT'] . "/accounts/mkPortal/mkCommand/staffNotify.php");
+			staff_notify_performance(array($new_staff_performance_id));
+
 			echo "<script type='text/javascript'>";
 			echo "alert('Staff Performance Uploaded!');";
 			echo "window.location = 'staff_performance_listing.php';";
