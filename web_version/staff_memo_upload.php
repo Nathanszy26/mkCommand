@@ -521,7 +521,7 @@ if ($runScript == "Submit Staff Memo") {
                       <label class="control-label col-md-3 col-sm-3 col-xs-12" for="staff_memo_date">Date <span class="required">*</span>
                       </label>
                       <div class="col-md-6 col-sm-6 col-xs-12">
-                        <input id="staff_memo_date" name="staff_memo_date" type="text" required="required" class="form-control col-md-7 col-xs-12"> (DD/MM/YYYY)
+                        <input id="staff_memo_date" name="staff_memo_date" type="text" required="required" class="form-control col-md-7 col-xs-12"> (YYYY/MM/DD)
                       </div>
                     </div>
 
