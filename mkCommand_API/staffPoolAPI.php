@@ -64,10 +64,19 @@ header('Content-Type: application/json; charset=UTF-8');
  *     filters{}, counts{}, caller{} }
  *
  * Each person in both lists:
- *   comp_id, company_name, person, fullname, email, mobile_no, position,
- *   department, staff_type, total_staff, kpi_scorecard_exempted,
- *   mk_command_exempted, mk_academy_exempted
+ *   mk_id, comp_id, company_name, person, fullname, email, mobile_no,
+ *   position, department, district, staff_type, total_staff,
+ *   kpi_scorecard_exempted, mk_command_exempted, mk_academy_exempted
  * — see publicRow() in staffPoolCore.php, which defines that shape.
+ *
+ *   mk_id is the ACCOUNT id behind the person, for an application that wants
+ *   to join this listing to its own records: staff_portal2.users.id for a
+ *   staff row, and for a GW -- who has no users row of their own --
+ *   mkmembers.member_registrations.id matched on mobile, falling back to
+ *   their GW login account, exactly as the email beside it is matched. It is
+ *   null when a GW matched nothing, or matched more than one live account:
+ *   the pool never guesses between two people. person + comp_id remains the
+ *   identity this pool is keyed by; mk_id is a convenience, not a key.
  *
  * THE SUMMARY IS THE WHOLE COMPANY, the lists are what you filtered.
  *   This is the report's own behaviour: its tiles are a head count and do not

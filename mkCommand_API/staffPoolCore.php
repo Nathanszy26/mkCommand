@@ -319,7 +319,8 @@ class StaffPoolRepository
      *  whose people are stored under Globinaco. */
     private function staffSelect($compExpr)
     {
-        return "SELECT u.person,
+        return "SELECT u.id AS mk_id,
+                       u.person,
                        {$compExpr} AS comp_id,
                        u.fullname,
                        u.department,
@@ -420,7 +421,8 @@ class StaffPoolRepository
          * is the safe direction for an exemption. All 17 groups currently
          * agree on name, district and every flag — only boss_id differs — so
          * this changes the count, not anybody's values. */
-        $sql = "SELECT g.monthly_assign_gw_code            AS person,
+        $sql = "SELECT NULL AS mk_id,
+                       g.monthly_assign_gw_code            AS person,
                        g.comp_id,
                        MAX(g.monthly_assign_gw_fullname)   AS fullname,
                        '' AS department,
@@ -486,7 +488,7 @@ class StaffPoolRepository
      *  Non-fatal on purpose: a failure here leaves the GW without an address
      *  and the head count still right, exactly as assigngw.php drops its
      *  badges rather than its page. */
-    public function gwEmails(array $mobiles)
+    public function gwAccounts(array $mobiles)
     {
         $want = array();
         foreach ($mobiles as $m) {
@@ -507,15 +509,23 @@ class StaffPoolRepository
             foreach (array_chunk($pending, 400) as $chunk) {
                 foreach ($this->emailsByPhone(
                     "SELECT m.phone_no AS k, COUNT(*) AS cnt,
-                            MAX(TRIM(IFNULL(m.email, ''))) AS email
+                            MAX(TRIM(IFNULL(m.email, ''))) AS email,
+                            MAX(m.id) AS mk_id
                        FROM mkmembers.member_registrations m
                       WHERE m.deleted = 0 AND m.phone_no IN (%s)
                       GROUP BY m.phone_no",
                     $chunk
                 ) as $k => $row) {
                     $seen[$k] = true;                     // matched, ambiguous or not
-                    if ($row['cnt'] === 1 && $row['email'] !== '') {
-                        $found[$k] = $row['email'];
+                    /* The AMBIGUITY rule decides the whole match, not the
+                     * address: one live row means we know which person this
+                     * is, so the id is theirs even when they left the email
+                     * blank. An empty address stays empty. */
+                    if ($row['cnt'] === 1) {
+                        $found[$k] = array(
+                            'email' => $row['email'],
+                            'mk_id' => $row['mk_id'],
+                        );
                     }
                 }
             }
@@ -527,22 +537,41 @@ class StaffPoolRepository
             foreach (array_chunk($leftover, 400) as $chunk) {
                 foreach ($this->emailsByPhone(
                     "SELECT u.mobile_no AS k, COUNT(*) AS cnt,
-                            MAX(TRIM(IFNULL(u.email, ''))) AS email
+                            MAX(TRIM(IFNULL(u.email, ''))) AS email,
+                            MAX(u.id) AS mk_id
                        FROM staff_portal2.users u
                       WHERE u.status = '1' AND u.is_gw = '1'
                         AND u.mobile_no IN (%s)
                       GROUP BY u.mobile_no",
                     $chunk
                 ) as $k => $row) {
-                    if ($row['cnt'] === 1 && $row['email'] !== '') {
-                        $found[$k] = $row['email'];
+                    if ($row['cnt'] === 1) {
+                        $found[$k] = array(
+                            'email' => $row['email'],
+                            'mk_id' => $row['mk_id'],
+                        );
                     }
                 }
             }
         } catch (Exception $e) {
-            error_log('staffPoolCore gwEmails: ' . $e->getMessage());
+            error_log('staffPoolCore gwAccounts: ' . $e->getMessage());
         }
         return $found;
+    }
+
+    /** Query: the address alone, as mobile => email. gwAccounts() without the
+     *  id, so the two passes and the ambiguity rule are still written once.
+     *  An unmatched mobile, or one whose match has no address, is absent —
+     *  which is the shape this returned before mk_id existed. */
+    public function gwEmails(array $mobiles)
+    {
+        $out = array();
+        foreach ($this->gwAccounts($mobiles) as $k => $a) {
+            if ($a['email'] !== '') {
+                $out[$k] = $a['email'];
+            }
+        }
+        return $out;
     }
 
     /** Query: one chunk of the lookup above. %s in $sqlTemplate is where the
@@ -562,14 +591,16 @@ class StaffPoolRepository
             $out[(string)$r['k']] = array(
                 'cnt'   => (int)$r['cnt'],
                 'email' => (string)$r['email'],
+                'mk_id' => ($r['mk_id'] === null || $r['mk_id'] === '')
+                    ? null : (int)$r['mk_id'],
             );
         }
         return $out;
     }
 
-    /** Command: fill in the email of every GW row in $rows, in place of the
-     *  empty string gw() selects. Staff rows already carry users.email and are
-     *  left exactly as they are.
+    /** Command: fill in the email AND mk_id of every GW row in $rows, in place
+     *  of the placeholders gw() selects. Staff rows already carry users.email
+     *  and users.id and are left exactly as they are.
      *
      *  One batched lookup for the whole set, never one per row — the API hands
      *  it a company at a time, which is up to ~700 mobiles. */
@@ -585,12 +616,15 @@ class StaffPoolRepository
             return $rows;
         }
 
-        $byMobile = $this->gwEmails($mobiles);
+        $byMobile = $this->gwAccounts($mobiles);
         foreach ($rows as &$r) {
             if ($r['person_type'] !== 'gw') { continue; }
             $m = trim((string)$r['mobile_no']);
             if ($m !== '' && isset($byMobile[$m])) {
-                $r['email'] = $byMobile[$m];
+                if ($byMobile[$m]['email'] !== '') {
+                    $r['email'] = $byMobile[$m]['email'];
+                }
+                $r['mk_id'] = $byMobile[$m]['mk_id'];
             }
         }
         unset($r);
@@ -616,6 +650,12 @@ class StaffPoolRepository
              * downstream has to ask which population it is holding. */
             $r['department']      = trim((string)$r['department']);
             $r['district']        = trim((string)$r['district']);
+            /* users.id for a staff row; for a GW it is still the placeholder
+             * here and withGwEmails() fills it from the myMK registration (or
+             * their own GW login) afterwards. null means no account was
+             * matched -- a real answer, not a missing one. */
+            $r['mk_id']           = (isset($r['mk_id']) && $r['mk_id'] !== null && $r['mk_id'] !== '')
+                ? (int)$r['mk_id'] : null;
             $r['base_in_pool']    = 1;
             $r['base_kpi']        = (int)$r['base_kpi'];
             $r['base_mk_command'] = (int)$r['base_mk_command'];
@@ -1090,6 +1130,7 @@ function publicRow(array $row, array $overrides, array $compNames = array())
     $compId = (int)$row['comp_id'];
 
     return array(
+        'mk_id'                  => isset($row['mk_id']) ? $row['mk_id'] : null,
         'comp_id'                => $compId,
         'company_name'           => isset($compNames[$compId])
             ? $compNames[$compId]
