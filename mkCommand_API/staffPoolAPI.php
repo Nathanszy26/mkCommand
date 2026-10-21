@@ -55,13 +55,118 @@ header('Content-Type: application/json; charset=UTF-8');
  *   excluded    0|1     include the excluded_staff list      (default 1)
  *   summary_only 0|1    the figures alone, no lists          (default 0)
  *
+ *   -- the reporting line, and it is NOT asked for unless you ask --
+ *   staff_tree  all     the company's managers and their people, as TWO
+ *                       SECTIONS. comp_id=1 only for now:
+ *
+ *                         staffPoolAPI.php?comp_id=1&staff_tree=all
+ *
+ *   staff_tree_individual  one person's branch: THEMSELVES and everybody
+ *               string     under them, at every level, and nothing above:
+ *
+ *                         staffPoolAPI.php?comp_id=1&staff_tree_individual=rinob
+ *
+ *                       `specific_staff` is accepted as the same parameter.
+ *                       Given both, the individual wins — it is the more
+ *                       specific question.
+ *
+ *                       EITHER ONE CHANGES THE WHOLE ANSWER. A tree request
+ *                       is a different question from a pool listing, so it is
+ *                       answered on its own: staff[] and excluded_staff[] are
+ *                       NOT sent — the tree already holds those people — and
+ *                       neither are filters{}, counts{} or caller{}. See OUT
+ *                       below for exactly what comes back.
+ *
+ *                       Leave them off and this endpoint behaves exactly as
+ *                       it did before the tree existed, down to the last
+ *                       field. q, dept and staff_type do not touch a tree.
+ *
  * OUT:
  *   { success, comp_id, company_name, generated_at,
  *     staff[],            everyone in the pool
  *     excluded_staff[],   everyone an override has taken OUT of the pool
  *     summary{},          company_total_*, over the WHOLE company
  *     by_company[],       per-company summaries, when comp_id is every company
+ *     staff_tree{},       the reporting line, when it was asked for
  *     filters{}, counts{}, caller{} }
+ *
+ * THE TREE (staffPoolTree.php owns all of it — read that file for the rules)
+ *
+ *   staff_tree=all answers TWO FLAT LISTS of managers — no nesting anywhere
+ *     { success, comp_id, company_name, generated_at, summary{},
+ *       staff_tree { mode:"all", counts{}, hod[], am[], vacant[] } }
+ *
+ *     hod[]   one entry per DEPARTMENT        — Globinaco has 16
+ *     am[]    one entry per sub-department    — Globinaco has 18
+ *     vacant[] departments that are live but whose head is not in the pool
+ *
+ *     An entry is department_id and department_name, then that manager's
+ *     staff[] row, then two numbers — and NO subordinates[]. Nobody's people
+ *     are listed here. To open one org, ask for it:
+ *     staff_tree_individual=<that person>.
+ *
+ *       direct_subordinates   how many report straight to them
+ *       total_subordinates    how many are under them at any depth
+ *
+ *     Both are read off the chart, so they are the REAL org size and not a
+ *     count of anything in this answer. jeffrey's entry says 657 even though
+ *     asking for him individually returns 13 — see the cap below.
+ *
+ *     An entry is one DEPARTMENT, not one person: mackaylachu heads both
+ *     Accounts and Procurement & Inventory, so he is two entries with the
+ *     same person and different units — 16 departments cannot print as 15
+ *     rows. counts.managers is how many distinct people the two lists name.
+ *     The chief executive is deliberately not in either list.
+ *
+ *   staff_tree_individual=x answers
+ *     { success, comp_id, company_name, generated_at,
+ *       staff_tree { mode:"individual", person, comp_id, company_name,
+ *                    staff_type, counts{}, staff{} } }
+ *
+ *     staff{} is that one person as a node, with everybody under them nested
+ *     inside it. Nothing about the rest of the company comes with it.
+ *
+ *   In BOTH shapes a person is a staff[] row — the same publicRow() shape, the
+ *   same values — with this added on top of it:
+ *
+ *     hod_department_name   NEW. Every department this person heads, comma
+ *                           separated, from department_head; '' for everybody
+ *                           else. On tree nodes only: staff[] is untouched.
+ *     direct_subordinates   see each shape above / below
+ *     total_subordinates    see each shape above / below
+ *
+ *   A NODE in the nested shape carries three more:
+ *
+ *     level                 0 at the root of this answer
+ *     also_reports_to[]     their other live superiors. The chart is not a
+ *                           tree — 16 of Globinaco's GW are assigned under two
+ *                           people, and 82 across the group — so inside any
+ *                           ONE tree each is drawn once, on their shortest
+ *                           line down from that tree's own top, and the
+ *                           superiors that did not get them are named here.
+ *                           At the top of a tree it is everybody above them,
+ *                           which is what that tree leaves out.
+ *     subordinates[]        the nested nodes
+ *
+ *   On a NODE the two counts describe WHAT IS IN THIS ANSWER, so they add up
+ *   to the arrays you are holding. On a flat hod[]/am[] entry there is no
+ *   array to add up and they are the real org size instead. The two therefore
+ *   disagree wherever a tree was capped, and that is the one place to be
+ *   careful:
+ *
+ *   ONE TREE IS CAPPED, AND NOTHING IN THE NODE SAYS SO. jeffrey is the top of
+ *   what this endpoint draws, so his tree is the whole company; it is cut to
+ *   his direct reports, the department heads. Under HIS tree those heads read
+ *   0 subordinates — indistinguishable from somebody who really has none.
+ *
+ *   hod[] still reports their true org size, and staff_tree_individual for any
+ *   of them returns everything below them. So nobody is unreachable; they are
+ *   only not nested under jeffrey. See StaffPoolTree::depthLimits().
+ *
+ *   The tree is the WHOLE company, like the summary and for the same reason:
+ *   q, dept and staff_type do not touch it. Filter out one manager and every
+ *   branch under them is orphaned, which is not a tree anybody can read.
+ *   summary_only=1 does empty the lists, as it empties every other list.
  *
  * Each person in both lists:
  *   mk_id, comp_id, company_name, person, fullname, email, mobile_no,
@@ -516,6 +621,112 @@ try {
         }
     }
 
+    /* ---------- the reporting line, when it was asked for ----------------
+     *
+     * LAST, and additive. Everything above is already built and nothing here
+     * reaches back into it, so a request that does not ask for a tree never
+     * runs a line of this and gets the answer it always got. staffPoolTree.php
+     * is not even loaded.
+     *
+     * The tree is built over $rows — the WHOLE company, unfiltered, the same
+     * set the summary is counted off. Not $shown: a tree with a filter applied
+     * to it is a handful of disconnected people.
+     */
+    $treeAll   = input('staff_tree');
+    $treeOne   = input(array('staff_tree_individual', 'specific_staff'));
+    $wantsTree = ($treeAll !== null) || ($treeOne !== null && $treeOne !== '');
+
+    if ($wantsTree) {
+        $treeFile = __DIR__ . '/staffPoolTree.php';
+        if (!file_exists($treeFile)) {
+            /* Two files go up together. Said plainly, because the alternative
+             * is a fatal error in the log and an empty body on the caller. */
+            fail('The staff tree is not installed on this server yet. Upload '
+               . 'staffPoolTree.php beside staffPoolAPI.php.', 500);
+        }
+        require_once $treeFile;
+
+        /* One company for now. Answering another with two empty sections would
+         * read as "this company has no managers" rather than "this is not
+         * built for it yet" — see StaffPoolTree::supportedComps(). */
+        if (!in_array((int)$compId, StaffPoolTree::supportedComps(), true)) {
+            fail('The staff tree is only built for company '
+               . implode(' and ', StaffPoolTree::supportedComps())
+               . ' at the moment. Pass comp_id=1.', 400);
+        }
+
+        $tree = new StaffPoolTree($pdo, $rows, $overrides, $compNames);
+
+        if ($treeOne !== null && $treeOne !== '') {
+            /* One person. Asking for somebody the pool does not hold is a
+             * mistake worth naming — an empty tree would read as "nobody
+             * reports to them", which is a different answer. */
+            $found = $tree->candidates($treeOne);
+            if (empty($found)) {
+                fail('No such person in the staff pool for this company: '
+                   . $treeOne . '.', 404);
+            }
+            /* Ambiguous only when the same login is live at two companies in
+             * an all-companies request, or when a GW code reads like a
+             * username. Never guessed: comp_id says which. */
+            if (count($found) > 1) {
+                $who = array();
+                foreach ($found as $key) {
+                    $who[] = $tree->describe($key);
+                }
+                fail('More than one person is called ' . $treeOne
+                   . '. Pass comp_id as well: ' . implode('; ', $who) . '.', 409);
+            }
+            $treeOut = $tree->individual($found[0]);
+            /* Asked for ONE person: the answer is that person's tree and
+             * nothing else. A company summary, a head count and a filter block
+             * beside it are about the company, not about them. */
+            $keep = array('success', 'comp_id', 'company_name', 'generated_at');
+        } else {
+            /* 'all' is what the URL says; '' is what an empty staff_tree= in a
+             * hand-typed URL leaves, and both mean the whole company. Anything
+             * else is a typo, and answering the whole company anyway would
+             * hide it. */
+            $mode = strtolower((string)$treeAll);
+            if (!in_array($mode, array('all', '', '1', 'true', 'yes', 'y'), true)) {
+                fail("staff_tree must be 'all'. For one person's branch use "
+                   . 'staff_tree_individual=<person>.');
+            }
+            $treeOut = $tree->sections();
+            /* The whole company: the head count still belongs beside the
+             * sections, the flat listing does not — the sections ARE the
+             * listing, and printing staff[] as well would send the same people
+             * twice in one response. */
+            $keep = array('success', 'comp_id', 'company_name', 'generated_at',
+                          'summary');
+        }
+
+        if ($summaryOnly) {
+            /* "The figures alone, no lists" covers the tree too. counts stay,
+             * so the shape of the answer does not change with the switch. */
+            foreach (array('hod', 'am', 'vacant', 'staff') as $list) {
+                if (isset($treeOut[$list])) {
+                    $treeOut[$list] = array();
+                }
+            }
+        }
+
+        /* Rebuilt rather than unset one key at a time, so what a tree request
+         * answers is one list to read and not a subtraction to work out. */
+        $lean = array();
+        foreach ($keep as $field) {
+            if (isset($payload[$field])) {
+                $lean[$field] = $payload[$field];
+            }
+        }
+        if (isset($payload['notice'])) {
+            $lean['requested_comp_id'] = $payload['requested_comp_id'];
+            $lean['notice']            = $payload['notice'];
+        }
+        $lean['staff_tree'] = $treeOut;
+        $payload = $lean;
+    }
+
     respond($payload);
 } catch (Exception $e) {
     error_log('staffPoolAPI: ' . $e->getMessage());
@@ -524,6 +735,17 @@ try {
     if (strpos($e->getMessage(), 'staff_flag_override') !== false) {
         fail('The override tables are not installed yet. Run '
            . 'mkCommand_API/sql/staff_flag_override.sql on globportal.', 500);
+    }
+    /* The reporting line is read from three tables the pool itself never
+     * touches, so a missing grant on one of them would otherwise be reported
+     * as the pool failing — and the pool is fine. */
+    foreach (array('organization_chart_glob', 'monthly_assign', 'department_head')
+             as $table) {
+        if (strpos($e->getMessage(), $table) !== false) {
+            fail('Could not read the reporting line (' . $table . '). The '
+               . 'staff pool itself is fine — drop staff_tree from the request '
+               . 'to read it. Check the error log.', 500);
+        }
     }
     fail('Could not build the staff pool. Check the error log.', 500);
 }
