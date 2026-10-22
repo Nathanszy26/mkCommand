@@ -713,11 +713,50 @@ function attStaffLeaveDaysBatch($db, $persons, $range)
         catch (PDOException $e) { error_log('HR leave batch lookup failed: ' . $e->getMessage()); }
     }
 
-    // ── Expand each person's intervals to a per-day map (in-memory, no queries) ──
+    return attExpandLeaveIntervals($intervalsByPerson, $range);
+}
+
+/**
+ * Query: turn [ key => [ [fromTs, toTs, type], ... ] ] into
+ * [ key => [ 'Y/m/d' => type ] ] across the range, in memory and with no queries.
+ *
+ * ONE definition, shared by the staff lookup above and the GW lookup below, so a
+ * leave day means the same thing in both reports.
+ *
+ * THE SHORTEST INTERVAL OWNS THE DAY. Overlapping leave is ordinary — one GW
+ * application runs 3 Sep to 3 Nov 2026 over four shorter ones, and a staff LWP
+ * can wrap a one-day EL — so intervals are tried shortest first and the first to
+ * claim a day keeps it. A one-day emergency leave inside a two-month unpaid
+ * stretch is the truthful label for that day.
+ *
+ * Sorting by span rather than trusting the order they arrived in is what makes
+ * that true: an application id says when leave was FILED, nothing about how long
+ * it runs, so a long application filed late would otherwise bury every short one
+ * under it. EQUAL SPANS KEEP ARRIVAL ORDER, which is how
+ * attStaffLeaveDaysBatch() still lets driver_leaves win over HR on a day both
+ * describe identically — it appends driver_leaves first — and how
+ * attGwLeaveDaysBatch()'s newest-first ORDER BY still settles its own ties.
+ * (usort() is not stable on PHP 7.2, hence the explicit position tiebreak.)
+ */
+function attExpandLeaveIntervals($intervalsByKey, $range)
+{
+    $out  = array();
     $from = strtotime($range['from_ymd']);
     $end  = strtotime($range['to_ymd']);
-    foreach ($intervalsByPerson as $person => $intervals)
+    foreach ($intervalsByKey as $key => $intervals)
     {
+        $ordered = array();
+        foreach ($intervals as $pos => $iv) { $ordered[] = array($iv, $pos); }
+        usort($ordered, function ($a, $b)
+        {
+            $spanA = $a[0][1] - $a[0][0];
+            $spanB = $b[0][1] - $b[0][0];
+            if ($spanA != $spanB) { return ($spanA < $spanB) ? -1 : 1; }
+            return $a[1] - $b[1];
+        });
+        $intervals = array();
+        foreach ($ordered as $o) { $intervals[] = $o[0]; }
+
         $days = array();
         $cur  = $from;
         while ($cur <= $end)
@@ -728,7 +767,7 @@ function attStaffLeaveDaysBatch($db, $persons, $range)
             }
             $cur = strtotime('+1 day', $cur);
         }
-        if (count($days) > 0) { $out[$person] = $days; }
+        if (count($days) > 0) { $out[$key] = $days; }
     }
     return $out;
 }
@@ -738,6 +777,108 @@ function attStaffLeaveDays($db, $person, $range)
 {
     $map = attStaffLeaveDaysBatch($db, array($person), $range);
     return isset($map[$person]) ? $map[$person] : array();
+}
+
+/**
+ * Query: an NRIC reduced to nothing but its digits, so '890616-12-6515' and
+ * '890616126515' are the same key.
+ *
+ * THE TWO SIDES STORE IT DIFFERENTLY and that is the whole reason this exists:
+ * hr.leave_application_GW.staff_id carries the dashes, monthly_assign_gw_nric
+ * carries them too but gw_nric does not, and a handful of rows on both sides
+ * have stray spaces or punctuation. Stripping to digits makes one key out of
+ * all of them. '' when there is nothing left to match on.
+ */
+function attNricKey($nric)
+{
+    return preg_replace('/\D+/', '', (string)$nric);
+}
+
+/**
+ * Query (batched): for MANY GWs at once, the days (Y/m/d) each is on leave within
+ * the range, mapped to the leave TYPE for that day — the GW counterpart of
+ * attStaffLeaveDaysBatch(), reading hr.leave_application_GW in ONE query.
+ *
+ * $gwByCode is [ monthly_assign_gw_code => monthly_assign_gw_nric ] and the answer
+ * comes back KEYED ON THE CODE, because the code is what the GW report holds and
+ * what gw_attendance is keyed on. The NRIC is only the join.
+ *
+ * MATCHED ON NRIC, NOT ON A CODE. leave_application_GW has no GW code at all: its
+ * staff_id is the worker's NRIC (gw_nric is the same number without dashes), so
+ * attNricKey() normalises both sides. A GW CARRYING NO NRIC CANNOT BE MATCHED and
+ * is skipped — at Globinaco that is 4 of 367, but at Arus Sawit almost every GW
+ * record has a blank NRIC, so that company gets next to no leave from here until
+ * those records are filled in.
+ *
+ * STATUSES 1, 2 and 4 — NEW, PROCESSING and APPROVED, per hr.leave_status — the
+ * same three attStaffLeaveDaysBatch() counts. 3 is CANCELLED and 5 is REJECTED,
+ * and neither keeps anybody off work.
+ *
+ * Returns: [ gwCode => [ 'Y/m/d' => leaveType, ... ], ... ] (only GWs with leave).
+ */
+function attGwLeaveDaysBatch($gwByCode, $range)
+{
+    if (count($gwByCode) == 0) { return array(); }
+
+    // Normalised NRIC => the GW code(s) carrying it. A LIST, because two codes can
+    // share one NRIC (a worker re-registered under a new code) and the leave belongs
+    // to both of them.
+    $codesByNric = array();
+    foreach ($gwByCode as $code => $nric)
+    {
+        $key = attNricKey($nric);
+        if ($key === '') { continue; }
+        $codesByNric[$key][] = $code;
+    }
+    if (count($codesByNric) == 0) { return array(); }
+
+    $db_hr = attHrDb();
+    if (!($db_hr instanceof PDO)) { return array(); }
+
+    $intervalsByCode = array();
+    try
+    {
+        // date_from / date_to are VARCHARs holding MIXED formats: 26,221 rows are
+        // 'Y-m-d' and 47 are 'Y/m/d', so both are folded to '-' before being
+        // compared as strings. (Two rows are blank or junk and match nothing, which
+        // is the right answer for them.) Filtered by DATE AND STATUS in SQL and by
+        // person in PHP, so one query serves every GW on the report instead of a
+        // 900-value IN list that no index would help anyway.
+        $stmt = $db_hr->prepare(
+            "SELECT staff_id, date_from, date_to, leave_type_id FROM leave_application_GW"
+          . " WHERE REPLACE(date_from,'/','-') <= ? AND REPLACE(date_to,'/','-') >= ?"
+          . " AND leave_status_id IN ('1','2','4')"
+          . " AND (cancel_date IS NULL OR cancel_date = '')"
+          // NEWEST APPLICATION FIRST. attExpandLeaveIntervals() decides overlaps by
+          // SPAN, so this no longer picks the winner — it settles the ties, where two
+          // applications cover a day for the same number of days. Without any ORDER BY
+          // that tie would fall to whatever order the scan happened to return, and the
+          // type shown could change between two identical requests.
+          . " ORDER BY leave_application_id DESC"
+        );
+        $stmt->execute(array($range['to_ymd'], $range['from_ymd']));
+        while ($r = $stmt->fetch(PDO::FETCH_ASSOC))
+        {
+            $key = attNricKey($r['staff_id']);
+            if ($key === '' || !isset($codesByNric[$key])) { continue; }
+            $lf = strtotime(str_replace('/', '-', $r['date_from']));
+            $lt = strtotime(str_replace('/', '-', $r['date_to']));
+            if (!$lf || !$lt) { continue; }
+            foreach ($codesByNric[$key] as $code)
+            {
+                $intervalsByCode[$code][] = array($lf, $lt, (string)$r['leave_type_id']);
+            }
+        }
+    }
+    catch (PDOException $e)
+    {
+        // Same bargain as the holiday calendar: leave is an annotation, so losing it
+        // must not cost the report the attendance it is actually about.
+        error_log('GW leave batch lookup failed: ' . $e->getMessage());
+        return array();
+    }
+
+    return attExpandLeaveIntervals($intervalsByCode, $range);
 }
 
 // ─────────────────────────── CLASSIFY ───────────────────────────

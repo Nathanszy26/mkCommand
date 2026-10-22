@@ -64,7 +64,9 @@
 	{
 		$e_district = mysql_real_escape_string($report_gw_district, $db);
 
-		$queryGW  = "SELECT monthly_assign_gw_id, monthly_assign_gw_code, monthly_assign_gw_fullname, monthly_assign_gw_district";
+		// nric is selected for one reason: leave_application_GW has no GW code and is
+		// matched on the NRIC instead. See attGwLeaveDaysBatch().
+		$queryGW  = "SELECT monthly_assign_gw_id, monthly_assign_gw_code, monthly_assign_gw_fullname, monthly_assign_gw_district, monthly_assign_gw_nric";
 		$queryGW .= " FROM evaluation.monthly_assign_gw";
 		$queryGW .= " WHERE comp_id = '$comp_id'";
 		$queryGW .= attGwActiveSql();
@@ -85,15 +87,26 @@
 			$no ++;
 			$gwData[] = array(
 				'no'       => $no,
+				'code'     => $rowGW['monthly_assign_gw_code'],
 				'name'     => strtoupper($rowGW['monthly_assign_gw_fullname']),
 				'district' => $rowGW['monthly_assign_gw_district'],
+				'nric'     => $rowGW['monthly_assign_gw_nric'],
 				'grid'     => $grid,
 			);
 		}
 
+		// Leave for every GW on the report in ONE query, then attach each one's slice —
+		// instead of a query per head. Keyed on the GW code, matched on the NRIC.
+		$gwByCode = array();
+		foreach ($gwData as $g) { $gwByCode[$g['code']] = $g['nric']; }
+		$leaveByCode = attGwLeaveDaysBatch($gwByCode, $range);
+		foreach ($gwData as $i => $g)
+		{
+			$gwData[$i]['leave'] = isset($leaveByCode[$g['code']]) ? $leaveByCode[$g['code']] : array();
+		}
+
 		$days         = attRangeDays($range);
 		$holidayByDay = attHolidaysByDay($db, $days);
-		$noLeave      = array();   // GWs are not in the staff leave table (gas_usage.driver_leaves)
 
 		if ($range['multi'])
 		{
@@ -107,7 +120,7 @@
 					"<strong>" . htmlspecialchars($g['name']) . "</strong>",
 					htmlspecialchars($g['district']),
 				);
-				attRenderPersonCalendarRows($leading, $g['grid'], $days, $holidayByDay, $noLeave);
+				attRenderPersonCalendarRows($leading, $g['grid'], $days, $holidayByDay, $g['leave']);
 			}
 			echo "</table></div>";
 		}
@@ -133,7 +146,8 @@
 				{
 					$entries = isset($g['grid'][$pCode][$range['from']]) ? $g['grid'][$pCode][$range['from']] : array();
 					$isHol   = !empty($holidayByDay[$range['from']]);
-					renderSingleDayTd($pCode, $entries, $range['from'], $isHol, false);
+					$onLeave = isset($g['leave'][$range['from']]) ? $g['leave'][$range['from']] : '';
+					renderSingleDayTd($pCode, $entries, $range['from'], $isHol, $onLeave);
 				}
 				echo "</tr>";
 			}
