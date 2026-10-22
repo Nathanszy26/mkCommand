@@ -106,6 +106,43 @@ header('Content-Type: application/json; charset=UTF-8');
  *   The same three attendanceReportShared.php counts, so this endpoint and the
  *   attendance reports agree about who was away.
  *
+ * SICK LEAVE RECEIPTS — receipt_date, AND ONLY WHERE ONE ACTUALLY MATCHES.
+ *   hr.medical_claim holds the receipts people claim medical expenses against.
+ *   A receipt is attached to a leave record when ALL FIVE of these hold, and
+ *   receipt_date is '' whenever any of them does not:
+ *
+ *     1. the record is SICK LEAVE — leave_type 'SL' and nothing else. An AL
+ *        or an EL never carries a receipt here even if the person happened to
+ *        claim one that week.
+ *     2. the person is STAFF, never a GW. medical_claim.staff_id is a login
+ *        name (users.person, e.g. 'nadzmar'), and a GW's `person` is a code
+ *        from a different namespace — so a GW code landing on a staff login
+ *        would be a different human being.
+ *     3. medical_claim.staff_id matches that person.
+ *     4. the receipt falls INSIDE the record's own date_from..date_to, which
+ *        is the whole span of the application and not the part clipped to this
+ *        month — a receipt dated 28 Sep belongs to an SL that began on the
+ *        28th, whichever month you asked about.
+ *     5. the receipt date PARSES. See leaveClaimDate().
+ *
+ *   SEVERAL RECEIPTS CAN FALL INSIDE ONE SICK LEAVE, and they are not always
+ *   the same day: one four-day SL in Jan 2026 carries receipts from the 6th
+ *   and the 7th, and one one-day SL carries three receipts all dated that day.
+ *   So there are TWO fields, because one would quietly lose the rest:
+ *     receipt_date   the EARLIEST matching receipt, or '' — the single value
+ *     receipt_dates  every DISTINCT matching receipt date, in order, or []
+ *   receipt_date is always receipt_dates[0] when there is one.
+ *
+ *   NO STATUS FILTER, deliberately. medical_claim.status is 'yes', 'no' or ''
+ *   (117 rows say 'no'), and a receipt_date is a fact about a receipt that
+ *   exists whether or not the claim was ever paid. Filtering on a status this
+ *   endpoint does not publish would hide rows for a reason a caller could not
+ *   see. Say so and it can be added.
+ *
+ *   medical_claim has NO comp_id, only a login name — the same exposure
+ *   hr.leave_application carries, and bounded the same way: this endpoint only
+ *   looks up names the company's own pool handed it.
+ *
  * HALF DAYS ARE REAL. Every one of these tables stores from_apm / to_apm as
  *   'AM' or 'PM'. A record starting PM or ending AM is half a day at that
  *   edge, so `half` on the day says 'am', 'pm' or '' and day_count is 0.5 per
@@ -206,6 +243,10 @@ define('LEAVE_TABLE_HR',     'hr.leave_application');
 define('LEAVE_TABLE_GW',     'hr.leave_application_GW');
 define('LEAVE_TABLE_DRIVER', 'gas_usage.driver_leaves');
 
+/** The receipts behind a sick leave. On HR's host, like the two tables above
+ *  it. See SICK LEAVE RECEIPTS at the top. */
+define('LEAVE_TABLE_CLAIM',  'hr.medical_claim');
+
 /** HR's host. Same host and credentials attHrDb() uses in
  *  attendance/includes/attendanceReportShared.php and attendanceAPI.php reads
  *  the holiday calendar from. The only non-local read in this file. */
@@ -287,6 +328,32 @@ function leaveIsoDate($value)
         return null;
     }
     $iso = str_replace('/', '-', substr($value, 0, 10));
+    $d   = DateTime::createFromFormat('Y-m-d', $iso);
+    return ($d && $d->format('Y-m-d') === $iso) ? $iso : null;
+}
+
+/**
+ * Query: a medical_claim.receipt_date as Y-m-d, or null when it cannot be
+ * placed. Stricter about SHAPE and looser about PADDING than leaveIsoDate(),
+ * because this one column is messier than the three leave tables:
+ *
+ *   11,744 of 11,764 rows are YEAR FIRST — '2026/10/03', '2026-09-05', and
+ *   also UNPADDED ones like '2021-11-2' and '2021/8/13'. All of those are
+ *   accepted: year first means the parts cannot be mistaken for each other,
+ *   and leaveIsoDate() would drop every unpadded one.
+ *
+ *   19 rows are NOT year first — '03/08/2020', '5/1/2022' — and are REFUSED
+ *   rather than guessed at. Nothing in the column says whether '03/08/2020' is
+ *   3 August or 8 March, and attaching the wrong receipt to somebody's sick
+ *   leave is worse than attaching none. 1 row is blank and goes the same way.
+ */
+function leaveClaimDate($value)
+{
+    $value = trim((string)$value);
+    if (!preg_match('/^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})$/', $value, $m)) {
+        return null;
+    }
+    $iso = sprintf('%04d-%02d-%02d', (int)$m[1], (int)$m[2], (int)$m[3]);
     $d   = DateTime::createFromFormat('Y-m-d', $iso);
     return ($d && $d->format('Y-m-d') === $iso) ? $iso : null;
 }
@@ -428,6 +495,59 @@ class LeaveRepository
                  ORDER BY g.leave_application_id DESC";
 
         return $this->run($this->hr, $sql, $fromIso, $toIso, 'nric', LEAVE_TABLE_GW);
+    }
+
+    /**
+     * Query: the medical receipts in these years, as person => sorted distinct
+     * Y-m-d dates. Staff only, by nature: staff_id is a login name.
+     *
+     * BOUNDED BY YEAR, not by the month, and that is on purpose. The caller
+     * matches each receipt against one SICK LEAVE's own span, and a sick leave
+     * overlapping this month can start or end outside it — so the read has to
+     * cover whatever those records reach, which the caller works out and passes
+     * in. The whole table is 11,764 rows, so a year or two of it is nothing.
+     *
+     * The year prefilter is done in SQL on the first four characters and the
+     * precise test in PHP, because receipt_date is a VARCHAR of mixed shapes
+     * that no single SQL comparison gets right. The REGEXP drops the 19
+     * not-year-first rows here rather than letting leaveClaimDate() see them.
+     *
+     * SUBSTR() and not LEFT(), which does the same thing in MySQL: LEFT is a
+     * reserved word elsewhere, and SUBSTR keeps this query runnable against a
+     * fixture as well as against MySQL.
+     */
+    public function medicalClaims($fromYear, $toYear)
+    {
+        if (!($this->hr instanceof PDO)) {
+            return null;
+        }
+        $sql = "SELECT c.staff_id AS person, c.receipt_date AS d
+                  FROM hr.medical_claim c
+                 WHERE c.staff_id <> ''
+                   AND c.receipt_date REGEXP '^[0-9]{4}[/-]'
+                   AND SUBSTR(c.receipt_date, 1, 4) BETWEEN :y1 AND :y2";
+
+        $stmt = $this->hr->prepare($sql);
+        $stmt->execute(array(':y1' => sprintf('%04d', (int)$fromYear),
+                             ':y2' => sprintf('%04d', (int)$toYear)));
+
+        $out = array();
+        foreach ($stmt->fetchAll() as $r) {
+            $person = strtolower(trim((string)$r['person']));
+            $date   = leaveClaimDate($r['d']);
+            if ($person === '' || $date === null) {
+                continue;
+            }
+            /* Keyed by date so the same receipt date claimed twice — which
+             * happens — is one date and not two. */
+            $out[$person][$date] = true;
+        }
+        foreach ($out as $person => $dates) {
+            $dates = array_keys($dates);
+            sort($dates);
+            $out[$person] = $dates;
+        }
+        return $out;
     }
 
     /**
@@ -623,6 +743,36 @@ function leaveIndexGwByCode($gwRows, array $nricByCode)
 }
 
 /**
+ * Query: this person's records with receipt_date filled in on the sick ones.
+ *
+ * $receiptDates is that ONE person's receipts, already sorted, and is empty for
+ * a GW — see SICK LEAVE RECEIPTS at the top for why a GW never gets one. Every
+ * record comes back carrying both fields, sick or not, so a caller never has to
+ * test whether the key exists.
+ */
+function leaveAttachReceipts(array $records, array $receiptDates)
+{
+    $out = array();
+    foreach ($records as $r) {
+        $matched = array();
+        /* 'SL' and nothing else. leave_type is upper-cased by the reads. */
+        if ($r['leave_type'] === 'SL' && !empty($receiptDates)) {
+            foreach ($receiptDates as $date) {
+                /* The RECORD's own span, not the part inside this month. */
+                if ($date >= $r['date_from'] && $date <= $r['date_to']) {
+                    $matched[] = $date;
+                }
+            }
+        }
+        $r['receipt_dates'] = $matched;
+        /* The single value asked for: the earliest match, or '' when none. */
+        $r['receipt_date']  = empty($matched) ? '' : $matched[0];
+        $out[] = $r;
+    }
+    return $out;
+}
+
+/**
  * Query: one person's month — their records clipped to it, the per-day map and
  * the totals, from the records that already belong to them.
  *
@@ -750,6 +900,10 @@ function leaveComposeDays(array $records, $fromIso, $toIso)
             /* And the part that is this month's, which is what days{} and the
              * totals are built from. */
             'days_in_month'   => $p['days'],
+            /* Sick leave only, and only when a receipt really falls inside
+             * this record. See SICK LEAVE RECEIPTS at the top. */
+            'receipt_date'    => isset($r['receipt_date']) ? $r['receipt_date'] : '',
+            'receipt_dates'   => isset($r['receipt_dates']) ? $r['receipt_dates'] : array(),
             'reason'          => $r['reason'],
             'source'          => $r['source'],
         );
@@ -890,12 +1044,41 @@ try {
     $staffLeave = leaveMergeStaff($hrRows, $driverRows);
     $gwLeave    = leaveIndexGwByCode($gwRows, $nricByCode);
 
+    /* ---- the receipts behind the sick leave ---- */
+    /* Bounded by the years the SICK LEAVE records actually reach, which can be
+     * wider than the month: an SL running 28 Dec to 3 Jan needs both years.
+     * No sick leave in the answer means no query at all. */
+    $claims   = null;
+    $claimFrom = null;
+    $claimTo   = null;
+    foreach ($staffLeave as $records) {
+        foreach ($records as $r) {
+            if ($r['leave_type'] !== 'SL') {
+                continue;
+            }
+            if ($claimFrom === null || $r['date_from'] < $claimFrom) { $claimFrom = $r['date_from']; }
+            if ($claimTo   === null || $r['date_to']   > $claimTo)   { $claimTo   = $r['date_to']; }
+        }
+    }
+    if ($claimFrom !== null) {
+        try {
+            $claims = $leave->medicalClaims(substr($claimFrom, 0, 4), substr($claimTo, 0, 4));
+        } catch (Exception $e) {
+            error_log('leaveAPI medical claim read: ' . $e->getMessage());
+            $claims = null;
+        }
+    }
+
     /* What answered and what did not, so an empty result can be read
      * correctly. See THE SOURCES at the top of this file. */
     $sources = array(
         'staff' => array(
             LEAVE_TABLE_HR     => ($hrRows === null) ? 'unavailable' : 'ok',
             LEAVE_TABLE_DRIVER => 'ok',
+            /* 'not_needed' when the answer holds no sick leave to attach a
+             * receipt to, which is not the same as the table being down. */
+            LEAVE_TABLE_CLAIM  => ($claimFrom === null)
+                ? 'not_needed' : (($claims === null) ? 'unavailable' : 'ok'),
         ),
         'gw' => array(
             LEAVE_TABLE_GW => ($gwRows === null) ? 'unavailable' : 'ok',
@@ -918,6 +1101,12 @@ try {
         } else {
             if (isset($staffLeave[$person])) { $records = $staffLeave[$person]; }
         }
+
+        /* A GW is handed no receipts at all, by design — medical_claim is
+         * keyed on a login name and a GW code is a different namespace. */
+        $mine    = (!$isGw && $claims !== null && isset($claims[$person]))
+                 ? $claims[$person] : array();
+        $records = leaveAttachReceipts($records, $mine);
 
         $month_ = leaveComposeDays($records, $fromIso, $toIso);
 
@@ -991,6 +1180,7 @@ try {
      * 'leave_application_GW', so testing it first would blame the staff table
      * for a GW failure. */
     foreach (array('leave_application_GW' => 'the GW leave table',
+                   'medical_claim'        => 'the medical claim receipts',
                    'leave_application'    => 'the staff leave table',
                    'driver_leaves'        => 'the driver leave table',
                    'monthly_assign_gw'    => 'the GW records',
