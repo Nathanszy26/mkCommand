@@ -94,7 +94,7 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  *   staff_tree=all answers TWO FLAT LISTS of managers — no nesting anywhere
  *     { success, comp_id, company_name, generated_at, summary{},
- *       staff_tree { mode:"all", counts{}, hod[], am[], vacant[] } }
+ *       staff_tree { mode:"all", counts{}, hod[], am[], vacant[], access[] } }
  *
  *     hod[]   one entry per DEPARTMENT        — Globinaco has 16
  *     am[]    one entry per sub-department    — Globinaco has 18
@@ -121,10 +121,12 @@ header('Content-Type: application/json; charset=UTF-8');
  *   staff_tree_individual=x answers
  *     { success, comp_id, company_name, generated_at,
  *       staff_tree { mode:"individual", person, comp_id, company_name,
- *                    staff_type, counts{}, staff{} } }
+ *                    staff_type, counts{}, access{}, staff{} } }
  *
  *     staff{} is that one person as a node, with everybody under them nested
  *     inside it. Nothing about the rest of the company comes with it.
+ *     access{} is what they may SEE, which is a different question — see
+ *     ACCESS below.
  *
  *   In BOTH shapes a person is a staff[] row — the same publicRow() shape, the
  *   same values — with this added on top of it:
@@ -150,18 +152,32 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  *   On a NODE the two counts describe WHAT IS IN THIS ANSWER, so they add up
  *   to the arrays you are holding. On a flat hod[]/am[] entry there is no
- *   array to add up and they are the real org size instead. The two therefore
- *   disagree wherever a tree was capped, and that is the one place to be
- *   careful:
+ *   array to add up and they are the real org size instead. Nothing is capped
+ *   today — StaffPoolTree::depthLimits() is empty — so the two agree.
  *
- *   ONE TREE IS CAPPED, AND NOTHING IN THE NODE SAYS SO. jeffrey is the top of
- *   what this endpoint draws, so his tree is the whole company; it is cut to
- *   his direct reports, the department heads. Under HIS tree those heads read
- *   0 subordinates — indistinguishable from somebody who really has none.
+ * ACCESS — WHO MAY SEE WHICH DEPARTMENTS
+ *   A separate statement from the reporting line, and it moves nobody in it.
  *
- *   hod[] still reports their true org size, and staff_tree_individual for any
- *   of them returns everything below them. So nobody is unreachable; they are
- *   only not nested under jeffrey. See StaffPoolTree::depthLimits().
+ *     staff_tree=all          access[]  one entry per person who holds a
+ *                                       grant (three today)
+ *     staff_tree_individual   access{}  that person's own grant, always
+ *                                       present — scope "none" for the
+ *                                       people who have none
+ *
+ *   { scope: "all"|"listed"|"none", departments[], counts{}, unknown[] }
+ *   and each granted department carries its id, name, head, and the
+ *   sub-departments inside it.
+ *
+ *   IT CHANGES NO BRANCH AND NO COUNT. staff_tree_individual=sooCK answers
+ *   with his reporting line — himself and two people — and says beside it
+ *   that he may see eight departments. Seeing a department is not managing
+ *   it, and an earlier version of this file said so by re-parenting those
+ *   heads under him, which made the org chart claim something nobody had
+ *   agreed to. See StaffPoolTree::departmentAccess().
+ *
+ *   `unknown` is only present when a grant names a department that no longer
+ *   exists — a rename that this list did not follow, surfaced rather than
+ *   quietly shrinking somebody's access.
  *
  *   The tree is the WHOLE company, like the summary and for the same reason:
  *   q, dept and staff_type do not touch it. Filter out one manager and every

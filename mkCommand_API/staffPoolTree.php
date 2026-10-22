@@ -42,6 +42,11 @@
  *   staff_tree_individual=x      that person and everybody under them,
  *                                nested. This is the only shape that nests.
  *
+ *   Both also carry ACCESS — which departments somebody may SEE. It is a
+ *   separate statement from the reporting line and moves nobody in it; see
+ *   departmentAccess(). The line itself is now exactly what the chart and
+ *   department_head say, with no hand-written edges at all.
+ *
  * ONE PERSON, ONE PLACE — WITHIN A SINGLE TREE
  *   The chart is not a tree. 16 of Globinaco's general workers are assigned
  *   under two superiors; across the whole group 82 people are under more than
@@ -318,44 +323,66 @@ class StaffPoolTree
      */
     public static function handPlacements()
     {
+        /* EMPTY ON PURPOSE. This held fourteen edges that put every
+         * department head under jeffrey, the four divisions under sooCK and
+         * Workshop under rinob. They were removed because they were answering
+         * the wrong question: who may SEE a department is not who REPORTS to
+         * whom, and writing an access rule as a fake reporting line left the
+         * chart saying something nobody had agreed to.
+         *
+         * That is now departmentAccess(), below, which states the access and
+         * changes no line in the chart. The reporting line here is once again
+         * only what organization_chart_glob and department_head say.
+         *
+         * The mechanism is kept: add an entry and it still moves a branch,
+         * for the day a line really is missing from the data. */
+        return array();
+    }
+
+    /**
+     * WHO MAY SEE WHICH DEPARTMENTS.
+     *
+     * A statement about access, nothing else. It moves nobody in the chart,
+     * changes no branch and no count — staff_tree_individual still answers
+     * with the reporting line, and this is reported beside it. The two are
+     * deliberately separate: a manager seeing another department's figures
+     * does not make its people report to them, and the previous attempt to
+     * say this by re-parenting them made the org chart tell a lie.
+     *
+     * `departments` is either the string 'all' — every department this
+     * company has, now and after the next one is added — or the exact
+     * dept_name of each grant. Names are matched against department_head
+     * case-insensitively, and any that match nothing are reported back as
+     * `unknown` rather than dropped, so a renamed department shows up as a
+     * broken grant instead of silently shrinking somebody's access.
+     *
+     * Top-level departments only. The sub-departments inside a granted one
+     * come with it — see accessFor(), which lists them.
+     */
+    public static function departmentAccess()
+    {
         return array(
-            /* Management A — Jeffrey Soo Yee Lieh (jeffrey, comp 1).
-             * Every other department head answers to him, so asking for him
-             * returns the whole company below the CEO. He is left with no
-             * hand-written boss of his own, which is what makes him the top of
-             * what this endpoint draws. */
-            array('person' => 'tiffiny92',   'comp_id' => 1,   // Admin
-                  'boss'   => 'vincentng',   'boss_comp_id' => 1),
-            array('person' => 'mackaylachu', 'comp_id' => 1,   // Accounts, Procurement
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'chuasf',      'comp_id' => 1,   // IT
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'vincentng',   'comp_id' => 1,   // HR
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'Fionaliew',   'comp_id' => 1,   // Contracts
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'sooCK',       'comp_id' => 1,   // Management B (O&E)
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'rinob',       'comp_id' => 1,   // Fleet
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'ntc',         'comp_id' => 1,   // Sajak Warni
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
-            array('person' => 'danny',       'comp_id' => 1,   // Cold Mix
-                  'boss'   => 'jeffrey',     'boss_comp_id' => 1),
+            /* Jeffrey Soo Yee Lieh — the whole company. */
+            array('person' => 'jeffrey', 'comp_id' => 1, 'departments' => 'all'),
 
-            /* Fleet — Rino Binsoning (rinob, comp 1) */
-            array('person' => 'leongwee',   'comp_id' => 1,    // Workshop
-                  'boss'   => 'rinob',      'boss_comp_id' => 1),
+            /* Soo Chee Kiong — the four divisions and the four units under
+             * Management B (O&E). */
+            array('person' => 'sooCK', 'comp_id' => 1, 'departments' => array(
+                'GM, Call Centre & Division A',
+                'R01, Training & Division B',
+                'Periodic & Division C',
+                'Emergency & Division D',
+                'Fleet',
+                'Workshop',
+                'Sajak Warni',
+                'Cold Mix',
+            )),
 
-            /* Management B (O&E) — Soo Chee Kiong (sooCK, comp 1) */
-            array('person' => 'justin',     'comp_id' => 1,
-                  'boss'   => 'sooCK',      'boss_comp_id' => 1),
-            array('person' => 'brianlimkh', 'comp_id' => 1,
-                  'boss'   => 'sooCK',      'boss_comp_id' => 1),
-            array('person' => 'tang',       'comp_id' => 1,
-                  'boss'   => 'sooCK',      'boss_comp_id' => 1),
-            array('person' => 'heldah',     'comp_id' => 1,
-                  'boss'   => 'sooCK',      'boss_comp_id' => 1),
+            /* Rino Binsoning — Fleet and the Workshop beside it. */
+            array('person' => 'rinob', 'comp_id' => 1, 'departments' => array(
+                'Fleet',
+                'Workshop',
+            )),
         );
     }
 
@@ -392,11 +419,14 @@ class StaffPoolTree
      */
     public static function depthLimits()
     {
-        return array(
-            /* Management A — Jeffrey Soo Yee Lieh: the department heads under
-             * him, not their people. */
-            array('person' => 'jeffrey', 'comp_id' => 1, 'levels' => 1),
-        );
+        /* EMPTY. jeffrey was capped here because handPlacements() had put the
+         * whole company under him and his tree was 657 people. Those
+         * placements are gone, so his branch is now his five real chart
+         * reports — and a cap on that would hide their teams for no gain.
+         *
+         * The mechanism stays for the next branch that grows too big to
+         * send. */
+        return array();
     }
 
     private $repo;
@@ -422,6 +452,8 @@ class StaffPoolTree
     private $rank = array();
     /** The two sections, as department rows. See readDepartments(). */
     private $units = array('hod' => array(), 'am' => array());
+    /** section => key => that department row, for placing people. */
+    private $unitByKey = array('hod' => array(), 'am' => array());
     /** Live departments whose head is not in the pool. */
     private $vacantUnits = array();
     /** key => how many rungs below it are drawn. See depthLimits(). */
@@ -653,6 +685,9 @@ class StaffPoolTree
                 'department_name' => trim((string)$dh['dept_name']),
                 'person'          => (string)$dh['staff_id'],
                 'comp_id'         => (int)$dh['comp_id'],
+                /* 0 for a top-level department. Carried so accessFor() can
+                 * say which sub-departments sit inside a granted one. */
+                'parent_id'       => (int)$dh['parent_id'],
             );
 
             if (!isset($this->rows[$key])) {
@@ -673,7 +708,17 @@ class StaffPoolTree
             }
 
             $unit['key'] = $key;
-            $this->units[$isTop ? 'hod' : 'am'][] = $unit;
+            $section = $isTop ? 'hod' : 'am';
+            $this->units[$section][] = $unit;
+
+            /* FIRST ONE WINS. mackaylachu heads two departments, so asking
+             * "which unit is this person in" has two answers for him; the one
+             * listed first is the one taken, which is the lowest `order` and
+             * so the one the org navigator shows him under. The sections
+             * still print both — this index is for placing OTHER people. */
+            if (!isset($this->unitByKey[$section][$key])) {
+                $this->unitByKey[$section][$key] = $unit;
+            }
 
             if (!isset($this->rank[$key])) {
                 $this->rank[$key] = $rank++;
@@ -727,6 +772,240 @@ class StaffPoolTree
             }
         }
         return array_merge($staff, $gw);
+    }
+
+    /**
+     * Query: this person's pool rows — themselves and everybody below them,
+     * at any depth, as the flat set another endpoint can work over.
+     *
+     * NO DEPTH LIMIT. depthLimits() shortens a drawn TREE because a tree is
+     * read by a human; this answers "who is in this person's org", and a
+     * caller asking that needs all of them. attendanceAPI.php scopes itself
+     * with this, so staff=jeffrey covers the whole company.
+     *
+     * Rows, not keys: the caller wants the people, and the pool row is what
+     * every other endpoint here publishes.
+     */
+    public function branch($key)
+    {
+        if (!isset($this->rows[$key])) {
+            return array();
+        }
+
+        $seen  = array($key => true);
+        $queue = array($key);
+
+        for ($i = 0; $i < count($queue); $i++) {
+            if (empty($this->children[$queue[$i]])) {
+                continue;
+            }
+            foreach (array_keys($this->children[$queue[$i]]) as $child) {
+                if (isset($seen[$child]) || !isset($this->rows[$child])) {
+                    continue;
+                }
+                $seen[$child] = true;
+                $queue[]      = $child;
+            }
+        }
+
+        $out = array();
+        foreach ($queue as $k) {
+            $out[] = $this->rows[$k];
+        }
+        return $out;
+    }
+
+    /** Query: every department this person heads, as the sections label them,
+     *  or '' — so a caller that never draws a tree can still say who is a
+     *  head. Keyed by the pool's own person + comp_id. */
+    public function hodLabel($person, $compId)
+    {
+        $key = self::key('staff', $person, $compId);
+        return isset($this->hodNames[$key])
+            ? implode(', ', array_keys($this->hodNames[$key]))
+            : '';
+    }
+
+    /**
+     * Query: the departments one person may see — see departmentAccess().
+     *
+     * Resolved against the departments this company ACTUALLY has, so a grant
+     * naming something that no longer exists comes back in `unknown` and a
+     * department added after the grant was written is picked up by 'all'
+     * without anybody editing a list.
+     *
+     * Each granted department carries its head and the sub-departments inside
+     * it, because access to a department is access to what is in it, and a
+     * caller should not have to go and work that out.
+     *
+     * scope: 'all' | 'listed' | 'none' — 'none' is most people, and is a real
+     * answer rather than a missing field.
+     */
+    public function accessFor($person, $compId)
+    {
+        $want = null;
+        foreach (self::departmentAccess() as $grant) {
+            if ((int)$grant['comp_id'] === (int)$compId
+                && strcasecmp(trim((string)$grant['person']), trim((string)$person)) === 0) {
+                $want = $grant['departments'];
+                break;
+            }
+        }
+
+        if ($want === null) {
+            return array('scope' => 'none', 'departments' => array(),
+                         'counts' => array('departments' => 0, 'sub_departments' => 0));
+        }
+
+        $all = (is_string($want) && strtolower($want) === 'all');
+
+        /* Wanted names, lower-cased, so the lookup is the case-insensitive
+         * match the grant promises. */
+        $byName = array();
+        if (!$all) {
+            foreach ((array)$want as $name) {
+                $byName[strtolower(trim((string)$name))] = trim((string)$name);
+            }
+        }
+
+        $out  = array();
+        $subs = 0;
+        foreach ($this->units['hod'] as $unit) {
+            $key = strtolower($unit['department_name']);
+            if (!$all && !isset($byName[$key])) {
+                continue;
+            }
+            unset($byName[$key]);
+
+            /* The sub-departments inside it, named the way am[] names them. */
+            $inside = array();
+            foreach ($this->units['am'] as $sub) {
+                if ((int)$sub['parent_id'] === (int)$unit['department_id']) {
+                    $inside[] = array(
+                        'department_id'   => $sub['department_id'],
+                        'department_name' => $sub['department_name'],
+                        'person'          => $sub['person'],
+                    );
+                }
+            }
+            $subs += count($inside);
+
+            $row = $this->rows[$unit['key']];
+            $out[] = array(
+                'department_id'   => $unit['department_id'],
+                'department_name' => $unit['department_name'],
+                'person'          => (string)$row['person'],
+                'fullname'        => displayName($row['fullname'], $row['person']),
+                'sub_departments' => $inside,
+            );
+        }
+
+        $access = array(
+            'scope'       => $all ? 'all' : 'listed',
+            'departments' => $out,
+            'counts'      => array('departments'     => count($out),
+                                   'sub_departments' => $subs),
+        );
+
+        /* A grant naming a department that is not there any more. Reported,
+         * never swallowed: it means somebody renamed a unit and this list did
+         * not follow. */
+        if (!empty($byName)) {
+            $access['unknown'] = array_values($byName);
+        }
+        return $access;
+    }
+
+    /** Query: every grant there is, for the whole-company answer. Ordered as
+     *  departmentAccess() writes them, and skipping anybody who is not in the
+     *  pool — a grant to somebody who has left grants nothing. */
+    public function accessAll()
+    {
+        $out = array();
+        foreach (self::departmentAccess() as $grant) {
+            $key = self::key('staff', $grant['person'], $grant['comp_id']);
+            if (!isset($this->rows[$key])) {
+                continue;
+            }
+            $row = $this->rows[$key];
+            $out[] = array(
+                'person'   => (string)$row['person'],
+                'comp_id'  => (int)$row['comp_id'],
+                'fullname' => displayName($row['fullname'], $row['person']),
+            ) + $this->accessFor($grant['person'], $grant['comp_id']);
+        }
+        return $out;
+    }
+
+    /**
+     * Query: WHICH DEPARTMENT THIS PERSON BELONGS TO — the nearest department
+     * head above them, and the nearest sub-department head above them.
+     *
+     * This is what turns the two flat sections into a grouping. Every person
+     * lands in exactly ONE hod unit and at most one am unit, so a report that
+     * groups by this partitions the company instead of repeating people under
+     * every manager above them, which is what the branches do.
+     *
+     * NEAREST, AND THEMSELVES COUNTS. A head is in their own unit, so a
+     * department's group holds its head and their people together. Walking
+     * up from a general worker under victorchai (KK/PTN) under justin, the
+     * am is KK/PTN and the hod is justin's department — not sooCK's or
+     * jeffrey's, which are further up the same line.
+     *
+     * Breadth-first upward, so "nearest" means fewest rungs, and the 82
+     * people with two superiors get the closer of the two rather than
+     * whichever edge happened to be read first.
+     *
+     * Empty strings when nothing is found: somebody on no chart at all
+     * belongs to no department, and saying so beats inventing one.
+     */
+    public function placement($person, $compId, $type = 'staff')
+    {
+        $out = array('hod_person' => '', 'hod_unit' => '',
+                     'am_person'  => '', 'am_unit'  => '');
+
+        $start = self::key($type === 'gw' ? 'gw' : 'staff', $person, $compId);
+        if (!isset($this->rows[$start])) {
+            return $out;
+        }
+
+        $seen  = array($start => true);
+        $queue = array($start);
+        $hod   = null;
+        $am    = null;
+
+        for ($i = 0; $i < count($queue); $i++) {
+            $key = $queue[$i];
+
+            if ($hod === null && isset($this->unitByKey['hod'][$key])) {
+                $hod = $this->unitByKey['hod'][$key];
+            }
+            if ($am === null && isset($this->unitByKey['am'][$key])) {
+                $am = $this->unitByKey['am'][$key];
+            }
+            if ($hod !== null && $am !== null) {
+                break;
+            }
+            if (empty($this->parents[$key])) {
+                continue;
+            }
+            foreach (array_keys($this->parents[$key]) as $parent) {
+                if (!isset($seen[$parent]) && isset($this->rows[$parent])) {
+                    $seen[$parent] = true;
+                    $queue[]       = $parent;
+                }
+            }
+        }
+
+        if ($hod !== null) {
+            $out['hod_person'] = $hod['person'];
+            $out['hod_unit']   = $hod['department_name'];
+        }
+        if ($am !== null) {
+            $out['am_person'] = $am['person'];
+            $out['am_unit']   = $am['department_name'];
+        }
+        return $out;
     }
 
     /** Query: what a key is, for an error message a human can act on. */
@@ -814,6 +1093,14 @@ class StaffPoolTree
         if (!empty($this->vacantUnits)) {
             $out['vacant'] = $this->vacantUnits;
         }
+
+        /* Who may see which departments. Beside the lists, not inside them —
+         * it is a fact about three people, not about all 34 units. */
+        $access = $this->accessAll();
+        if (!empty($access)) {
+            $out['access'] = $access;
+            $out['counts']['access'] = count($access);
+        }
         return $out;
     }
 
@@ -881,6 +1168,11 @@ class StaffPoolTree
                 'people'    => count($placed['depth']),
                 'max_depth' => $placed['depth'] ? max($placed['depth']) : 0,
             ),
+            /* What they may SEE, beside what they MANAGE. The two are
+             * different questions and this answer keeps them apart: `staff`
+             * below is the reporting line and nothing else, and `access` does
+             * not add a single person to it. See departmentAccess(). */
+            'access'       => $this->accessFor($row['person'], $compId),
             'staff'        => $this->node($key, 0, $this->kidsOf($placed),
                                           $placed['parent']),
         );
