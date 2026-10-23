@@ -186,9 +186,17 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  * Each person in both lists:
  *   mk_id, comp_id, company_name, person, fullname, email, mobile_no,
- *   position, department, district, staff_type, total_staff,
- *   kpi_scorecard_exempted, mk_command_exempted, mk_academy_exempted
+ *   staff_picture_url, position, department, district, staff_type,
+ *   total_staff, kpi_scorecard_exempted, mk_command_exempted,
+ *   mk_academy_exempted
  * — see publicRow() in staffPoolCore.php, which defines that shape.
+ *
+ *   staff_picture_url is the ABSOLUTE url of that person's profile photo in
+ *   the myMK storage bucket, ready to put in an <img>, and null when there is
+ *   no photo on file — which is the common case outside companies 1, 2, 3, 4,
+ *   7 and 8. It is the same face staffDirectory.php shows, resolved by the
+ *   same links; PoolPhotos below owns all of it. Every list carries it: the
+ *   pool, the excluded, and every node of the tree.
  *
  *   mk_id is the ACCOUNT id behind the person, for an application that wants
  *   to join this listing to its own records: staff_portal2.users.id for a
@@ -258,6 +266,241 @@ $ALLOW_ANONYMOUS = true;
 $ANON_ALLOW_IPS = array(
     // '203.0.113.10',
 );
+
+/* ---------- profile photos ------------------------------------------------
+ *
+ * The one thing in this file that is not in staffPoolCore.php on purpose: a
+ * photo is not a pool rule. It moves nobody in or out of the pool and changes
+ * no flag and no count, so staffHeadcountReport.php — the core's other caller
+ * — has no use for one and does not pay for it. publicRow() only PUBLISHES
+ * what is stamped on the row here.
+ *
+ * The matching rules are staffDirectory.php's, so the face this endpoint
+ * names is the face the directory shows. See that file for why each link
+ * exists; the one deliberate difference is noted on gwIndex() below.
+ */
+
+/** Profile photos live in the myMK app's storage bucket, not on this host.
+ *  staff_profile.profile_pic / gw_profile.profile_pic hold a path relative to
+ *  the bucket root; a caller only ever gets the finished absolute URL, and the
+ *  base is the same one staffDirectory.php publishes. */
+class ProfilePhoto
+{
+    const URL_BASE = 'https://app.globportal.com/mymk/storage/';
+
+    /** Absolute URL of a stored path, or null when there is no photo on file.
+     *  Each path segment is encoded separately so the slashes survive. */
+    public static function url($pic)
+    {
+        if ($pic === null || trim($pic) === '') {
+            return null;
+        }
+        $segments = array_map('rawurlencode', explode('/', ltrim(trim($pic), '/')));
+        return self::URL_BASE . implode('/', $segments);
+    }
+}
+
+/**
+ * Stamps staff_picture_url on every pool row, for both populations.
+ *
+ * TWO READS FOR THE WHOLE ANSWER, matched in PHP. staffDirectory.php resolves
+ * a staff photo with a correlated subquery per row, which is right for a
+ * search that returns a screenful; this endpoint answers with a whole company
+ * — about 940 rows at Globinaco, or some 1,400 for every company at once —
+ * while the two photo tables together hold roughly 1,040 rows with a picture
+ * on them. Reading those once and indexing them beats a subquery per person,
+ * and the phone link cannot use an index on either side anyway.
+ *
+ * Nothing here is scoped to the companies asked for: the whole of both tables
+ * is a thousand rows, and the mymkid link below is not company-scoped in the
+ * directory's SQL either, so loading everything is both simpler and exactly
+ * what that SQL does.
+ *
+ * A row that matches nothing gets null, which is a real answer and not a
+ * failure — most of the group has no photo on file at all.
+ */
+class PoolPhotos
+{
+    private $db;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    /** Digits only. Every one of these four tables stores a number however it
+     *  was typed, so this is the only comparable form. */
+    private static function digits($v)
+    {
+        return preg_replace('/\D/', '', (string)$v);
+    }
+
+    /** A Malaysian mobile reduced to its national form: digits, then the
+     *  country code, then the trunk zero — the PHP of staffDirectory.php's
+     *  TRIM(LEADING '0' FROM TRIM(LEADING '60' FROM ...)), repeated prefixes
+     *  and all. '0123456789', '123456789' and '60123456789' are one number. */
+    private static function msisdn($v)
+    {
+        $d = self::digits($v);
+        while (strncmp($d, '60', 2) === 0) {
+            $d = substr($d, 2);
+        }
+        return ltrim($d, '0');
+    }
+
+    /** The company a person's PROFILE is filed under, which is not always the
+     *  company the pool reports them as: Trillium's people are stored under
+     *  Globinaco and relabelled as company 16, so their staff_profile rows are
+     *  still comid 1. Look them up under home, or all 21 of them miss. */
+    private static function homeComp($compId)
+    {
+        return (int)$compId === StaffPoolRepository::TRILLIUM_COMP_ID
+            ? StaffPoolRepository::TRILLIUM_HOME_COMP_ID
+            : (int)$compId;
+    }
+
+    /** Fills staff_picture_url on every row and hands them back. */
+    public function attach(array $rows)
+    {
+        if (empty($rows)) {
+            return $rows;
+        }
+        $staff = $this->staffIndexes();
+        $gw    = $this->gwIndex();
+
+        foreach ($rows as &$r) {
+            $r['staff_picture_url'] = ProfilePhoto::url(
+                (isset($r['person_type']) && $r['person_type'] === 'gw')
+                    ? self::gwPhoto($gw, $r)
+                    : self::staffPhoto($staff, $r)
+            );
+        }
+        unset($r);
+        return $rows;
+    }
+
+    /**
+     * A staff member's photo path, or null. Link priority mirrors
+     * staffDirectory.php's STAFF_PHOTO_SUBQUERY, which in turn mirrors
+     * enroll_admin.php's checkFaceEncodings:
+     *
+     *   1. staff_profile.person + comid  ==  users.person + comp_id
+     *   2. fallback: staff_profile.mymkid == users.id
+     *   3. fallback: the phone number, reduced to its national form
+     *
+     * Link 3 exists for company 8 (TP Group), whose staff_profile.person holds
+     * the PHONE NUMBER rather than the username and whose mymkid is a myMK
+     * account id rather than users.id, so links 1 and 2 both miss.
+     *
+     * Verified on live data: no two profiles in one company share a username,
+     * a mymkid or a reduced number, so no link here can return the wrong face.
+     */
+    private static function staffPhoto(array $ix, array $row)
+    {
+        $comp = self::homeComp($row['comp_id']);
+
+        $key = $comp . '|' . strtolower(trim((string)$row['person']));
+        if (isset($ix['person'][$key])) {
+            return $ix['person'][$key];
+        }
+        if (isset($row['mk_id']) && $row['mk_id'] !== null
+            && isset($ix['mymkid'][(int)$row['mk_id']])) {
+            return $ix['mymkid'][(int)$row['mk_id']];
+        }
+        /* Enough digits to be a real number, the same guard the directory's
+         * SQL carries: without it the hundreds of profiles holding a USERNAME
+         * in `person` and the live users with no usable mobile_no would both
+         * reduce to '' and match each other. */
+        if (strlen(self::digits($row['mobile_no'])) >= 9) {
+            $phone = $comp . '|' . self::msisdn($row['mobile_no']);
+            if (isset($ix['phone'][$phone])) {
+                return $ix['phone'][$phone];
+            }
+        }
+        return null;
+    }
+
+    /** A GW's photo path, or null. gw_profile has no GW code to join on, so
+     *  the phone number is the only thing a worker's assignment row and their
+     *  signup have in common. */
+    private static function gwPhoto(array $ix, array $row)
+    {
+        $key = self::msisdn($row['mobile_no']);
+        if ($key === '') {
+            return null;
+        }
+        $key .= '|' . (int)$row['comp_id'];
+        return isset($ix[$key]) ? $ix[$key] : null;
+    }
+
+    /** The three staff_profile indexes, from one read. */
+    private function staffIndexes()
+    {
+        $ix = array('person' => array(), 'mymkid' => array(), 'phone' => array());
+
+        $sql = "SELECT p.comid, p.person, p.mymkid, p.profile_pic
+                FROM staff_portal2.staff_profile p
+                WHERE p.deleted_at IS NULL
+                  AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''";
+        foreach ($this->db->query($sql)->fetchAll() as $p) {
+            $comp = (int)$p['comid'];
+            $pic  = $p['profile_pic'];
+
+            /* Lower-cased because MySQL compared these case-insensitively and
+             * a PHP array key does not. */
+            $ix['person'][$comp . '|' . strtolower(trim((string)$p['person']))] = $pic;
+            $ix['mymkid'][(int)$p['mymkid']] = $pic;
+
+            /* Only company 8 files a number here; for everybody else `person`
+             * is a username and reduces to '', which is not an index key. */
+            $phone = self::msisdn($p['person']);
+            if ($phone !== '') {
+                $ix['phone'][$comp . '|' . $phone] = $pic;
+            }
+        }
+        return $ix;
+    }
+
+    /**
+     * GW photos, keyed by national-form number and company.
+     *
+     * THE ONE DELIBERATE DIFFERENCE from staffDirectory.php, which compares
+     * these two numbers digit for digit: gw_profile stores a signup as
+     * '60196307391' while monthly_assign_gw stores that same worker as
+     * '0196307391', so an exact comparison finds 29 of Arus Sawit's 243
+     * pictures. Reducing both sides the way the staff link already does finds
+     * 232 of them, and it cannot cross two people: the only six numbers in
+     * the whole table carrying two different pictures are six workers who
+     * signed up twice, and the newer signup wins below.
+     *
+     * `person` beats `mobile` when a row disagrees with itself — it is the
+     * column the signup writes — and a later row beats an earlier one, which
+     * is what reading in id order gives.
+     */
+    private function gwIndex()
+    {
+        $index = array();
+
+        $sql = "SELECT p.comp_id, p.person, p.mobile, p.profile_pic
+                FROM staff_portal2.gw_profile p
+                WHERE p.deleted_at IS NULL
+                  AND p.profile_pic IS NOT NULL AND p.profile_pic <> ''
+                ORDER BY p.id";
+        foreach ($this->db->query($sql)->fetchAll() as $p) {
+            $comp = (int)$p['comp_id'];
+
+            $byMobile = self::msisdn($p['mobile']);
+            if ($byMobile !== '' && !isset($index[$byMobile . '|' . $comp])) {
+                $index[$byMobile . '|' . $comp] = $p['profile_pic'];
+            }
+            $byPerson = self::msisdn($p['person']);
+            if ($byPerson !== '') {
+                $index[$byPerson . '|' . $comp] = $p['profile_pic'];
+            }
+        }
+        return $index;
+    }
+}
 
 /* ---------- plumbing ------------------------------------------------------ */
 
@@ -537,6 +780,13 @@ try {
         $repo->gw($compId, $scopeComps)
     );
     $rows      = $repo->withGwEmails($rows);
+    /* Before the rows are split, filtered or handed to the tree, so staff[],
+     * excluded_staff[] and every tree node carry the same field — see
+     * PoolPhotos. summary_only=1 still pays for the two reads; they are a
+     * thousand rows between them and the alternative is a second code path
+     * that could answer differently. */
+    $photos    = new PoolPhotos($pdo);
+    $rows      = $photos->attach($rows);
     $overrides = $repo->overrides($compId);
     $summary   = publicSummary($rows, $overrides);
 

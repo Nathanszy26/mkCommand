@@ -1139,6 +1139,14 @@ function publicRow(array $row, array $overrides, array $compNames = array())
         'fullname'               => displayName($row['fullname'], $row['person']),
         'email'                  => (string)$row['email'],
         'mobile_no'              => (string)$row['mobile_no'],
+        /* The absolute URL of this person's profile photo, or null when there
+         * is none on file. PUBLISHED here, RESOLVED by the caller — a photo is
+         * not a pool rule, so staffPoolAPI.php's PoolPhotos stamps it on the
+         * row and staffHeadcountReport.php, which shows no faces, pays for
+         * nothing. A row nobody stamped reads as null, which is the same
+         * answer as having no photo. */
+        'staff_picture_url'      => isset($row['staff_picture_url'])
+            ? $row['staff_picture_url'] : null,
         'position'               => (string)$row['position'],
         /* As STORED, not as grouped: a GW has no department, so theirs is
          * empty and their district carries the location. groupLabel() is the
