@@ -7,6 +7,8 @@
  *
  *   staffHeadcountReport.php   the report page and its tick boxes
  *   staffPoolAPI.php           the JSON endpoint other applications read
+ *   jobspecReport.php          job spec approval progress, per pool member
+ *   staffOverview.php          MK Command's HR directory
  *
  * That is the whole point. A change to the pool, to a flag or to the way a
  * head count is counted happens HERE, once, and the report and every
@@ -839,6 +841,12 @@ function normaliseName($name)
  *  login or a GW code, not a name, so it is printed as it is stored. */
 function displayName($name, $code)
 {
+    /* A name that IS the code is a lookup that fell through to the login —
+     * COALESCE(fullname, person) in a report — and title-casing it would turn
+     * "sooCK" into "Soock". Left exactly as stored, like any other code. */
+    if (trim((string)$name) === (string)$code) {
+        return (string)$code;
+    }
     /* Normalise first, then trim: that is what lets the trim reach a leading
      * non-breaking space, which normaliseName has by then turned into a
      * plain one. */
@@ -900,6 +908,32 @@ function summarise(array $rows, array $overrides)
         }
     }
     return $out;
+}
+
+/** Query: the people a head count counts — $rows without everyone an override
+ *  has taken out of the pool. count() of this is summarise()'s total and
+ *  publicSummary()'s company_total_staff, by construction, so a page that
+ *  lists these rows lists exactly the number staffPoolAPI.php reports. */
+function inPoolRows(array $rows, array $overrides)
+{
+    $out = array();
+    foreach ($rows as $row) {
+        list($inPool) = effective($row, 'in_pool', $overrides);
+        if ($inPool) { $out[] = $row; }
+    }
+    return $out;
+}
+
+/** Query: the company a person's own records are FILED under, which is not
+ *  always the company the pool reports them as. Trillium's people are reported
+ *  as company 16 but stored under Globinaco, so their users row, their job
+ *  spec versions and their chart rows all say comp_id 1. Any lookup keyed on a
+ *  pool row's comp_id goes through this first. */
+function homeCompId($compId)
+{
+    return (int)$compId === StaffPoolRepository::TRILLIUM_COMP_ID
+        ? StaffPoolRepository::TRILLIUM_HOME_COMP_ID
+        : (int)$compId;
 }
 
 /** Query: the per-column totals for the table foot. Same counting rule as
