@@ -49,8 +49,10 @@ header('Content-Type: application/json; charset=UTF-8');
  *   have records:
  *     mk_id, person, comp_id, staff_type    the keys to join the others on
  *     fullname, position, department, district, total_staff
- *     summary{ records, merit, demerit, unknown, by_type{} }
- *     records[]  one entry per performance row, newest date first
+ *     summary{ records, merit, demerit, unknown, missed_dates, by_type{} }
+ *     records[]  one entry per performance row, newest date first, each with
+ *                missed_dates[] — the individual days a missed-submission
+ *                record is about, empty on every other kind
  *     days{ "21": [ performance_id, ... ] }   day OF THE MONTH -> the ids
  *                landing on it. A LIST, because a day can hold several — which
  *                is why this is not one cell per day like attendanceAPI.php's.
@@ -86,6 +88,37 @@ header('Content-Type: application/json; charset=UTF-8');
  *                  CANONICAL type ("Improvement Notice"). '' when the record
  *                  names no type: see below.
  *   merit_demerit  'merit' | 'demerit' | ''
+ *   missed_dates[] the days the record is about: see the next section
+ *
+ * THE DAYS A RECORD IS ABOUT — staff_performance_missed_dates.
+ *   A record filed for missed attendance submissions names only the month in
+ *   its title ("CAF - Missed Daily Attendance (October 2026)") and keeps the
+ *   individual days in a child table, one row per day:
+ *
+ *     staff_performance_missed_date      the day missed. A real DATE column,
+ *                                        unlike staff_performance_date
+ *     staff_performance_missed_periods   free text: '4.30PM', '8AM & 4.30PM'
+ *
+ *   Matched on staff_performance_id with staff_performance_missed_deleted = 0,
+ *   and published as missed_dates[] on the record it belongs to.
+ *
+ *   MOST RECORDS HAVE NONE. The table exists for the missed-submission type
+ *   alone, so missed_dates[] is empty on every other record and that is the
+ *   right answer, not a gap.
+ *
+ *   ROWS WITH A NULL staff_performance_id BELONG TO NOBODY and are dropped —
+ *   one of the two rows in the table today is one: a day entered against a
+ *   record that was never written. Matching on the parent id is what excludes
+ *   it, which is why that match is the test and not the staff id beside it.
+ *
+ *   THE DAYS ARE NOT FILTERED BY from..to. A record dated 1 November can list
+ *   October days; the days are the record's own content, so a missed_date
+ *   outside the month being asked for is expected rather than wrong. What the
+ *   report's range selects is the RECORD.
+ *
+ *   `periods` is published exactly as typed. '8AM & 4.30PM' is one string
+ *   naming two periods, and splitting it here would be inventing a format
+ *   nothing enforces.
  *
  * MERIT OR DEMERIT — THE TYPES TABLE FIRST, THE RECORD SECOND, AND THE SECOND
  * ONE IS NOT A FALLBACK YOU CAN SKIP. 445 of the 1,243 live rows — better than
@@ -126,6 +159,10 @@ require_once __DIR__ . '/staffPoolCore.php';
 /** The table this endpoint is about, and the lookup that names its types. */
 define('PERF_TABLE',       'staff_profile.staff_performance');
 define('PERF_TABLE_TYPES', 'staff_profile.staff_performance_types');
+
+/** The child table holding the individual days a missed-submission record is
+ *  about — see THE DAYS A RECORD IS ABOUT at the top. */
+define('PERF_TABLE_MISSED', 'staff_profile.staff_performance_missed_dates');
 
 /** The `performance` filter's accepted values. 'all' includes the records that
  *  say neither — see MERIT OR DEMERIT at the top. */
@@ -291,6 +328,63 @@ class PerformanceRepository
         $stmt->execute(array(':f' => $fromIso, ':t' => $toIso));
         return $stmt->fetchAll();
     }
+
+    /**
+     * Query: the missed days behind a set of records, as
+     * staff_performance_id => array of (date, periods), earliest day first.
+     *
+     * SCOPED BY THE RECORDS ALREADY FETCHED, NOT BY THE MONTH. The days are
+     * the record's own content and a record dated 1 November can list October
+     * days, so dating them into from..to would hide exactly the rows the
+     * record exists to list. See THE DAYS A RECORD IS ABOUT at the top.
+     *
+     * staff_performance_id IS NULL drops out along with the deleted rows,
+     * because a day naming no record belongs to nobody — an IN list on the
+     * parent ids excludes both without a second test.
+     *
+     * The date is a real DATE here, so it needs none of perfIsoDate()'s
+     * repair work; DATE_FORMAT still turns MySQL's '0000-00-00' into
+     * something recognisable rather than a day nobody can place.
+     */
+    public function missedDates(array $perfIds)
+    {
+        /* Ints taken straight off the parent rows and placed inline rather
+         * than bound: the list is as long as the month, and naming a
+         * placeholder per id buys nothing the cast has not already given. */
+        $ids = array();
+        foreach ($perfIds as $id) {
+            $id = (int)$id;
+            if ($id > 0) { $ids[$id] = $id; }
+        }
+        if (empty($ids)) {
+            return array();
+        }
+
+        $sql = "SELECT m.staff_performance_id                  AS perf_id,
+                       DATE_FORMAT(m.staff_performance_missed_date, '%Y-%m-%d')
+                                                               AS d,
+                       m.staff_performance_missed_periods      AS periods
+                  FROM " . PERF_TABLE_MISSED . " m
+                 WHERE m.staff_performance_missed_deleted = '0'
+                   AND m.staff_performance_id IN (" . implode(',', $ids) . ")
+                 ORDER BY m.staff_performance_id,
+                          m.staff_performance_missed_date,
+                          m.id";
+
+        $out = array();
+        foreach ($this->db->query($sql)->fetchAll() as $r) {
+            $day = trim((string)$r['d']);
+            if ($day === '' || $day === '0000-00-00') {
+                continue;
+            }
+            $out[(int)$r['perf_id']][] = array(
+                'date'    => $day,
+                /* Exactly as typed: see `periods` at the top. */
+                'periods' => trim((string)$r['periods']),
+            );
+        }
+        return $out;
+    }
 }
 
 /* ---------- composing ----------------------------------------------------- */
@@ -302,8 +396,11 @@ class PerformanceRepository
  * the top of this file for why the second is not optional — a third of the
  * live rows name no type at all and the record is the only thing that says
  * which way they count.
+ *
+ * $missed is missedDates()' map, read by this record's own id. Nothing there
+ * means this record names no days, which is the normal case.
  */
-function perfRecord(array $r, array $types)
+function perfRecord(array $r, array $types, array $missed)
 {
     $typeId = trim((string)$r['type_id']);
     $known  = ($typeId !== '' && isset($types[$typeId]));
@@ -337,6 +434,12 @@ function perfRecord(array $r, array $types)
         /* Which of the two sources decided it — see MERIT OR DEMERIT. */
         'merit_demerit_from' => $from,
         'points'             => trim((string)$r['points']),
+        /* The individual days behind this record, [] on everything but a
+         * missed-submission one — see THE DAYS A RECORD IS ABOUT at the top.
+         * Not filtered by the report's range: they are this record's content,
+         * not a second thing to select on. */
+        'missed_dates'       => isset($missed[(int)$r['id']])
+                                    ? $missed[(int)$r['id']] : array(),
     );
 }
 
@@ -351,14 +454,14 @@ function perfRecord(array $r, array $types)
  * A GW is ALSO indexed by code, because a GW whose mobile matched no myMK
  * registration has no mk_id and could not be found any other way.
  */
-function perfIndex(array $rows, array $types)
+function perfIndex(array $rows, array $types, array $missed)
 {
     $byStaffId = array();
     $byGwId    = array();
     $byGwCode  = array();
 
     foreach ($rows as $r) {
-        $record = perfRecord($r, $types);
+        $record = perfRecord($r, $types, $missed);
         if ($record['date'] === null) {
             continue;                       /* junk date: see perfIsoDate() */
         }
@@ -422,7 +525,8 @@ function perfCompose(array $records, $filter)
     $out     = array();
     $days    = array();
     $byType  = array();
-    $tally   = array('merit' => 0, 'demerit' => 0, 'unknown' => 0);
+    $tally   = array('merit' => 0, 'demerit' => 0, 'unknown' => 0,
+                     'missed_dates' => 0);
 
     foreach ($records as $record) {
         $verdict = $record['merit_demerit'];
@@ -432,6 +536,10 @@ function perfCompose(array $records, $filter)
         }
 
         $out[] = $record;
+
+        /* Days, not records: one record can name several. Counted off the
+         * records that SURVIVED the filter, like everything else here. */
+        $tally['missed_dates'] += count($record['missed_dates']);
 
         if ($verdict === 'merit' || $verdict === 'demerit') {
             $tally[$verdict]++;
@@ -465,6 +573,8 @@ function perfCompose(array $records, $filter)
             'merit'   => $tally['merit'],
             'demerit' => $tally['demerit'],
             'unknown' => $tally['unknown'],
+            /* Days named across this person's records, not a record count. */
+            'missed_dates' => $tally['missed_dates'],
             'by_type' => $byType,
         ),
     );
@@ -565,14 +675,24 @@ try {
     }
 
     /* ---- the reads, once each ---- */
-    $perf  = new PerformanceRepository($pdo);
-    $types = $perf->types();
-    $index = perfIndex($perf->month($fromIso, $toIso), $types);
+    $perf     = new PerformanceRepository($pdo);
+    $types    = $perf->types();
+    $perfRows = $perf->month($fromIso, $toIso);
+
+    /* The missed days are asked for by parent id, so this read is scoped by
+     * the records just fetched and not by the month — see missedDates(). */
+    $perfIds = array();
+    foreach ($perfRows as $r) {
+        $perfIds[] = $r['id'];
+    }
+
+    $index = perfIndex($perfRows, $types, $perf->missedDates($perfIds));
 
     /* ---- compose ---- */
     $out    = array();
     $totals = array('people_with_records' => 0, 'records' => 0,
-                    'merit' => 0, 'demerit' => 0, 'unknown' => 0);
+                    'merit' => 0, 'demerit' => 0, 'unknown' => 0,
+                    'missed_dates' => 0);
 
     foreach ($rows as $row) {
         $public = publicRow($row, $overrides, $compNames);
@@ -604,6 +724,7 @@ try {
         $totals['merit']   += $month_['summary']['merit'];
         $totals['demerit'] += $month_['summary']['demerit'];
         $totals['unknown'] += $month_['summary']['unknown'];
+        $totals['missed_dates'] += $month_['summary']['missed_dates'];
 
         $out[] = $entry;
     }
@@ -644,15 +765,20 @@ try {
             'demerit'             => $totals['demerit'],
             /* Records naming neither, which performance=all alone returns. */
             'unknown'             => $totals['unknown'],
+            /* Missed DAYS across every record returned — see THE DAYS A
+             * RECORD IS ABOUT. Far smaller than `records`: only the
+             * missed-submission type names any. */
+            'missed_dates'        => $totals['missed_dates'],
         ),
         'staff'        => $out,
     ));
 } catch (Exception $e) {
     error_log('performanceAPI: ' . $e->getMessage());
     /* Longest name first: 'staff_performance' is a prefix of
-     * 'staff_performance_types', so testing it first would blame the records
-     * for a lookup failure. */
-    foreach (array('staff_performance_types' => 'the performance types',
+     * 'staff_performance_types' and of 'staff_performance_missed_dates', so
+     * testing it first would blame the records for a lookup failure. */
+    foreach (array('staff_performance_missed_dates' => 'the missed attendance days',
+                   'staff_performance_types' => 'the performance types',
                    'staff_performance'       => 'the performance records',
                    'member_registrations'    => 'the myMK registrations',
                    'monthly_assign_gw'       => 'the GW records',
