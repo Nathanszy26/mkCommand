@@ -54,6 +54,17 @@ header('Content-Type: application/json; charset=UTF-8');
  *     leaves[]                          one entry per leave application
  *     days{ "3": {leave_id,leave_type,half} }   day OF THE MONTH -> that day
  *
+ *   applied_date ON A leaves[] ENTRY IS WHEN THE APPLICATION WAS MADE, Y-m-d,
+ *   and is not one of the days taken. It is usually before date_from and is
+ *   sometimes after it, because leave does get filed late — so it is the
+ *   field to read for "how much notice was given", and never a day to count.
+ *   days_in_month and the totals are unaffected by it.
+ *
+ *   '' MEANS NOT RECORDED, not "today" and not an error. It comes from
+ *   apply_date on the two hr tables, which gas_usage.driver_leaves has no
+ *   equivalent of — so a leave only that table knows about is blank here,
+ *   exactly as its reason is. See THE SOURCES below.
+ *
  *   GROUP A REPORT BY hod_unit AND am_unit, NOT BY A BRANCH — same rule as
  *   attendanceAPI.php, and for the same reason: each person has exactly one of
  *   each, while the branches overlap by design and would count people twice.
@@ -63,9 +74,14 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  *   STAFF, both of these, merged:
  *     hr.leave_application      on 175.145.207.141. staff_id IS users.person.
- *                               Dates stored 'Y/m/d' (all 60,064 rows).
+ *                               Dates stored 'Y/m/d' (all 60,064 rows), and
+ *                               apply_date with them — the one table family
+ *                               that records when an application was made.
  *     gas_usage.driver_leaves   local. driver_leave_person is users.person.
- *                               Dates stored 'Y-m-d'.
+ *                               Dates stored 'Y-m-d'. NINE COLUMNS, all of
+ *                               them the leave itself: no apply_date, no
+ *                               reason, no cancel_date. A row only this table
+ *                               has comes back with applied_date ''.
  *
  *     DEDUPLICATED ON leave_application_id, WHICH IS NOT OPTIONAL. Every one
  *     of the 19,635 driver_leaves rows carries the id of its
@@ -387,8 +403,8 @@ function leaveApm($value)
  * WHOLE company in a single query — a per-person query would be 668 of them.
  *
  * All three return the same shape, a flat list of records:
- *   array( key, leave_id, leave_type, status, date_from, date_to,
- *          from_apm, to_apm, reason, source )
+ *   array( key, leave_id, leave_type, status, applied_date, date_from,
+ *          date_to, from_apm, to_apm, reason, source )
  * so composing them is one rule applied three times and not three rules.
  */
 class LeaveRepository
@@ -426,7 +442,8 @@ class LeaveRepository
                        a.leave_type_id        AS leave_type,
                        a.leave_status_id      AS status,
                        a.date_from, a.date_to, a.from_apm, a.to_apm,
-                       a.reasons              AS reason
+                       a.reasons              AS reason,
+                       a.apply_date           AS applied_date
                   FROM hr.leave_application a
                  WHERE REPLACE(a.date_from,'/','-') <= :t
                    AND REPLACE(a.date_to,'/','-')   >= :f
@@ -461,7 +478,15 @@ class LeaveRepository
                        d.driver_leave_to        AS date_to,
                        d.driver_leave_from_apm  AS from_apm,
                        d.driver_leave_to_apm    AS to_apm,
-                       '' AS reason
+                       '' AS reason,
+                       /* THIS TABLE DOES NOT RECORD WHEN A LEAVE WAS APPLIED
+                        * FOR. Its nine columns are the leave itself and
+                        * nothing about the application, so applied_date is ''
+                        * for any row only this table has — the same blank,
+                        * and for the same reason, as reason above. A row HR
+                        * also has gets HR's apply_date, because HR is loaded
+                        * first and wins the dedupe; see leaveMergeStaff(). */
+                       '' AS applied_date
                   FROM gas_usage.driver_leaves d
                  WHERE REPLACE(d.driver_leave_from,'/','-') <= :t
                    AND REPLACE(d.driver_leave_to,'/','-')   >= :f
@@ -486,7 +511,8 @@ class LeaveRepository
                        g.leave_type_id        AS leave_type,
                        g.leave_status_id      AS status,
                        g.date_from, g.date_to, g.from_apm, g.to_apm,
-                       g.reasons              AS reason
+                       g.reasons              AS reason,
+                       g.apply_date           AS applied_date
                   FROM hr.leave_application_GW g
                  WHERE REPLACE(g.date_from,'/','-') <= :t
                    AND REPLACE(g.date_to,'/','-')   >= :f
@@ -630,17 +656,26 @@ class LeaveRepository
             if ($to < $from) {
                 $swap = $from; $from = $to; $to = $swap;
             }
+            /* NOT A REASON TO DROP THE ROW, unlike the key and the two dates
+             * above. When somebody applied is a fact ABOUT the application
+             * and not part of it: a leave whose apply_date is blank, junk, or
+             * from a table that never recorded one is still that person's
+             * leave, on those days. It comes back '' — read it as "not
+             * recorded", never as a date. leaveIsoDate() takes the same
+             * 'Y/m/d' this column is stored in as date_from does. */
+            $applied = leaveIsoDate($r['applied_date']);
             $out[] = array(
-                'key'        => $key,
-                'leave_id'   => (string)$r['leave_id'],
-                'leave_type' => strtoupper(trim((string)$r['leave_type'])),
-                'status'     => (string)$r['status'],
-                'date_from'  => $from,
-                'date_to'    => $to,
-                'from_apm'   => leaveApm($r['from_apm']),
-                'to_apm'     => leaveApm($r['to_apm']),
-                'reason'     => trim((string)$r['reason']),
-                'source'     => $source,
+                'key'          => $key,
+                'leave_id'     => (string)$r['leave_id'],
+                'leave_type'   => strtoupper(trim((string)$r['leave_type'])),
+                'status'       => (string)$r['status'],
+                'applied_date' => $applied === null ? '' : $applied,
+                'date_from'    => $from,
+                'date_to'      => $to,
+                'from_apm'     => leaveApm($r['from_apm']),
+                'to_apm'       => leaveApm($r['to_apm']),
+                'reason'       => trim((string)$r['reason']),
+                'source'       => $source,
             );
         }
         return $out;
@@ -891,6 +926,14 @@ function leaveComposeDays(array $records, $fromIso, $toIso)
             'leave_type_name' => leaveTypeName($r['leave_type']),
             'status'          => $r['status'],
             'status_name'     => leaveStatusName($r['status']),
+            /* WHEN IT WAS APPLIED FOR, Y-m-d, or '' when no table recorded
+             * it. It is NOT one of the leave's days and never belongs in
+             * days_in_month — it is the day the application was made, which
+             * is usually before date_from and is sometimes after it, because
+             * leave gets filed late. '' means "not recorded", and
+             * gas_usage.driver_leaves records it for nobody: see
+             * staffDriver(). */
+            'applied_date'    => isset($r['applied_date']) ? $r['applied_date'] : '',
             /* The WHOLE application, even the part outside this month, so a
              * caller can see that a leave started before the 1st. */
             'date_from'       => $r['date_from'],

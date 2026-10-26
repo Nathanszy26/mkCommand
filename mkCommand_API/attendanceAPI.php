@@ -6,8 +6,8 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  * MEANT TO BE READ BESIDE staffPoolAPI.php, not instead of it. That endpoint
  * owns who exists and what the org looks like — the pool, hod[], am[], the
- * reporting line. This one answers one question per person and nothing else,
- * keyed by the SAME identity it prints:
+ * reporting line. This one answers the two attendance slots per person and
+ * nothing else — 8:00am and 4:30pm — keyed by the SAME identity it prints:
  *
  *     person + comp_id + staff_type
  *
@@ -59,9 +59,20 @@ header('Content-Type: application/json; charset=UTF-8');
  *     am_person,  am_unit               nearest department head above them,
  *                                       and the nearest sub-department head.
  *                                       Themselves, when they are one.
- *     daily:  time, status, source, is_public_holiday
- *     month:  summary{on_time,late,no_data},
- *             days{ "1": {time,status,source,is_public_holiday} }
+ *     daily:  time, status, source                 the 8:00am slot
+ *             pm_time, pm_status, pm_source        the 4:30pm slot
+ *             is_public_holiday
+ *     month:  summary{on_time,late,no_data}        the 8:00am slot
+ *             pm_summary{has_data,no_data}         the 4:30pm slot
+ *             days{ "1": {time,status,source,
+ *                         pm_time,pm_status,pm_source,is_public_holiday} }
+ *
+ *   TWO SLOTS, ONE CELL. The unprefixed fields are the morning and keep the
+ *   names and the meanings they have always had, so a caller written before
+ *   the afternoon existed reads exactly what it used to. The pm_ ones are the
+ *   afternoon, and they are a DIFFERENT QUESTION with a different vocabulary:
+ *   has_data / no_data, never on_time or late. Do not add a pm_summary to a
+ *   summary — each covers every day already, so the sum would double-count.
  *
  *   GROUP A REPORT BY hod_unit AND am_unit, NOT BY A BRANCH. Each person has
  *   exactly one of each, so grouping covers the company once. The branches in
@@ -69,36 +80,85 @@ header('Content-Type: application/json; charset=UTF-8');
  *   above them — and a report grouped by those would count people repeatedly.
  *   attendanceBoard.php groups by these two.
  *
- * THE RULE — one slot, 8:00am, and nothing else is judged.
- *   status   on_time   checked in before 08:01:00
- *            late      08:01:00 or after
- *            no_data   neither source has them that day
- *   source   attendance_app | site_check_in | "" when no_data
+ * THE RULES — two slots, 8:00am and 4:30pm, and nothing else is judged.
+ *
+ *   8:00am — PUNCTUALITY. Were they on time?
+ *     status   on_time   checked in before 08:01:00
+ *              late      08:01:00 or after
+ *              no_data   no source has them that day
+ *     source   attendance_app | site_check_in | face_log | "" when no_data
  *
  *   THE WHOLE 8:00 MINUTE IS ON TIME. 08:00:04 has not reached 8:01, so it is
  *   not late; 08:01:00 is the first late second. rules.late_from publishes
  *   that one number, so a caller applying it with < gets exactly what this
  *   file got.
  *
+ *   4:30pm — PRESENCE. Did they check in at all?
+ *     pm_status   has_data   a source has them in that slot that day
+ *                 no_data    none does
+ *     pm_source   attendance_app | site_check_in | face_log | "" when no_data
+ *     pm_time     the check-in, still published — worth reading even though
+ *                 nothing is being marked against it
+ *
+ *   NOTHING AT 4:30PM IS LATE, AND THERE IS NO pm_late_from. The slot opens
+ *   at 16:30 and people submit it across the rest of the evening, so a
+ *   lateness line there would mark the diligent and the departed alike. The
+ *   legacy report takes the same position —
+ *   $ATT_PERIOD_LATE_CHECK['4.30PM'] is false in attendanceReportShared.php,
+ *   which shows the 4:30pm check-in but never calls it LATE.
+ *
+ *   BOTH SLOTS ARE FOUND THE SAME WAY — the source chain below is one rule
+ *   applied twice, with each read scoped to its own slot. What differs is
+ *   only what is made of a hit.
+ *
  *   A person is looked for in this order, and the FIRST hit wins:
  *     1. the attendance app — evaluation.staff_attendance for staff,
- *        evaluation.gw_attendance for a GW, both at period 8AM, as
- *        staffAttendanceReport.php and gwAttendanceReport.php read them
- *        (self check-in, submitted from the app).
- *     2. site check-in — mkPortal.staff_attendance_logs, the earliest check-in
- *        they made that day, as siteCheckInReport.php's STAFF report reads
- *        it. Lunch-break rows are not arrivals and are left out. Staff only:
- *        a GW has no users row and so never appears there.
- *     3. nothing: no_data.
+ *        evaluation.gw_attendance for a GW, at period 8AM for the morning and
+ *        4.30PM for the afternoon, as staffAttendanceReport.php and
+ *        gwAttendanceReport.php read them (self check-in, submitted from the
+ *        app). The period codes are the app's own strings; the dot in
+ *        '4.30PM' is part of the stored value.
+ *     2. site check-in — mkPortal.staff_attendance_logs, as
+ *        siteCheckInReport.php's STAFF report reads it. Lunch-break rows are
+ *        not arrivals and are left out. Staff only: a GW has no users row and
+ *        so never appears there.
+ *
+ *        THIS TABLE HAS NO SLOT OF ITS OWN — a row is a check-in at a moment
+ *        — so the slot is a time window instead. The morning takes the
+ *        earliest check-in of the day; the afternoon takes the earliest from
+ *        16:30 onwards, which is when the app itself opens the 4.30PM slot.
+ *        Without that window, a 7:40am arrival would be counted as the
+ *        afternoon too, and every one of these thirty-odd people would read
+ *        has_data every day.
+ *     3. the face log — evaluation.staff_attendance_face_log, the HQ door
+ *        terminal's own record, loaded from a spreadsheet one row per person
+ *        per day. first_in is the morning and last_out the afternoon.
+ *
+ *        MATCHED ON users.attendance_face_id, int to int, and on nothing
+ *        else, so this arm is staff only: a GW has no users row and so no
+ *        face id. It is LAST because it is a machine's record of a door and
+ *        not a person's statement about their day — where somebody both
+ *        submitted the app and walked past the reader, the submission is the
+ *        answer.
+ *
+ *        last_out GETS THE SAME 16:30 WINDOW as site check-in, and needs it
+ *        more: last_out is the last time the terminal saw somebody, not the
+ *        time they went home. On 23 Oct 2026, 17 of the 63 were before 16:30
+ *        and the earliest was 07:00:49.
+ *     4. nothing: no_data.
  *
  *   The order is the point. On 20 Oct 2026 the app had 505 of Globinaco's
- *   people and site check-in had 30, with almost nobody in both. They are two
- *   populations doing two jobs, so this is a fallback and never a tie-break.
+ *   people and site check-in had 30, with almost nobody in both; of the 98
+ *   people the face log matched on 23 Oct 2026, 5 had also submitted the app.
+ *   These are three populations doing three jobs, so each is a fallback for
+ *   the one before it and never a tie-break.
  *
- *   EARLIEST WINS within a source. Somebody who starts six patrol rounds in a
- *   day is judged on the first one, and a person with two app submissions on
- *   the same slot is judged on the earlier. Anything else would let a late
- *   second entry erase an on-time first one.
+ *   EARLIEST WINS within a source and within the slot's window. Somebody who
+ *   starts six patrol rounds in a day is judged on the first one, and a
+ *   person with two app submissions on the same slot is judged on the
+ *   earlier. Anything else would let a late second entry erase an on-time
+ *   first one. For 4:30pm, where nothing is scored, it simply means the time
+ *   shown is the check-in nearest the slot.
  *
  * PUBLIC HOLIDAYS — MARKED, NEVER SCORED.
  *   is_public_holiday  '1'  that calendar day is a public holiday
@@ -110,9 +170,10 @@ header('Content-Type: application/json; charset=UTF-8');
  *   "nobody could ask" is a different answer from "no", the same way
  *   source = '' is different from a source.
  *
- *   IT DOES NOT MOVE status. A no_data on Deepavali is still a no_data: this
- *   endpoint judges the 8am slot and nothing else, and whether a company
- *   holiday excuses an absence is a policy question the CALLER owns. The flag
+ *   IT DOES NOT MOVE EITHER status. A no_data on Deepavali is still a
+ *   no_data, morning and afternoon alike: this endpoint judges the two slots
+ *   and nothing else, and whether a company holiday excuses an absence is a
+ *   policy question the CALLER owns. The flag
  *   is here so a report can grey that column out, or leave those days out of
  *   its totals, with this file taking no position on which.
  *
@@ -145,25 +206,44 @@ header('Content-Type: application/json; charset=UTF-8');
 
 require_once __DIR__ . '/staffPoolCore.php';
 
-/* ---------- the rule ------------------------------------------------------ */
+/* ---------- the rules ----------------------------------------------------- */
 
-/** The one slot this endpoint judges. The app writes this exact string into
- *  attendance_period / gw_attendance_period — see $ATT_PERIODS in
- *  attendance/includes/attendanceReportShared.php, which is where the code
- *  comes from. Change both or neither. */
-define('ATT_PERIOD', '8AM');
+/** THE TWO SLOTS THIS ENDPOINT JUDGES. The app writes these exact strings
+ *  into attendance_period / gw_attendance_period — see $ATT_PERIODS in
+ *  attendance/includes/attendanceReportShared.php, which is where the codes
+ *  come from. The dot in '4.30PM' is part of the stored code, not a typo.
+ *  Change these or change that, never one of them. */
+define('ATT_PERIOD_AM', '8AM');
+define('ATT_PERIOD_PM', '4.30PM');
 
 /**
- * THE MOMENT IT BECOMES LATE. Anything before this is on time, so the whole
- * of the 8:00 minute counts — 08:00:04 has not reached 8:01 and is on time,
- * 08:01:00 is the first late second.
+ * THE MOMENT THE MORNING BECOMES LATE. Anything before this is on time, so
+ * the whole of the 8:00 minute counts — 08:00:04 has not reached 8:01 and is
+ * on time, 08:01:00 is the first late second.
  *
  * Expressed as the start of lateness rather than as a last-on-time value
  * because that is the rule in one unambiguous number: there is no "is the
  * boundary inclusive" question to get wrong. Compared as a string, which is
  * safe because both sides are zero-padded HH:MM:SS.
+ *
+ * THERE IS DELIBERATELY NO SUCH NUMBER FOR THE AFTERNOON. 4:30pm is a
+ * presence check and not a punctuality one — has_data or no_data — which is
+ * the legacy report's rule too: $ATT_PERIOD_LATE_CHECK['4.30PM'] is false in
+ * attendanceReportShared.php, so a 4:30pm check-in is shown there but never
+ * marked LATE.
  */
 define('ATT_LATE_FROM', '08:01:00');
+
+/**
+ * WHEN THE AFTERNOON SLOT OPENS, and the only thing this time is used for:
+ * deciding which site check-ins could be evidence of it. The app will not
+ * submit a 4.30PM row before this — the earliest in October 2026 is 16:30:07
+ * — so the fallback is held to the same line. Without it, somebody's 7am
+ * arrival at a site would be read as them doing the 4:30pm slot.
+ *
+ * NOT a lateness boundary. Nothing at 4:30pm is late; see ATT_LATE_FROM.
+ */
+define('ATT_PM_FROM', '16:30:00');
 
 /* ---------- the calendar -------------------------------------------------- */
 
@@ -279,7 +359,10 @@ class AttendanceRepository
     }
 
     /**
-     * Query: the staff app's 8am check-ins, as the staff report reads them.
+     * Query: the staff app's check-ins for ONE slot, as the staff report reads
+     * them. $period is ATT_PERIOD_AM or ATT_PERIOD_PM — the slot is a
+     * parameter and not a constant in the SQL, so the morning and the
+     * afternoon are read by the same code and cannot drift apart.
      *
      * Indexed BOTH ways on purpose. That report matches a person on
      * (attendance_by_person AND attendance_by_comp_id) OR mymk_id, because the
@@ -289,7 +372,7 @@ class AttendanceRepository
      *
      * MIN(time) per day: see EARLIEST WINS at the top of this file.
      */
-    public function staffApp($compId, $fromYmd, $toYmd)
+    public function staffApp($compId, $fromYmd, $toYmd, $period)
     {
         $sql = "SELECT a.attendance_by_person AS person,
                        a.attendance_by_comp_id AS comp_id,
@@ -307,7 +390,7 @@ class AttendanceRepository
                           a.mymk_id, a.attendance_by_date";
 
         $stmt = $this->db->prepare($sql);
-        $stmt->execute(array(':period' => ATT_PERIOD, ':f' => $fromYmd,
+        $stmt->execute(array(':period' => $period, ':f' => $fromYmd,
                              ':t' => $toYmd, ':c' => (string)(int)$compId));
 
         $byPerson = array();
@@ -330,8 +413,9 @@ class AttendanceRepository
     }
 
     /**
-     * Query: the GW app's 8am check-ins, as the GW report reads them — keyed
-     * on monthly_assign_gw_code, which is the pool's `person` for a GW.
+     * Query: the GW app's check-ins for ONE slot, as the GW report reads them
+     * — keyed on monthly_assign_gw_code, which is the pool's `person` for a
+     * GW. $period is ATT_PERIOD_AM or ATT_PERIOD_PM, as in staffApp().
      *
      * A row with no code identifies nobody and is dropped: the table carries
      * plenty of them from submissions that never named a worker.
@@ -341,7 +425,7 @@ class AttendanceRepository
      * so a company filter here could only ever remove a row that was about to
      * be ignored anyway.
      */
-    public function gwApp($fromYmd, $toYmd)
+    public function gwApp($fromYmd, $toYmd, $period)
     {
         $sql = "SELECT g.monthly_assign_gw_code AS person,
                        g.gw_attendance_by_date AS d,
@@ -356,7 +440,7 @@ class AttendanceRepository
                  GROUP BY g.monthly_assign_gw_code, g.gw_attendance_by_date";
 
         $stmt = $this->db->prepare($sql);
-        $stmt->execute(array(':period' => ATT_PERIOD, ':f' => $fromYmd, ':t' => $toYmd));
+        $stmt->execute(array(':period' => $period, ':f' => $fromYmd, ':t' => $toYmd));
 
         $out = array();
         foreach ($stmt->fetchAll() as $r) {
@@ -379,10 +463,22 @@ class AttendanceRepository
      * they arrive at a site, and it covers about thirty — which is the
      * population this fallback is for.
      *
+     * $sinceTime NARROWS IT TO ONE SLOT, and is the whole difference between
+     * the morning read and the afternoon one. This table has no slot column:
+     * a row is a check-in at a moment, and the same thirty-odd people check
+     * in morning, midday and late afternoon (448 rows from 16:30 onwards in
+     * October 2026). Passed null — the morning — every row counts and the
+     * earliest is the arrival. Passed ATT_PM_FROM, only rows from 16:30
+     * onwards count, so a person who was at a site at 07:40 and nowhere near
+     * one at 4:30pm is no_data for the afternoon instead of being credited
+     * with it. MIN() still applies, so what comes back is the check-in
+     * NEAREST the slot rather than whatever they did last.
+     *
      * LUNCH IS NOT AN ARRIVAL. is_lunch_break marks the out/in pair somebody
      * logs at midday; counting one would turn a lunch break into a very late
      * start on any day whose arrival row is missing. Dropped here so the
-     * earliest row left is an arrival.
+     * earliest row left is an arrival. It stays dropped for the afternoon
+     * too, where a midday row is out of the window anyway.
      *
      * Indexed by person AND by mymk_id, exactly as staffApp() is and for the
      * same reason — this table carries both, and the pool's mk_id matches the
@@ -390,7 +486,7 @@ class AttendanceRepository
      *
      * Deleted rows are retractions and stay out.
      */
-    public function siteCheckIn($compId, $fromYmd, $toYmd)
+    public function siteCheckIn($compId, $fromYmd, $toYmd, $sinceTime = null)
     {
         $sql = "SELECT l.person, l.mymk_id, DATE(l.checked_in_at) AS d,
                        MIN(TIME(l.checked_in_at)) AS t
@@ -399,12 +495,22 @@ class AttendanceRepository
                    AND l.comp_id = :c
                    AND IFNULL(l.is_lunch_break, 0) <> 1
                    AND l.checked_in_at IS NOT NULL
-                   AND DATE(l.checked_in_at) BETWEEN :f AND :t
-                 GROUP BY l.person, l.mymk_id, DATE(l.checked_in_at)";
+                   AND DATE(l.checked_in_at) BETWEEN :f AND :t";
 
         /* comp_id is VARCHAR here, so it binds as a string. */
+        $args = array(':c' => (string)(int)$compId, ':f' => $fromYmd, ':t' => $toYmd);
+
+        /* Bound only when there is a window, so the morning read stays the
+         * query it always was. */
+        if ($sinceTime !== null) {
+            $sql .= "\n                   AND TIME(l.checked_in_at) >= :since";
+            $args[':since'] = $sinceTime;
+        }
+
+        $sql .= "\n                 GROUP BY l.person, l.mymk_id, DATE(l.checked_in_at)";
+
         $stmt = $this->db->prepare($sql);
-        $stmt->execute(array(':c' => (string)(int)$compId, ':f' => $fromYmd, ':t' => $toYmd));
+        $stmt->execute($args);
 
         $byPerson = array();
         $byMkId   = array();
@@ -425,12 +531,113 @@ class AttendanceRepository
         return array('by_person' => $byPerson, 'by_mk_id' => $byMkId);
     }
 
+    /**
+     * Query: the face terminal's day, keyed by mk_id — the HQ door readings,
+     * evaluation.staff_attendance_face_log.
+     *
+     * NOT A CHECK-IN ANYBODY MAKES. The other two sources are somebody
+     * deciding to submit; this one is a machine export, loaded from a
+     * spreadsheet (source_file is 'HQ3 report.xls'), one row per person per
+     * day with the first time they were seen and the last. It is the only
+     * source here nobody can forget to use, which is also why it is the only
+     * one that can show a person who never touched the app.
+     *
+     * MATCHED ON attendance_face_id, AND ONLY ON THAT. users.attendance_face_id
+     * is the number the terminal knows a person by, and person_id here is that
+     * number; the join is int to int, so there is no name to spell wrong and
+     * no collation to trip over. The 104 ids in use are unique across every
+     * users row, deleted ones included, so one id is one person.
+     *
+     * STAFF ONLY, which falls out of the join rather than being a rule: the
+     * key is users.id — the pool's mk_id — and a GW has none. A GW has no
+     * face id either, and no row here.
+     *
+     * TWO INDEXES OUT OF ONE ROW, because the row holds both ends of the day:
+     *   first_in   the morning, judged against ATT_LATE_FROM like any arrival
+     *   last_out   the afternoon, and ONLY when it is at $outSince or later
+     *
+     * $outSince IS NOT OPTIONAL POLISH. last_out is "the last time this person
+     * was seen", not "the time they went home": 17 of the 63 on 23 Oct 2026
+     * are before 16:30 and the earliest is 07:00:49, somebody who was gone by
+     * breakfast. Counted unfiltered, every one of them would read has_data for
+     * the 4:30pm slot. The window is the same ATT_PM_FROM that scopes the site
+     * check-in read, so both fallbacks answer the afternoon on the same terms.
+     *
+     * EITHER END CAN BE BLANK and they are kept apart for that reason — 41 of
+     * the 110 rows that day had no first_in and 47 no last_out. A person
+     * carrying one and not the other is found for that slot and no_data for
+     * the other, which is what the terminal actually knows about them.
+     *
+     * MIN(first_in) / MAX(last_out) because the name of each column is the
+     * rule: first in, last out. One row per person per day today, so the
+     * grouping changes nothing — it is there for the day the same date is
+     * uploaded twice, or a second terminal's file lands beside this one.
+     */
+    public function faceLog($fromIso, $toIso, $outSince)
+    {
+        /* Cross-schema, like the reads above — both are local under prog4.
+         * NULLIF(TRIM(...)) first so a blank cell cannot win a MIN(): '' sorts
+         * before every real time. */
+        $sql = "SELECT u.id AS mk_id,
+                       f.attendance_date AS d,
+                       MIN(NULLIF(TRIM(f.first_in), '')) AS first_in,
+                       MAX(NULLIF(TRIM(f.last_out), '')) AS last_out
+                  FROM staff_portal2.users u
+                  JOIN evaluation.staff_attendance_face_log f
+                    ON f.person_id = u.attendance_face_id
+                 WHERE u.attendance_face_id IS NOT NULL
+                   AND u.attendance_face_id > 0
+                   AND f.attendance_date BETWEEN :f AND :t
+                 GROUP BY u.id, f.attendance_date";
+
+        /* No company predicate and no status predicate on users: the key is
+         * users.id, which the pool already handed us for people it decided
+         * are in. Filtering again here could only lose somebody the pool
+         * kept — a Trillium row, say, which is stored under company 1. */
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute(array(':f' => $fromIso, ':t' => $toIso));
+
+        $firstIn = array();
+        $lastOut = array();
+        foreach ($stmt->fetchAll() as $r) {
+            $date = self::isoDate($r['d']);
+            $mkId = (int)$r['mk_id'];
+            if ($date === null || $mkId <= 0) {
+                continue;
+            }
+
+            $in = self::clockTime($r['first_in']);
+            if ($in !== null) {
+                self::keepEarliest($firstIn, $mkId, $date, $in);
+            }
+
+            $out = self::clockTime($r['last_out']);
+            /* The window, and the whole reason last_out is not simply
+             * trusted — see $outSince above. */
+            if ($out !== null && $out >= $outSince) {
+                self::keepLatest($lastOut, $mkId, $date, $out);
+            }
+        }
+        return array('first_in' => array('by_mk_id' => $firstIn),
+                     'last_out' => array('by_mk_id' => $lastOut));
+    }
+
     /** Command: keep the earliest time seen for this key and day. The GROUP BY
      *  already does it per row set; this holds when one person's rows arrive
      *  under two spellings of the same key. */
     private static function keepEarliest(array &$index, $key, $date, $time)
     {
         if (!isset($index[$key][$date]) || $time < $index[$key][$date]) {
+            $index[$key][$date] = $time;
+        }
+    }
+
+    /** Command: keep the LATEST time seen for this key and day — keepEarliest()
+     *  the other way round, for last_out, where the late reading is the one
+     *  that means anything. */
+    private static function keepLatest(array &$index, $key, $date, $time)
+    {
+        if (!isset($index[$key][$date]) || $time > $index[$key][$date]) {
             $index[$key][$date] = $time;
         }
     }
@@ -617,61 +824,122 @@ function attHolidayFlag(array $holidays, $date)
 /* ---------- composing ----------------------------------------------------- */
 
 /**
- * Query: one person's day, as the answer prints it — where they were sourced
- * from, what the 8am rule makes of it, and whether the company was on holiday.
+ * Query: one person's day, as the answer prints it — BOTH SLOTS and the
+ * holiday, in one cell.
+ *
+ * $am and $pm are each the three reads for one slot, as attFind() wants them.
+ * The morning fields keep the names they have always had (time, status,
+ * source) and the afternoon's are prefixed pm_, so a caller written before
+ * the afternoon existed still reads exactly what it used to.
  *
  * The holiday is a fact about the DAY and not about this person, and it DOES
- * NOT move status: see PUBLIC HOLIDAYS at the top of this file. It is attached
- * here, in the one place every cell of both modes passes through, so no caller
- * has to remember which mode carries it.
+ * NOT move either status: see PUBLIC HOLIDAYS at the top of this file. It is
+ * attached here, in the one place every cell of both modes passes through, so
+ * no caller has to remember which mode carries it.
  */
-function attCell(array $row, $date, array $staffApp, array $gwApp, array $site,
-                 array $holidays)
+function attCell(array $row, $date, array $am, array $pm, array $holidays)
 {
-    $cell = attArrival($row, $date, $staffApp, $gwApp, $site);
+    $cell = attArrival($row, $date, $am);
+
+    $afternoon         = attPresence($row, $date, $pm);
+    $cell['pm_time']   = $afternoon['time'];
+    $cell['pm_status'] = $afternoon['status'];
+    $cell['pm_source'] = $afternoon['source'];
+
     $cell['is_public_holiday'] = attHolidayFlag($holidays, $date);
     return $cell;
 }
 
 /**
- * Query: the first source that has this person on this day, and what it says.
+ * Query: the first source that has this person in this slot on this day —
+ * array('time','source') — or null when none of them do.
  *
- * THE ORDER IS THE RULE. App first, site check-in second, nothing third; see
- * the chain at the top of this file. Written once, here, so the daily answer
- * and every cell of a monthly one are decided the same way.
+ * THE ORDER IS THE RULE. App first, site check-in second, the face log third,
+ * nothing fourth; see the chain at the top of this file. Written once, here,
+ * so the two slots, the daily answer and every cell of a monthly one all find
+ * a person the same way. WHAT IS MADE OF A HIT is the only thing that differs
+ * between slots — attArrival() for the morning, attPresence() for the
+ * afternoon — and that difference is one line each, below.
+ *
+ * $reads is the four indexes for ONE slot:
+ *   array('staff_app' => …, 'gw_app' => …, 'site' => …, 'face' => …)
  */
-function attArrival(array $row, $date, array $staffApp, array $gwApp, array $site)
+function attFind(array $row, $date, array $reads)
 {
-    $person = strtolower(trim((string)$row['person']));
-    $isGw   = ($row['person_type'] === 'gw');
+    $person   = strtolower(trim((string)$row['person']));
+    $isGw     = ($row['person_type'] === 'gw');
+    $staffApp = $reads['staff_app'];
+    $gwApp    = $reads['gw_app'];
+    $site     = $reads['site'];
+    $face     = $reads['face'];
 
     if ($isGw) {
         if (isset($gwApp[$person][$date])) {
-            return attJudge($gwApp[$person][$date], 'attendance_app');
+            return array('time' => $gwApp[$person][$date], 'source' => 'attendance_app');
         }
         /* No site-check-in arm for a GW on purpose: that table is keyed on
          * users.person, which a GW does not have, so a code landing on
-         * somebody's login there would be a different person. */
-        return attJudge(null, '');
+         * somebody's login there would be a different person. No face-log arm
+         * either, for the same reason one step further back — the face log is
+         * keyed on users.attendance_face_id, and a GW has no users row to
+         * carry one. The app is the whole of a GW's answer. */
+        return null;
     }
 
     if (isset($staffApp['by_person'][$person][$date])) {
-        return attJudge($staffApp['by_person'][$person][$date], 'attendance_app');
+        return array('time' => $staffApp['by_person'][$person][$date],
+                     'source' => 'attendance_app');
     }
     $mkId = isset($row['mk_id']) ? (int)$row['mk_id'] : 0;
     if ($mkId > 0 && isset($staffApp['by_mk_id'][$mkId][$date])) {
-        return attJudge($staffApp['by_mk_id'][$mkId][$date], 'attendance_app');
+        return array('time' => $staffApp['by_mk_id'][$mkId][$date],
+                     'source' => 'attendance_app');
     }
     if (isset($site['by_person'][$person][$date])) {
-        return attJudge($site['by_person'][$person][$date], 'site_check_in');
+        return array('time' => $site['by_person'][$person][$date],
+                     'source' => 'site_check_in');
     }
     if ($mkId > 0 && isset($site['by_mk_id'][$mkId][$date])) {
-        return attJudge($site['by_mk_id'][$mkId][$date], 'site_check_in');
+        return array('time' => $site['by_mk_id'][$mkId][$date],
+                     'source' => 'site_check_in');
     }
-    return attJudge(null, '');
+    /* By mk_id ONLY. The face log is joined through users.attendance_face_id,
+     * so a hit here is already a hit on a users row — there is no second,
+     * by-name arm to try, and nothing to spell wrong. */
+    if ($mkId > 0 && isset($face['by_mk_id'][$mkId][$date])) {
+        return array('time' => $face['by_mk_id'][$mkId][$date],
+                     'source' => 'face_log');
+    }
+    return null;
 }
 
-/** Query: a time and a source as the answer prints them. */
+/** Query: the MORNING cell — a punctuality judgement, on_time or late. */
+function attArrival(array $row, $date, array $reads)
+{
+    $hit = attFind($row, $date, $reads);
+    return ($hit === null) ? attJudge(null, '') : attJudge($hit['time'], $hit['source']);
+}
+
+/**
+ * Query: the AFTERNOON cell — a presence check, has_data or no_data, and no
+ * third answer.
+ *
+ * NOTHING AT 4:30PM IS LATE. The slot opens at 16:30 and people submit it
+ * across the rest of the evening; a "late" there would mean nothing, which is
+ * why the legacy report does not score it either (ATT_LATE_FROM has the
+ * reference). The time is still published, because when somebody checked in
+ * is worth reading even when it is not being marked.
+ */
+function attPresence(array $row, $date, array $reads)
+{
+    $hit = attFind($row, $date, $reads);
+    if ($hit === null) {
+        return array('time' => '', 'status' => 'no_data', 'source' => '');
+    }
+    return array('time' => $hit['time'], 'status' => 'has_data', 'source' => $hit['source']);
+}
+
+/** Query: a morning time and source as the answer prints them. */
 function attJudge($time, $source)
 {
     if ($time === null) {
@@ -796,14 +1064,34 @@ try {
         $rows = $pool;
     }
 
-    /* ---- the three reads, once each ---- */
+    /* ---- the reads: the sources, once each, for the whole range ---- */
+    /* Seven queries for the whole company and the whole range, not seven per
+     * person. The slot is a parameter to the two app reads, so the afternoon
+     * is read exactly as the morning is and the two cannot drift.
+     *
+     * THE OTHER TWO SOURCES HAVE NO SLOT OF THEIR OWN, so the slot is a time
+     * window instead, and ATT_PM_FROM is that window in both: site check-ins
+     * from 16:30 onwards, and a last_out from 16:30 onwards. The face log is
+     * ONE query for both slots, because one row carries both ends of a
+     * person's day — first_in for the morning, last_out for the afternoon. */
     $att      = new AttendanceRepository($pdo);
     $appFrom  = str_replace('-', '/', $fromIso);
     $appTo    = str_replace('-', '/', $toIso);
 
-    $staffApp = $att->staffApp($compId, $appFrom, $appTo);
-    $gwApp    = $att->gwApp($appFrom, $appTo);
-    $site     = $att->siteCheckIn($compId, $fromIso, $toIso);
+    $face = $att->faceLog($fromIso, $toIso, ATT_PM_FROM);
+
+    $am = array(
+        'staff_app' => $att->staffApp($compId, $appFrom, $appTo, ATT_PERIOD_AM),
+        'gw_app'    => $att->gwApp($appFrom, $appTo, ATT_PERIOD_AM),
+        'site'      => $att->siteCheckIn($compId, $fromIso, $toIso),
+        'face'      => $face['first_in'],
+    );
+    $pm = array(
+        'staff_app' => $att->staffApp($compId, $appFrom, $appTo, ATT_PERIOD_PM),
+        'gw_app'    => $att->gwApp($appFrom, $appTo, ATT_PERIOD_PM),
+        'site'      => $att->siteCheckIn($compId, $fromIso, $toIso, ATT_PM_FROM),
+        'face'      => $face['last_out'],
+    );
 
     /* ---- and the calendar, once ---- */
     /* A holiday is company-wide, so it is read for the range and not per
@@ -820,8 +1108,11 @@ try {
     }
 
     /* ---- compose ---- */
-    $out    = array();
-    $totals = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
+    $out      = array();
+    $totals   = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
+    /* The afternoon is counted separately because it is counted in different
+     * words: has_data / no_data, with no on_time or late to add to. */
+    $pmTotals = array('has_data' => 0, 'no_data' => 0);
 
     foreach ($rows as $row) {
         $public = publicRow($row, $overrides, $compNames);
@@ -853,23 +1144,31 @@ try {
         ) + $where;
 
         if ($mode === 'daily') {
-            $cell  = attCell($row, $fromIso, $staffApp, $gwApp, $site, $holidays);
+            $cell  = attCell($row, $fromIso, $am, $pm, $holidays);
             $entry = $entry + $cell;
             $totals[$cell['status']]++;
+            $pmTotals[$cell['pm_status']]++;
         } else {
-            $byDay   = array();
-            $summary = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
+            $byDay     = array();
+            $summary   = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
+            $pmSummary = array('has_data' => 0, 'no_data' => 0);
             foreach ($days as $day) {
-                $cell = attCell($row, $day, $staffApp, $gwApp, $site, $holidays);
+                $cell = attCell($row, $day, $am, $pm, $holidays);
                 /* Keyed by day OF THE MONTH, which is what a month grid is
                  * indexed by on screen; the full date is derivable from
                  * year + month and is not repeated 31 times per person. */
                 $byDay[(string)(int)substr($day, 8, 2)] = $cell;
                 $summary[$cell['status']]++;
+                $pmSummary[$cell['pm_status']]++;
             }
-            $entry['summary'] = $summary;
-            $entry['days']    = $byDay;
-            foreach ($summary as $k => $n) { $totals[$k] += $n; }
+            $entry['summary']    = $summary;
+            /* Beside it, not merged into it: the two slots are counted in
+             * different words, and a single no_data covering both would say
+             * neither. */
+            $entry['pm_summary'] = $pmSummary;
+            $entry['days']       = $byDay;
+            foreach ($summary as $k => $n)   { $totals[$k]   += $n; }
+            foreach ($pmSummary as $k => $n) { $pmTotals[$k] += $n; }
         }
 
         $out[] = $entry;
@@ -884,13 +1183,44 @@ try {
         'from'         => $fromIso,
         'to'           => $toIso,
         'rules'        => array(
-            'period'    => ATT_PERIOD,
-            /* The moment lateness begins. A caller comparing a time against
-             * this uses <, the same way this file does, and gets the same
-             * answer — which is why the rule is published as one number and
-             * not as a boundary somebody has to guess the inclusiveness of. */
+            /* TWO SLOTS, JUDGED DIFFERENTLY, and each one says which fields
+             * on a staff row carry it — so a caller reads the rule rather
+             * than inferring it from a field name. */
+            'periods'   => array(
+                'am' => array(
+                    'period'    => ATT_PERIOD_AM,
+                    'judges'    => 'punctuality',
+                    /* The moment lateness begins. A caller comparing a time
+                     * against this uses <, the same way this file does, and
+                     * gets the same answer — which is why the rule is
+                     * published as one number and not as a boundary somebody
+                     * has to guess the inclusiveness of. */
+                    'late_from' => ATT_LATE_FROM,
+                    'statuses'  => array('on_time', 'late', 'no_data'),
+                    'fields'    => array('time', 'status', 'source'),
+                    'summary'   => 'summary',
+                ),
+                'pm' => array(
+                    'period'    => ATT_PERIOD_PM,
+                    /* Presence, not punctuality: there is no late_from here
+                     * because nothing at 4:30pm is late. */
+                    'judges'    => 'presence',
+                    'opens_at'  => ATT_PM_FROM,
+                    'statuses'  => array('has_data', 'no_data'),
+                    'fields'    => array('pm_time', 'pm_status', 'pm_source'),
+                    'summary'   => 'pm_summary',
+                ),
+            ),
+            /* In the order they are tried, which is the order a tie would be
+             * broken in if the sources ever overlapped much. They barely do
+             * — see the chain at the top of this file. */
+            'sources'   => array('attendance_app', 'site_check_in', 'face_log'),
+            /* The three below are the morning's rule under the names it was
+             * published with before the afternoon slot existed, kept so a
+             * caller written against that answer still reads the same thing.
+             * rules.periods.am is the same rule and is where to read it. */
+            'period'    => ATT_PERIOD_AM,
             'late_from' => ATT_LATE_FROM,
-            'sources'   => array('attendance_app', 'site_check_in'),
             'statuses'  => array('on_time', 'late', 'no_data'),
         ),
         'scope'        => $scope,
@@ -903,10 +1233,15 @@ try {
             'people' => count($out),
             'days'   => count($days),
             /* Over every person AND every day, so in month mode these add up
-             * to people x days and not to people. */
-            'on_time' => $totals['on_time'],
-            'late'    => $totals['late'],
-            'no_data' => $totals['no_data'],
+             * to people x days and not to people. The first three are the
+             * 8am slot, the pm_ pair the 4:30pm one; each set adds up to
+             * people x days on its own, and adding one set to the other
+             * would count every cell twice. */
+            'on_time'     => $totals['on_time'],
+            'late'        => $totals['late'],
+            'no_data'     => $totals['no_data'],
+            'pm_has_data' => $pmTotals['has_data'],
+            'pm_no_data'  => $pmTotals['no_data'],
             /* Days in the range, NOT people x days — a holiday is one fact
              * about the company. 0 when the calendar could not be read, which
              * holidays.source says plainly rather than implying here. */
@@ -928,10 +1263,11 @@ try {
     respond($payload);
 } catch (Exception $e) {
     error_log('attendanceAPI: ' . $e->getMessage());
-    /* Longest name first: 'staff_attendance' is a prefix of
-     * 'staff_attendance_logs', so testing it first would blame the app for a
-     * site check-in failure. */
-    foreach (array('staff_attendance_logs'    => 'site check-in',
+    /* Longest name first: 'staff_attendance' is a prefix of both
+     * 'staff_attendance_logs' and 'staff_attendance_face_log', so testing it
+     * first would blame the app for a site check-in or face log failure. */
+    foreach (array('staff_attendance_face_log' => 'the face log',
+                   'staff_attendance_logs'    => 'site check-in',
                    'gw_attendance'            => 'the GW attendance app',
                    'staff_attendance'         => 'the staff attendance app',
                    'organization_chart_glob'  => 'the reporting line',
