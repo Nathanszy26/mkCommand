@@ -2,32 +2,42 @@
 /**
  * Job Spec approval progress report.
  *
- * MUST be hosted on globportal.com, same folder as jobSpecWrite.php —
- * mkPortal (versions), staff_portal2 (users) and the reporting line are all
- * local there under prog4. The mkcommand <-> globportal 3306 path is firewalled.
+ * MUST be hosted on globportal.com, same folder as jobSpecWrite.php and
+ * staffPoolCore.php — mkPortal (versions), staff_portal2 (users) and the
+ * reporting line are all local there under prog4. The mkcommand <-> globportal
+ * 3306 path is firewalled.
  *
- * Reads job_spec_version directly, NOT the stg_jobspec_* staging tables: those
- * are dropped after an import, and the report must also cover specs submitted
- * through the app.
+ * WHO IS COUNTED is the staff pool — staffPoolCore.php, the same code
+ * staffPoolAPI.php and staffHeadcountReport.php count with. Nobody is decided
+ * here: if staffPoolAPI.php?comp_id=1 says company_total_staff is 665, this
+ * report counts 665 people for company 1, staff and GW together, and everybody
+ * an override has taken out of the pool is counted nowhere.
  *
- * A staff member with NO version at all but with a capability list (portal job
- * descriptions) is waiting on a superior's approval (jobSpecWrite.php
- * approve_capability), so they count as PENDING here — see specSource(). Staff
- * with neither, and every GW without a version, have no job spec and are not
- * counted. The capability lists live on mkcommand.mkgroup.my and are read over
- * HTTPS from jobSpecs.php (CapabilityClient).
+ * ONE ROW PER PERSON, not per version. Each pool member is counted once, by
+ * where their CURRENT job spec stands — the newest version, the same one
+ * staffOverview.php shows in its Job Spec column:
  *
- * Both schemas live on the SAME mysqld, so one connection with fully-qualified
- * table names serves the whole report. jobSpecWrite.php uses two PDO handles
- * for its own reasons (pooling per logical repository); here a single handle is
- * simpler and lets the boss/version join happen in the database.
+ *   pending / approved / rejected   the status of that newest version
+ *   pending (capability version)    no version at all, but a capability list
+ *                                   (portal job descriptions) a superior has
+ *                                   to approve — jobSpecWrite.php
+ *                                   approve_capability. Read over HTTPS from
+ *                                   jobSpecs.php (CapabilityClient).
+ *   none                            no version and no capability list
  *
- * TWO POPULATIONS, reported separately:
- *   staff (is_gw = 0/NULL) -> superior comes from evaluation.monthly_assign
+ * so pending + approved + rejected + none is the pool's head count, exactly.
+ *
+ * Reviewing is still read off the reporting line, by the rules
+ * jobSpecWrite.php enforces:
+ *   staff (is_gw = 0/NULL) -> evaluation.monthly_assign
  *                             (comp 1: organization_chart_glob — see chartSource)
- *   GW    (is_gw = 1)      -> superior comes from evaluation.monthly_assign_gw
+ *   GW    (is_gw = 1)      -> evaluation.monthly_assign_gw
  * They never mix: a GW's `person` is a monthly_assign_gw_code, which is a
  * different namespace from users.person and can collide with one.
+ *
+ * TRILLIUM (comp 16) is reported as its own company, as the pool reports it,
+ * but its people's versions and chart rows are filed under Globinaco (1) — so
+ * every lookup goes through homeCompId() first.
  *
  * Access: any logged-in user may open this, but only active KPI super admins
  * (staff_portal2.kpi_super_admins, status = 1) may choose the company. Everyone
@@ -59,28 +69,30 @@ if (!UnifiedAuth::isLoggedIn()) {
 
 $currentUser = UnifiedAuth::getLoggedInUser();
 
-/* ---------- DB ------------------------------------------------------------ */
-
-class Db
-{
-    private static $pdo = null;
-
-    /** One shared PDO. Both schemas are on this host. */
-    public static function get()
-    {
-        if (self::$pdo === null) {
-            $pdo = new PDO(
-                'mysql:host=localhost;charset=utf8mb4',
-                'prog4',
-                'prog42023',
-                array(PDO::ATTR_TIMEOUT => 5)
-            );
-            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-            self::$pdo = $pdo;
-        }
-        return self::$pdo;
-    }
+/* The staff pool — who this page counts — plus Db and displayName().
+ *
+ * On globportal staffPoolCore.php lives in accounts/mkPortal/hr, beside
+ * staffPoolAPI.php, while this page lives in accounts/mkPortal/mkCommand —
+ * so ../hr is tried first. The second path is the repo layout, where both
+ * sit in mkCommand_API/. A missing or out-of-date core says so on the page
+ * rather than failing as a blank HTTP 500. */
+$poolCore = null;
+foreach (array(__DIR__ . '/../hr/staffPoolCore.php', __DIR__ . '/staffPoolCore.php') as $candidate) {
+    if (file_exists($candidate)) { $poolCore = $candidate; break; }
+}
+if ($poolCore !== null) {
+    require_once $poolCore;
+}
+if ($poolCore === null || !function_exists('inPoolRows') || !function_exists('homeCompId')) {
+    http_response_code(500);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo '<p style="font:14px sans-serif;padding:24px">'
+       . ($poolCore === null
+            ? 'staffPoolCore.php was not found. Expected it at accounts/mkPortal/hr/staffPoolCore.php.'
+            : 'staffPoolCore.php at ' . htmlspecialchars($poolCore, ENT_QUOTES, 'UTF-8')
+              . ' is out of date (no inPoolRows / homeCompId). Upload the current one.')
+       . '</p>';
+    exit;
 }
 
 /* ---------- access -------------------------------------------------------- */
@@ -89,24 +101,13 @@ class Db
  *
  *  Only active KPI super admins may. Everyone else is pinned to the comp_id
  *  their session was built with, so the report answers "my company" and
- *  nothing else. kpi_super_admins.user_id is staff_portal2.users.id — the same
- *  id UnifiedAuth puts in the session — and status is TINYINT (1 = active).
+ *  nothing else. The check itself is the pool's isSuperAdmin(), so this page
+ *  and the Staff Headcount report agree on who a super admin is.
  *
  *  Fails closed: the caller treats a DB error as "not a super admin". */
 function canPickCompany(PDO $pdo, $userId)
 {
-    if ($userId === null || $userId === '') {
-        return false;
-    }
-    $stmt = $pdo->prepare(
-        "SELECT 1
-           FROM staff_portal2.kpi_super_admins
-          WHERE user_id = :uid AND status = 1
-          LIMIT 1"
-    );
-    $stmt->bindValue(':uid', (int)$userId, PDO::PARAM_INT);
-    $stmt->execute();
-    return $stmt->fetchColumn() !== false;
+    return isSuperAdmin($pdo, $userId);
 }
 
 /* ---------- capability lists (company portals, over HTTPS) ---------------- */
@@ -158,11 +159,26 @@ class CapabilityClient
     }
 }
 
+/** Query: the key a person is matched by across tables — lower-cased, because
+ *  MySQL compared these case-insensitively and a PHP array key does not. Same
+ *  shape CapabilityClient keys its holders by. */
+function personKey($person, $compId)
+{
+    return strtolower(trim((string)$person)) . '|' . (int)$compId;
+}
+
 /* ---------- repository ---------------------------------------------------- */
 
+/**
+ * The reads behind the report: each person's newest version, and who may
+ * review it. WHO is counted is not decided here — that is the staff pool.
+ *
+ * Every method takes STORAGE company ids (homeCompId()), because that is what
+ * job_spec_version and the charts hold.
+ */
 class ApprovalReportRepository
 {
-    protected $db;
+    private $db;
 
     /** Live assignment today. Copied verbatim from jobSpecWrite.php so this
      *  report and the app never disagree about who may approve. */
@@ -172,17 +188,10 @@ class ApprovalReportRepository
         AND (oc.monthly_assign_to IS NULL OR oc.monthly_assign_to = ''
             OR STR_TO_DATE(REPLACE(oc.monthly_assign_to, '-', '/'), '%Y/%m/%d') >= CURDATE())";
 
-    /** A version is reviewable by a boss only if that boss did not submit it —
-     *  mirrors JobSpecWriteService::review()'s SUBMITTER_CANNOT_REVIEW_OWN. */
-    const NOT_SUBMITTER = "
-        NOT (oc.boss_id = v.submitted_by AND oc.boss_comp_id = v.submitted_by_comp_id)";
-
     /** A blank boss_id is not a superior. Both reporting-line tables hold rows
-     *  with an empty boss_id for top-of-chart staff; they pass ACTIVE_CLAUSE, and pass
-     *  NOT_SUBMITTER because '' never equals a real submitted_by. Without this
-     *  they INNER JOIN into byBoss() and collapse into one phantom superior with
-     *  no name and a "no account" badge — while being wrongly excluded from
-     *  withoutReviewer(), which is where they belong. */
+     *  with an empty boss_id for top-of-chart staff; without this they collapse
+     *  into one phantom superior with no name and a "no account" badge, while
+     *  the people under it are wrongly kept out of "no superior". */
     const HAS_BOSS = "
         TRIM(IFNULL(oc.boss_id, '')) <> ''";
 
@@ -192,52 +201,56 @@ class ApprovalReportRepository
      *  comp_id. */
     const GLOB_COMP_ID = 1;
 
-    /** Capability holders in scope, from CapabilityClient: 'person|comp' => row.
-     *  Empty = nobody counts as pending-on-capability. */
-    protected $holders = array();
+    /** Who may approve a GW — the clause GwRepository in jobSpecWrite.php
+     *  checks. A GW with kpi_scorecard_exclude set IS in the pool (that column
+     *  is a flag, not a pool rule) but nobody can approve them in the app, so
+     *  they land under "no superior", which is the truth about them. */
+    const GW_ACTIVE_CLAUSE = "
+        g.monthly_assign_gw_status = '1'
+        AND (g.kpi_scorecard_exclude IS NULL OR g.kpi_scorecard_exclude <> '1')";
+
+    /** As HAS_BOSS, for the GW reporting line. */
+    const GW_HAS_BOSS = "
+        TRIM(IFNULL(g.boss_id, '')) <> ''";
 
     public function __construct(PDO $db) { $this->db = $db; }
 
-    /** Command: who has a capability list (see specSource()). */
-    public function setCapabilityHolders(array $holders) { $this->holders = $holders; }
-
-    /** Command: give capability stubs their task count — the size of the list
-     *  awaiting approval, which only the portal knows. */
-    protected function withCapabilityItems(array $rows)
+    private function run($sql, array $args = array())
     {
-        foreach ($rows as $i => $r) {
-            if ($r['version_id'] === null) {
-                $key = strtolower($r['person']) . '|' . (int)$r['comp_id'];
-                $rows[$i]['items'] = isset($this->holders[$key]) ? (int)$this->holders[$key]['items'] : 0;
-            }
+        $stmt = $this->db->prepare($sql);
+        foreach ($args as $k => $vv) {
+            $stmt->bindValue($k, $vv, is_int($vv) ? PDO::PARAM_INT : PDO::PARAM_STR);
         }
-        return $rows;
+        $stmt->execute();
+        return $stmt->fetchAll();
+    }
+
+    /** Inlined int IN() list. Every id has been through (int); '-1' matches
+     *  nothing, so an empty list reads nothing rather than everything. */
+    private static function intList(array $ids)
+    {
+        $ints = array_map('intval', $ids);
+        return empty($ints) ? '-1' : implode(',', array_unique($ints));
     }
 
     /**
      * Query: the chart to read, always aliased `oc` so ACTIVE_CLAUSE and
-     * NOT_SUBMITTER above apply verbatim and are written once.
+     * HAS_BOSS apply verbatim.
      *
-     * A company filter pins the staff-side comp, so exactly one chart is read
-     * and the join keeps its indexes. Unfiltered, the report spans companies on
-     * both charts, so the two are UNIONed on disjoint scopes — which can never
-     * double-count, and ignores a comp-1 row left in the old table mid-migration
-     * instead of duplicating it. The union sits INSIDE the join source, not at
-     * the top level: byBoss() groups by boss, and a boss with staff in comp 1
-     * and elsewhere would otherwise split into two half-counted rows.
-     *
-     * monthly_assign keeps history, so one reporting line can hold several live
-     * rows. Every query below is already proof against that — byBoss() counts
-     * DISTINCT version ids, staffForBoss() groups by version id, and
-     * withoutReviewer() only asks whether a row EXISTS — because a staff member
-     * with two superiors could always produce more than one row here.
+     * One company on one chart reads that table alone and keeps its indexes.
+     * Companies on both charts UNION the two on disjoint scopes — which can
+     * never double-count, and ignores a comp-1 row left in the old table
+     * mid-migration instead of duplicating it.
      */
-    protected static function chartSource($compId)
+    private static function chartSource(array $comps)
     {
-        if ($compId !== null) {
-            return ((int)$compId === self::GLOB_COMP_ID)
-                ? 'staff_portal2.organization_chart_glob oc'
-                : 'evaluation.monthly_assign oc';
+        $hasGlob  = in_array(self::GLOB_COMP_ID, $comps, true);
+        $hasOther = count(array_diff($comps, array(self::GLOB_COMP_ID))) > 0;
+        if (!$hasOther) {
+            return 'staff_portal2.organization_chart_glob oc';
+        }
+        if (!$hasGlob) {
+            return 'evaluation.monthly_assign oc';
         }
         return "(SELECT staff_id, comp_id, boss_id, boss_comp_id,
                         monthly_assign_from, monthly_assign_to
@@ -251,171 +264,95 @@ class ApprovalReportRepository
     }
 
     /**
-     * Query: the rows this report counts, always aliased `v` — every version,
-     * plus one 'pending' stub per live staff member who has no version at all
-     * but DOES have a capability list (it awaits a superior's approval). Staff
-     * with neither are not counted anywhere: they have no job spec.
+     * Query: each person's NEWEST version, keyed personKey(person, comp).
      *
-     * A stub has id NULL, so counts key on row_key instead of v.id. Its
-     * submitted_by is '' rather than NULL so NOT_SUBMITTER evaluates true for
-     * it instead of NULL. Stubs are drawn from the same population MK Command
-     * shows (active, undeleted, not mk_command_excluded). The holder list comes
-     * from another host, so it is inlined as quoted literals, not joined.
+     * Newest is MAX(id) — the ordering staffOverview.php's Job Spec column and
+     * jobSpecWrite.php's latest_approved both use — so a superseded version
+     * never counts. $isGw: 0 = staff (is_gw NULL or 0), 1 = GW. Legacy rows
+     * predate the column and are NULL, so IFNULL keeps them on the staff side.
      */
-    protected function specSource($compId)
+    public function latestVersions(array $comps, $isGw)
     {
-        if (empty($this->holders)) {
-            return "(" . self::VERSION_ROWS . ") v";
-        }
-        $tuples = array();
-        foreach ($this->holders as $h) {
-            $tuples[] = '(' . $this->db->quote($h['person']) . ', ' . (int)$h['comp_id'] . ')';
-        }
-        $comp = ($compId !== null) ? " AND u.comp_id = " . (int)$compId : "";
-        return "(" . self::VERSION_ROWS . "
-                 UNION ALL
-                 SELECT NULL, u.person, u.comp_id, 0, 'pending', '', 0,
-                        NULL, NULL, NULL, CONCAT('c', u.person, '|', u.comp_id)
-                 FROM staff_portal2.users u
-                 WHERE u.status = 1 AND IFNULL(u.deleted, 0) = 0
-                   AND IFNULL(u.mk_command_excluded, 0) <> 1{$comp}
-                   AND (u.person, u.comp_id) IN (" . implode(',', $tuples) . ")
-                   AND NOT EXISTS (SELECT 1 FROM mkPortal.job_spec_version x
-                                   WHERE x.person = u.person AND x.comp_id = u.comp_id
-                                     AND IFNULL(x.is_gw, 0) = 0)) v";
-    }
-
-    /** The real-version half of specSource(); its column list is the shape
-     *  every stub branch must match. */
-    const VERSION_ROWS = "
-        SELECT jv.id, jv.person, jv.comp_id, jv.is_gw, jv.status,
-               jv.submitted_by, jv.submitted_by_comp_id, jv.submitted_at,
-               jv.reviewed_at, jv.reviewed_by, CONCAT('v', jv.id) AS row_key
-        FROM mkPortal.job_spec_version jv";
-
-    /** Build the company + population predicate and its bindings.
-     *  Shared by every query here and by the GW subclass (DRY).
-     *  $isGw: 0 = staff (is_gw NULL or 0), 1 = GW. Legacy rows predate the
-     *  column and are NULL, so IFNULL keeps them on the staff side. */
-    protected function scopeSql($compId, $isGw = 0)
-    {
-        $sql = " WHERE IFNULL(v.is_gw, 0) = :isgw ";
-        $args = array(':isgw' => (int)$isGw);
-        if ($compId !== null) {
-            $sql .= " AND v.comp_id = :comp ";
-            $args[':comp'] = (int)$compId;
-        }
-        return array($sql, $args);
-    }
-
-    protected function run($sql, array $args)
-    {
-        $stmt = $this->db->prepare($sql);
-        foreach ($args as $k => $vv) {
-            $stmt->bindValue($k, $vv, is_int($vv) ? PDO::PARAM_INT : PDO::PARAM_STR);
-        }
-        $stmt->execute();
-        return $stmt->fetchAll();
-    }
-
-    /** Query: overall counts by status. */
-    public function totals($compId)
-    {
-        list($where, $args) = $this->scopeSql($compId);
-        $sql = "SELECT v.status, COUNT(*) AS n
-                FROM " . $this->specSource($compId) . "
-                {$where}
-                GROUP BY v.status";
-        $out = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
-        foreach ($this->run($sql, $args) as $r) {
-            $out[$r['status']] = (int)$r['n'];
+        if (empty($comps)) { return array(); }
+        $rows = $this->run(
+            "SELECT v.id AS version_id, v.person, v.comp_id, v.status,
+                    v.submitted_by, v.submitted_by_comp_id, v.submitted_at,
+                    v.reviewed_at, v.reviewed_by,
+                    (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
+                      WHERE vi.version_id = v.id) AS items
+             FROM mkPortal.job_spec_version v
+             INNER JOIN (SELECT MAX(x.id) AS id
+                           FROM mkPortal.job_spec_version x
+                          WHERE IFNULL(x.is_gw, 0) = " . ($isGw ? 1 : 0) . "
+                            AND x.comp_id IN (" . self::intList($comps) . ")
+                          GROUP BY x.person, x.comp_id) latest
+                     ON latest.id = v.id"
+        );
+        $out = array();
+        foreach ($rows as $r) {
+            $out[personKey($r['person'], $r['comp_id'])] = $r;
         }
         return $out;
     }
 
-    /** Query: one row per superior who owes a review, newest-pending first. */
-    public function byBoss($compId)
+    /** Query: every staff member's live direct superiors in these companies,
+     *  personKey(staff) => [bossKey => boss]. */
+    public function staffSuperiors(array $comps)
     {
-        list($where, $args) = $this->scopeSql($compId);
-        $sql = "SELECT oc.boss_id, oc.boss_comp_id,
-                       COALESCE(ub.fullname, oc.boss_id) AS boss_name,
-                       ub.person IS NULL AS boss_missing,
-                       COUNT(DISTINCT CASE WHEN v.status = 'pending'  THEN v.row_key END) AS pending,
-                       COUNT(DISTINCT CASE WHEN v.status = 'approved' THEN v.row_key END) AS approved,
-                       COUNT(DISTINCT CASE WHEN v.status = 'rejected' THEN v.row_key END) AS rejected
-                FROM " . $this->specSource($compId) . "
-                INNER JOIN " . self::chartSource($compId) . "
-                    ON oc.staff_id = v.person AND oc.comp_id = v.comp_id
-                   AND " . self::ACTIVE_CLAUSE . "
-                   AND " . self::NOT_SUBMITTER . "
-                   AND " . self::HAS_BOSS . "
-                LEFT JOIN staff_portal2.users ub
-                    ON ub.person = oc.boss_id AND ub.comp_id = oc.boss_comp_id
-                   AND ub.status = 1 AND IFNULL(ub.deleted, 0) = 0
-                {$where}
-                GROUP BY oc.boss_id, oc.boss_comp_id, ub.fullname, ub.person
-                ORDER BY boss_name ASC";
-        return $this->run($sql, $args);
+        if (empty($comps)) { return array(); }
+        return self::byStaff($this->run(
+            "SELECT oc.staff_id, oc.comp_id, oc.boss_id, oc.boss_comp_id,
+                    ub.fullname AS boss_name, ub.person IS NULL AS boss_missing
+             FROM " . self::chartSource($comps) . "
+             LEFT JOIN staff_portal2.users ub
+                 ON ub.person = oc.boss_id AND ub.comp_id = oc.boss_comp_id
+                AND ub.status = 1 AND IFNULL(ub.deleted, 0) = 0
+             WHERE oc.comp_id IN (" . self::intList($comps) . ")
+               AND " . self::ACTIVE_CLAUSE . "
+               AND " . self::HAS_BOSS
+        ));
     }
 
-    /** Query: the staff behind one superior's row. */
-    public function staffForBoss($compId, $bossId)
+    /** Query: every GW's live supervisors in these companies, same shape.
+     *  comp_id is VARCHAR on monthly_assign_gw, so the list is quoted and the
+     *  column is left bare to keep its index. */
+    public function gwSuperiors(array $comps)
     {
-        list($where, $args) = $this->scopeSql($compId);
-        $args[':boss'] = $bossId;
-        $sql = "SELECT v.id AS version_id, v.person, v.comp_id, v.status,
-                       v.submitted_at, v.reviewed_at, v.reviewed_by,
-                       COALESCE(us.fullname, v.person) AS staff_name,
-                       (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
-                        WHERE vi.version_id = v.id) AS items
-                FROM " . $this->specSource($compId) . "
-                INNER JOIN " . self::chartSource($compId) . "
-                    ON oc.staff_id = v.person AND oc.comp_id = v.comp_id
-                   AND " . self::ACTIVE_CLAUSE . "
-                   AND " . self::NOT_SUBMITTER . "
-                   AND " . self::HAS_BOSS . "
-                LEFT JOIN staff_portal2.users us
-                    ON us.person = v.person AND us.comp_id = v.comp_id
-                {$where}
-                  AND oc.boss_id = :boss
-                GROUP BY v.row_key, v.id, v.person, v.comp_id, v.status,
-                         v.reviewed_at, v.reviewed_by, us.fullname
-                ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
-        return $this->withCapabilityItems($this->run($sql, $args));
+        if (empty($comps)) { return array(); }
+        $list = array();
+        foreach ($comps as $c) { $list[] = "'" . (int)$c . "'"; }
+        return self::byStaff($this->run(
+            "SELECT g.monthly_assign_gw_code AS staff_id, g.comp_id,
+                    g.boss_id, g.boss_comp_id,
+                    ub.fullname AS boss_name, ub.person IS NULL AS boss_missing
+             FROM evaluation.monthly_assign_gw g
+             LEFT JOIN staff_portal2.users ub
+                 ON ub.person = g.boss_id AND ub.comp_id = g.boss_comp_id
+                AND ub.status = 1 AND IFNULL(ub.deleted, 0) = 0
+             WHERE g.comp_id IN (" . implode(',', array_unique($list)) . ")
+               AND " . self::GW_ACTIVE_CLAUSE . "
+               AND " . self::GW_HAS_BOSS
+        ));
     }
 
-    /** Query: versions with no eligible reviewer — no live direct superior
-     *  other than whoever submitted it.
-     *
-     *  Deliberately NOT limited to pending. An auto-approved version lands here
-     *  too: jobSpecWrite.php approves on submit precisely when the submitter is
-     *  the only possible approver ("Auto-approved (sole approver)"). Those rows
-     *  are also invisible in byBoss(), which INNER JOINs the same condition — so
-     *  without this list the status tiles would not reconcile with the table.
-     *
-     *  HAS_BOSS is applied here too, and must stay in step with byBoss(): a
-     *  staff member whose only chart row has a blank boss_id has no reviewer,
-     *  so the NOT EXISTS has to ignore that row rather than treat it as cover. */
-    public function withoutReviewer($compId)
+    /** One entry per (staff, boss) pair. monthly_assign keeps history, so one
+     *  reporting line can hold several live rows — that is one superior, not
+     *  several, and keying on the pair collapses them. */
+    private static function byStaff(array $rows)
     {
-        list($where, $args) = $this->scopeSql($compId);
-        $sql = "SELECT v.id AS version_id, v.person, v.comp_id, v.status,
-                       v.submitted_at, v.submitted_by, v.reviewed_at, v.reviewed_by,
-                       COALESCE(us.fullname, v.person) AS staff_name,
-                       (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
-                        WHERE vi.version_id = v.id) AS items
-                FROM " . $this->specSource($compId) . "
-                LEFT JOIN staff_portal2.users us
-                    ON us.person = v.person AND us.comp_id = v.comp_id
-                {$where}
-                  AND NOT EXISTS (
-                      SELECT 1 FROM " . self::chartSource($compId) . "
-                      WHERE oc.staff_id = v.person AND oc.comp_id = v.comp_id
-                        AND " . self::ACTIVE_CLAUSE . "
-                        AND " . self::NOT_SUBMITTER . "
-                        AND " . self::HAS_BOSS . ")
-                ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
-        return $this->withCapabilityItems($this->run($sql, $args));
+        $out = array();
+        foreach ($rows as $r) {
+            $bossId  = trim((string)$r['boss_id']);
+            $bossKey = personKey($bossId, $r['boss_comp_id']);
+            $out[personKey($r['staff_id'], $r['comp_id'])][$bossKey] = array(
+                'boss_key'     => $bossKey,
+                'boss_id'      => $bossId,
+                'boss_comp_id' => (int)$r['boss_comp_id'],
+                'boss_name'    => (string)$r['boss_name'],     // '' when no account
+                'boss_missing' => (int)$r['boss_missing'] === 1,
+            );
+        }
+        return $out;
     }
 
     /** Query: the task list of one version, in display order.
@@ -424,7 +361,8 @@ class ApprovalReportRepository
      *
      *  $compId joins back to job_spec_version so a pinned viewer cannot read
      *  another company's tasks by guessing a version id: the item table itself
-     *  carries no comp_id, and this is the one query reachable by id alone. */
+     *  carries no comp_id, and this is the one query reachable by id alone.
+     *  It is a STORAGE comp — see homeCompId(). */
     public function itemsFor($versionId, $compId = null)
     {
         $args = array(':v' => (int)$versionId);
@@ -439,235 +377,241 @@ class ApprovalReportRepository
         $sql .= " ORDER BY i.sort_order ASC, i.id ASC";
         return $this->run($sql, $args);
     }
-
-    /** Query: companies for the filter — the live, weekly-reporting group only
-     *  (subsidiaries.status / weekly_report_status). Driven from subsidiaries
-     *  rather than job_spec_version so a company in the group with no specs yet
-     *  is still selectable, and one outside the group is never offered.
-     *  `name` is the label; code and an id label are the fallbacks, since name
-     *  is NOT NULL but may still be blank. */
-    public function companies()
-    {
-        $sql = "SELECT s.id AS comp_id,
-                       COALESCE(NULLIF(TRIM(s.name), ''),
-                                NULLIF(TRIM(s.code), ''),
-                                CONCAT('Company ', s.id)) AS display_name
-                FROM staff_portal2.subsidiaries s
-                WHERE s.status = '1'
-                  AND s.weekly_report_status = 1
-                ORDER BY display_name";
-        return $this->run($sql, array());
-    }
 }
 
-/* ---------- GW repository ------------------------------------------------- */
+/* ---------- one population, assembled ------------------------------------- */
 
 /**
- * The same report, for the GW population.
+ * One population of the report — staff or GW — as one row per pool member.
  *
- * Identical question, different reporting line: a GW's superior is
- * (boss_id, boss_comp_id) on evaluation.monthly_assign_gw, not a row in
- * the staff reporting line. Extends the staff repository purely to reuse scopeSql()
- * and run(); every query below is its own, and nothing here touches the staff
- * side's results. chartSource() is inherited but never called — GW never read
- * an organization chart, so the comp-1 split does not apply to them.
- *
- * evaluation is on this same mysqld, so a fully-qualified name reaches it on
- * the shared connection — same approach staffHierarchy.php uses. Requires
- * SELECT on `evaluation`.
- *
- * monthly_assign_gw stores comp_id and boss_comp_id as VARCHAR while
- * job_spec_version stores them as INT, so the int side is CAST to CHAR. Casting
- * that way round leaves the varchar column bare and keeps its index usable.
+ * Built in PHP from four reads rather than as one SQL statement: the members
+ * come from the pool (whose override rule lives in PHP), the capability lists
+ * from another host, and the GW tables are latin1 while job_spec_version is
+ * not. Every figure on the page is counted off $rows, so the tiles, the
+ * superior table and the "no superior" card cannot disagree about who exists.
  */
-class GwApprovalReportRepository extends ApprovalReportRepository
+class ApprovalPopulation
 {
-    /** The live GW population — matches GwRepository in jobSpecWrite.php and
-     *  staffHierarchy.php, so all three agree on who exists. */
-    const GW_ACTIVE_CLAUSE = "
-        g.monthly_assign_gw_status = '1'
-        AND (g.kpi_scorecard_exclude IS NULL OR g.kpi_scorecard_exclude <> '1')";
+    /** The order a list is read in: what still needs somebody, first. */
+    private static $ORDER = array('pending' => 0, 'rejected' => 1, 'approved' => 2, 'none' => 3);
 
-    /** Mirrors SUBMITTER_CANNOT_REVIEW_OWN for the GW reporting line. */
-    const GW_NOT_SUBMITTER = "
-        NOT (g.boss_id = v.submitted_by
-             AND g.boss_comp_id = CAST(v.submitted_by_comp_id AS CHAR))";
+    private $rows = array();
 
-    /** As HAS_BOSS, for the GW reporting line: an assignment row with a blank
-     *  boss_id names no supervisor, so it must not stand in for one. */
-    const GW_HAS_BOSS = "
-        TRIM(IFNULL(g.boss_id, '')) <> ''";
-
-    /** A version belongs to the live GW population at all.
-     *
-     *  GW_ACTIVE_CLAUSE only bites where monthly_assign_gw is joined, so before
-     *  this predicate an excluded GW (kpi_scorecard_exclude = '1') still counted
-     *  in the tiles and surfaced in the "no reviewer" card. Both now drop them,
-     *  and the whole GW section counts exactly the population staffHierarchy.php
-     *  and manpower_summary.php count.
-     *
-     *  Correlated on v, so it applies to queries that never touch the chart. */
-    const GW_IN_POPULATION = "
-        EXISTS (SELECT 1 FROM evaluation.monthly_assign_gw gp
-                WHERE gp.monthly_assign_gw_code = v.person
-                  AND gp.comp_id = CAST(v.comp_id AS CHAR)
-                  AND gp.monthly_assign_gw_status = '1'
-                  AND (gp.kpi_scorecard_exclude IS NULL
-                       OR gp.kpi_scorecard_exclude <> '1'))";
-
-    /** Join predicate from a version to its GW record. */
-    const GW_JOIN = "
-        g.monthly_assign_gw_code = v.person
-        AND g.comp_id = CAST(v.comp_id AS CHAR)";
-
-    /** The GW flavour of specSource(): versions only. A GW has no portal row
-     *  and so no capability list — no version means no job spec. */
-    protected function specSource($compId)
+    /**
+     * $members    in-pool rows of ONE type, from staffPoolCore.php
+     * $latest     ApprovalReportRepository::latestVersions()
+     * $holders    capability holders (staff only; empty for GW)
+     * $superiors  ApprovalReportRepository::staffSuperiors() / gwSuperiors()
+     * $isGw       the GW rule for "has a reviewer": a supervisor with no users
+     *             account cannot log in to approve, so they do not count as one
+     */
+    public function __construct(array $members, array $latest, array $holders,
+                                array $superiors, $isGw)
     {
-        return "(" . self::VERSION_ROWS . ") v";
+        foreach ($members as $m) {
+            $key  = personKey($m['person'], homeCompId($m['comp_id']));
+            $spec = self::specFor($key, $latest, $holders);
+
+            /* The reviewers are the live superiors other than whoever submitted
+             * the newest version — JobSpecWriteService::review()'s
+             * SUBMITTER_CANNOT_REVIEW_OWN. A capability list or no spec at all
+             * has no submitter, so every superior is a reviewer. */
+            $reviewers = array();
+            $covered   = false;
+            $all = isset($superiors[$key]) ? $superiors[$key] : array();
+            foreach ($all as $bossKey => $b) {
+                if ($spec['submitted_by'] !== ''
+                    && strcasecmp($b['boss_id'], $spec['submitted_by']) === 0
+                    && $b['boss_comp_id'] === (int)$spec['submitted_by_comp_id']) {
+                    continue;
+                }
+                $reviewers[$bossKey] = $b;
+                if (!$isGw || !$b['boss_missing']) {
+                    $covered = true;
+                }
+            }
+
+            $this->rows[] = array(
+                'person'     => (string)$m['person'],
+                'comp_id'    => (int)$m['comp_id'],
+                'staff_name' => displayName($m['fullname'], $m['person']),
+                'district'   => (string)$m['district'],
+                'reviewers'  => $reviewers,
+                'covered'    => $covered,
+            ) + $spec;
+        }
     }
 
-    /** The GW flavour of scopeSql(): company + population, one definition,
-     *  used by every query below so the tiles, the table and the no-reviewer
-     *  card can never disagree about who exists. */
-    private function gwScope($compId)
+    /** Query: where one person's job spec stands. */
+    private static function specFor($key, array $latest, array $holders)
     {
-        list($sql, $args) = $this->scopeSql($compId, 1);
-        return array($sql . " AND " . self::GW_IN_POPULATION . " ", $args);
+        if (isset($latest[$key])) {
+            $v = $latest[$key];
+            return array(
+                'status'               => (string)$v['status'],
+                'version_id'           => (int)$v['version_id'],
+                'items'                => (int)$v['items'],
+                'capability'           => false,
+                'submitted_by'         => trim((string)$v['submitted_by']),
+                'submitted_by_comp_id' => (int)$v['submitted_by_comp_id'],
+                'reviewed_at'          => $v['reviewed_at'],
+                'reviewed_by'          => $v['reviewed_by'],
+            );
+        }
+        $none = array(
+            'version_id'           => null,
+            'submitted_by'         => '',
+            'submitted_by_comp_id' => 0,
+            'reviewed_at'          => null,
+            'reviewed_by'          => null,
+        );
+        if (isset($holders[$key])) {
+            return array('status' => 'pending', 'capability' => true,
+                         'items' => (int)$holders[$key]['items']) + $none;
+        }
+        return array('status' => 'none', 'capability' => false, 'items' => 0) + $none;
     }
 
-    public function totals($compId)
+    /** Query: the tiles. total is the pool's head count for this population,
+     *  and the four statuses add up to it. */
+    public function totals()
     {
-        list($where, $args) = $this->gwScope($compId);
-        $sql = "SELECT v.status, COUNT(*) AS n
-                FROM " . $this->specSource($compId) . "
-                {$where}
-                GROUP BY v.status";
-        $out = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
-        foreach ($this->run($sql, $args) as $r) {
-            $out[$r['status']] = (int)$r['n'];
+        $out = array('total' => 0, 'pending' => 0, 'approved' => 0, 'rejected' => 0, 'none' => 0);
+        foreach ($this->rows as $r) {
+            $out['total']++;
+            if (isset($out[$r['status']])) { $out[$r['status']]++; }
         }
         return $out;
     }
 
-    /** Query: one row per GW supervisor who owes a review.
-     *  A GW with two live assignment rows is counted under BOTH supervisors —
-     *  either may approve, and the first to act takes it. */
-    public function byBoss($compId)
+    /** Query: one row per superior, with their people counted by status.
+     *  Somebody with two superiors is counted under both — either may act —
+     *  so this table is not meant to add up to the tiles; the tiles plus
+     *  withoutReviewer() are. */
+    public function byBoss()
     {
-        list($where, $args) = $this->gwScope($compId);
-        $sql = "SELECT g.boss_id, g.boss_comp_id,
-                       COALESCE(ub.fullname, g.boss_id) AS boss_name,
-                       ub.person IS NULL AS boss_missing,
-                       COUNT(DISTINCT CASE WHEN v.status = 'pending'  THEN v.row_key END) AS pending,
-                       COUNT(DISTINCT CASE WHEN v.status = 'approved' THEN v.row_key END) AS approved,
-                       COUNT(DISTINCT CASE WHEN v.status = 'rejected' THEN v.row_key END) AS rejected
-                FROM " . $this->specSource($compId) . "
-                INNER JOIN evaluation.monthly_assign_gw g
-                    ON " . self::GW_JOIN . "
-                   AND " . self::GW_ACTIVE_CLAUSE . "
-                   AND " . self::GW_NOT_SUBMITTER . "
-                   AND " . self::GW_HAS_BOSS . "
-                LEFT JOIN staff_portal2.users ub
-                    ON ub.person = g.boss_id AND ub.comp_id = g.boss_comp_id
-                   AND ub.status = 1 AND IFNULL(ub.deleted, 0) = 0
-                {$where}
-                GROUP BY g.boss_id, g.boss_comp_id, ub.fullname, ub.person
-                ORDER BY boss_name ASC";
-        return $this->run($sql, $args);
+        $out = array();
+        foreach ($this->rows as $r) {
+            foreach ($r['reviewers'] as $bossKey => $b) {
+                if (!isset($out[$bossKey])) {
+                    $out[$bossKey] = $b + array('pending' => 0, 'approved' => 0,
+                                                'rejected' => 0, 'none' => 0);
+                }
+                if (isset($out[$bossKey][$r['status']])) {
+                    $out[$bossKey][$r['status']]++;
+                }
+            }
+        }
+        $out = array_values($out);
+        usort($out, function ($a, $b) {
+            $c = strcasecmp(displayName($a['boss_name'], $a['boss_id']),
+                            displayName($b['boss_name'], $b['boss_id']));
+            return $c !== 0 ? $c : strcasecmp($a['boss_key'], $b['boss_key']);
+        });
+        return $out;
     }
 
-    /** Query: the GW behind one supervisor's row. Name comes from
-     *  monthly_assign_gw — a GW has no users record to fall back on. */
-    public function staffForBoss($compId, $bossId)
+    /** Query: the people behind one superior's row. Matched on boss_id alone,
+     *  which is what the View link carries. */
+    public function forBoss($bossId)
     {
-        list($where, $args) = $this->gwScope($compId);
-        $args[':boss'] = $bossId;
-        $sql = "SELECT v.id AS version_id, v.person, v.comp_id, v.status,
-                       v.submitted_at, v.reviewed_at, v.reviewed_by,
-                       COALESCE(MAX(g.monthly_assign_gw_fullname), v.person) AS staff_name,
-                       MAX(g.monthly_assign_gw_district) AS district,
-                       (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
-                        WHERE vi.version_id = v.id) AS items
-                FROM " . $this->specSource($compId) . "
-                INNER JOIN evaluation.monthly_assign_gw g
-                    ON " . self::GW_JOIN . "
-                   AND " . self::GW_ACTIVE_CLAUSE . "
-                   AND " . self::GW_NOT_SUBMITTER . "
-                   AND " . self::GW_HAS_BOSS . "
-                {$where}
-                  AND g.boss_id = :boss
-                GROUP BY v.row_key, v.id, v.person, v.comp_id, v.status,
-                         v.submitted_at, v.reviewed_at, v.reviewed_by
-                ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
-        return $this->run($sql, $args);
+        $out = array();
+        foreach ($this->rows as $r) {
+            foreach ($r['reviewers'] as $b) {
+                if (strcasecmp($b['boss_id'], (string)$bossId) === 0) {
+                    $out[] = $r;
+                    break;
+                }
+            }
+        }
+        return self::sorted($out);
     }
 
-    /** Query: GW versions with no eligible reviewer. A blank boss_id, a
-     *  supervisor with no users account, or a version the supervisor submitted
-     *  themselves (auto-approved) all land here. Same reasoning as the staff
-     *  version: every status, so the tiles reconcile with the table.
-     *
-     *  A GW outside the live population no longer lands here — gwScope() drops
-     *  them from this query and from totals() together, so the tiles still
-     *  reconcile. */
-    public function withoutReviewer($compId)
+    /** Query: the people nobody can review — no live superior other than whoever
+     *  submitted their spec. Every status, not just pending: an auto-approved
+     *  version lands here by design (jobSpecWrite.php approves on submit exactly
+     *  when the submitter is the only possible approver), and without them the
+     *  tiles would not reconcile with the table. */
+    public function withoutReviewer()
     {
-        list($where, $args) = $this->gwScope($compId);
-        $sql = "SELECT v.id AS version_id, v.person, v.comp_id, v.status,
-                       v.submitted_at, v.submitted_by, v.reviewed_at, v.reviewed_by,
-                       COALESCE((SELECT MAX(g2.monthly_assign_gw_fullname)
-                                 FROM evaluation.monthly_assign_gw g2
-                                 WHERE g2.monthly_assign_gw_code = v.person
-                                   AND g2.comp_id = CAST(v.comp_id AS CHAR)),
-                                v.person) AS staff_name,
-                       (SELECT COUNT(*) FROM mkPortal.job_spec_version_item vi
-                        WHERE vi.version_id = v.id) AS items
-                FROM " . $this->specSource($compId) . "
-                {$where}
-                  AND NOT EXISTS (
-                      SELECT 1 FROM evaluation.monthly_assign_gw g
-                      INNER JOIN staff_portal2.users ub
-                          ON ub.person = g.boss_id AND ub.comp_id = g.boss_comp_id
-                         AND ub.status = 1 AND IFNULL(ub.deleted, 0) = 0
-                      WHERE " . self::GW_JOIN . "
-                        AND " . self::GW_ACTIVE_CLAUSE . "
-                        AND " . self::GW_NOT_SUBMITTER . "
-                        AND " . self::GW_HAS_BOSS . ")
-                ORDER BY FIELD(v.status,'pending','rejected','approved'), staff_name";
-        return $this->run($sql, $args);
+        $out = array();
+        foreach ($this->rows as $r) {
+            if (!$r['covered']) { $out[] = $r; }
+        }
+        return self::sorted($out);
     }
+
+    private static function sorted(array $rows)
+    {
+        $order = self::$ORDER;
+        usort($rows, function ($a, $b) use ($order) {
+            $oa = isset($order[$a['status']]) ? $order[$a['status']] : 9;
+            $ob = isset($order[$b['status']]) ? $order[$b['status']] : 9;
+            if ($oa !== $ob) { return $oa - $ob; }
+            return strcasecmp($a['staff_name'], $b['staff_name']);
+        });
+        return $rows;
+    }
+}
+
+/**
+ * Query: the whole report for one company, or for every company in the pool's
+ * scope when $compId is null — the same scope staffPoolAPI.php's comp_id=all
+ * totals, so "All companies" here is that same group figure.
+ *
+ * Returns array(
+ *   'staff' => ApprovalPopulation, 'gw' => ApprovalPopulation,
+ *   'summary' => publicSummary() of the pool, 'capability_down' => bool).
+ */
+function loadReport(PDO $pdo, StaffPoolRepository $pool, array $poolCompanies, $compId)
+{
+    $scopeComps = array();
+    foreach ($poolCompanies as $c) {
+        $scopeComps[] = (int)$c['comp_id'];
+    }
+    $comps = ($compId !== null) ? array((int)$compId) : $scopeComps;
+
+    /* The pool, exactly as staffPoolAPI.php builds it. */
+    $rows      = array_merge($pool->staff($compId, $scopeComps), $pool->gw($compId, $scopeComps));
+    $overrides = $pool->overrides($compId);
+    $summary   = publicSummary($rows, $overrides);
+
+    $staff = array();
+    $gw    = array();
+    foreach (inPoolRows($rows, $overrides) as $r) {
+        if ($r['person_type'] === 'gw') { $gw[] = $r; } else { $staff[] = $r; }
+    }
+
+    /* Where their records are filed: Trillium (16) reads Globinaco's (1). */
+    $store   = array_values(array_unique(array_map('homeCompId', $comps)));
+    $gwStore = array_values(array_intersect($store, StaffPoolRepository::gwComps()));
+
+    $repo    = new ApprovalReportRepository($pdo);
+    $holders = capabilityHolders($store);
+
+    return array(
+        'staff' => new ApprovalPopulation(
+            $staff,
+            $repo->latestVersions($store, 0),
+            $holders === null ? array() : $holders,
+            $repo->staffSuperiors($store),
+            false
+        ),
+        'gw' => new ApprovalPopulation(
+            $gw,
+            $repo->latestVersions($gwStore, 1),
+            array(),                       // a GW has no capability list
+            $repo->gwSuperiors($gwStore),
+            true
+        ),
+        'summary'         => $summary,
+        'capability_down' => ($holders === null),
+    );
 }
 
 /* ---------- view helpers -------------------------------------------------- */
 
 function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
-
-/** "SOO ZHAO YUAN NATHAN" / "soo zhao yuan nathan" -> "Soo Zhao Yuan Nathan".
- *  Capitalises the first letter of every word. \p{L} with /u keeps accented
- *  letters intact, and the word boundary means "Mohd.Yuzaiman" and
- *  "Chu Chee Cheng @ Mohd.Yuzaiman" both come out right. */
-function titleCase($value)
-{
-    $value = trim((string)$value);
-    if ($value === '') { return ''; }
-    // strtolower/strtoupper rather than the mb_* pair: mbstring is not
-    // guaranteed on this host, and these only touch A-Z bytes, so a UTF-8
-    // multibyte sequence passes through untouched instead of being corrupted.
-    return preg_replace_callback(
-        '/\b\p{L}/u',
-        function ($m) { return strtoupper($m[0]); },
-        strtolower($value)
-    );
-}
-
-/** Display a person's name, but leave a bare login/code alone.
- *  Both name columns COALESCE down to the id when there is no record to read a
- *  full name from — title-casing that would turn "sooCK" into "Soock". */
-function displayName($name, $code)
-{
-    return ((string)$name === (string)$code) ? (string)$name : titleCase($name);
-}
 
 /** "2026-07-16 08:29:00" -> "16 Jul 2026" */
 function fmtDate($dt)
@@ -706,11 +650,10 @@ function taskUrl($versionId)
     return basename(__FILE__) . '?ajax=tasks&version=' . (int)$versionId;
 }
 
-/** Query: $companies with $compId guaranteed present. companies() is driven by
- *  job_spec_version, so a company with no versions yet is missing from it — and
- *  the select would then render "All companies" while the data is filtered to
- *  that company. $name is the session's company_name, from the same
- *  users -> subsidiaries join that produced comp_id. */
+/** Query: $companies with $compId guaranteed present. The pool's companies()
+ *  only offers the weekly-reporting group, so a viewer whose own company has
+ *  left it would otherwise see "All companies" in the select while the data
+ *  is filtered to their company. $name is the session's company_name. */
 function withOwnCompany(array $companies, $compId, $name)
 {
     if ($compId === null) {
@@ -728,19 +671,39 @@ function withOwnCompany(array $companies, $compId, $name)
     return $companies;
 }
 
-/** Query: is this row a capability stub rather than a real version? */
+/** Query: is this row a capability list awaiting approval, rather than a
+ *  version? */
 function isCapabilityRow(array $row)
 {
-    return $row['version_id'] === null;
+    return !empty($row['capability']);
 }
 
 /** Command: echo a row's status pill. A capability stub is pending like any
  *  other, and says so beneath — it has no version for the task count to open. */
 function renderStatus(array $row)
 {
-    echo '<span class="pill ' . h($row['status']) . '">' . h($row['status']) . '</span>';
+    $label = ($row['status'] === 'none') ? 'no job spec' : $row['status'];
+    echo '<span class="pill ' . h($row['status']) . '">' . h($label) . '</span>';
     if (isCapabilityRow($row)) {
         echo '<div class="muted">capability version</div>';
+    }
+}
+
+/** Command: echo a row's task count — a link that opens a version's tasks, the
+ *  capability list's size, or a dash for somebody with no job spec. */
+function renderTaskCount(array $row, $span)
+{
+    if (isCapabilityRow($row)) {
+        echo '<td class="num muted" title="Capability list — not yet approved in MK Command">'
+           . (int)$row['items'] . '</td>';
+    } elseif ($row['version_id'] === null) {
+        echo '<td class="num muted">&mdash;</td>';
+    } elseif ((int)$row['items'] > 0) {
+        echo '<td class="num"><a class="tasklink" href="' . h(taskUrl($row['version_id'])) . '"'
+           . ' data-url="' . h(taskUrl($row['version_id'])) . '"'
+           . ' data-span="' . (int)$span . '">' . (int)$row['items'] . '</a></td>';
+    } else {
+        echo '<td class="num">0</td>';
     }
 }
 
@@ -764,7 +727,7 @@ function renderTasks(array $rows, $span, $anchor)
     echo '</ol></div></td></tr>';
 }
 
-/** Command: echo one superior's versions as a nested table, inline beneath
+/** Command: echo one superior's people as a nested table, inline beneath
  *  their row. Staff and GW differ only by the District column, so one renderer
  *  serves both rather than two near-identical blocks of markup. */
 function renderDetail(array $rows, $isGw, $span, $anchor)
@@ -776,34 +739,24 @@ function renderDetail(array $rows, $isGw, $span, $anchor)
     echo '<th>Status</th><th class="num">Tasks</th><th>Reviewed</th><th>By</th>';
     echo '</tr></thead><tbody>';
 
+    $inner = $isGw ? 7 : 6;
     if (empty($rows)) {
-        $inner = $isGw ? 7 : 6;
-        echo '<tr><td colspan="' . $inner . '" class="empty">No versions for this superior.</td></tr>';
+        echo '<tr><td colspan="' . $inner . '" class="empty">Nobody under this superior.</td></tr>';
     }
     $n = 0;
     foreach ($rows as $d) {
         $n++;
         echo '<tr>';
         echo '<td class="idx">' . $n . '</td>';
-        echo '<td>' . h(displayName($d['staff_name'], $d['person']))
+        echo '<td>' . h($d['staff_name'])
            . '<div class="muted">' . h($d['person']) . '</div></td>';
         if ($isGw) {
-            echo '<td class="muted">' . h(!empty($d['district']) ? $d['district'] : '—') . '</td>';
+            echo '<td class="muted">' . h($d['district'] !== '' ? $d['district'] : '—') . '</td>';
         }
         echo '<td>';
         renderStatus($d);
         echo '</td>';
-        $inner = $isGw ? 7 : 6;
-        if (isCapabilityRow($d)) {
-            echo '<td class="num muted" title="Capability list — not yet approved in MK Command">'
-               . (int)$d['items'] . '</td>';
-        } elseif ((int)$d['items'] > 0) {
-            echo '<td class="num"><a class="tasklink" href="' . h(taskUrl($d['version_id'])) . '"'
-               . ' data-url="' . h(taskUrl($d['version_id'])) . '"'
-               . ' data-span="' . $inner . '">' . (int)$d['items'] . '</a></td>';
-        } else {
-            echo '<td class="num">0</td>';
-        }
+        renderTaskCount($d, $inner);
         echo '<td>' . h(fmtDate($d['reviewed_at'])) . '</td>';
         echo '<td class="muted">' . h($d['reviewed_by'] ? $d['reviewed_by'] : '—') . '</td>';
         echo '</tr>';
@@ -811,9 +764,9 @@ function renderDetail(array $rows, $isGw, $span, $anchor)
     echo '</tbody></table></div></td></tr>';
 }
 
-/** Command: render the "no reviewer" card for one population. Placed under
- *  that population's table so the two together account for every version in
- *  the tiles. Warning styling only when something is still pending — an
+/** Command: render the "no superior" card for one population. Placed under
+ *  that population's table so the two together account for everybody in the
+ *  tiles. Warning styling only when something is still pending — an
  *  auto-approved row here is expected, not a problem. */
 function renderNoReviewer(array $rows, $isGw)
 {
@@ -826,7 +779,7 @@ function renderNoReviewer(array $rows, $isGw)
     $who = $isGw ? 'GW' : 'Staff';
     ?>
     <div class="card <?php echo $pending > 0 ? 'warnbox' : ''; ?>">
-        <strong><?php echo count($rows); ?> Staff(s) with no Superior</strong>
+        <strong><?php echo count($rows); ?> <?php echo h($who); ?> with no Superior</strong>
         <table style="margin-top:10px">
             <thead>
             <tr><th class="idx">#</th><th><?php echo h($who); ?></th>
@@ -836,10 +789,10 @@ function renderNoReviewer(array $rows, $isGw)
             <?php $n = 0; foreach ($rows as $o): $n++; ?>
             <tr>
                 <td class="idx"><?php echo $n; ?></td>
-                <td><?php echo h(displayName($o['staff_name'], $o['person'])); ?>
+                <td><?php echo h($o['staff_name']); ?>
                     <div class="muted"><?php echo h($o['person']); ?></div></td>
                 <td><?php renderStatus($o); ?></td>
-                <td class="num"><?php echo (int)$o['items']; ?></td>
+                <?php renderTaskCount($o, 4); ?>
             </tr>
             <?php endforeach; ?>
             </tbody>
@@ -848,20 +801,11 @@ function renderNoReviewer(array $rows, $isGw)
     <?php
 }
 
-/** Query: capability holders for the companies in view — one company, or
- *  unfiltered the group companies() offers. Null when the portal host could
- *  not be read: the report then counts versions only and says so, rather than
- *  silently showing every capability-only staff member as having nothing. */
-function capabilityHolders(ApprovalReportRepository $repo, $compId)
+/** Query: capability holders for some STORAGE companies. Null when the portal
+ *  host could not be read: the report then counts those staff under "no job
+ *  spec" and says so, rather than silently claiming they have nothing. */
+function capabilityHolders(array $compIds)
 {
-    $compIds = array();
-    if ($compId !== null) {
-        $compIds[] = (int)$compId;
-    } else {
-        foreach ($repo->companies() as $c) {
-            $compIds[] = (int)$c['comp_id'];
-        }
-    }
     $out = array();
     try {
         foreach ($compIds as $cid) {
@@ -878,16 +822,18 @@ function capabilityHolders(ApprovalReportRepository $repo, $compId)
 
 $error = null;
 $capabilityDown = false;   // portal capability lists unreadable this load
-$totals = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
+$poolSummary = null;       // the pool's head count, as staffPoolAPI.php reports it
+$emptyTotals = array('total' => 0, 'pending' => 0, 'approved' => 0, 'rejected' => 0, 'none' => 0);
+$totals = $emptyTotals;
 $bosses = array();
 $noReviewer = array();
 $companies = array();
 $detail = array();
 
-$gwTotals  = array('pending' => 0, 'approved' => 0, 'rejected' => 0);
+$gwTotals     = $emptyTotals;
 $gwBosses     = array();
 $gwNoReviewer = array();
-$gwDetail  = array();
+$gwDetail     = array();
 
 /** The company the report opens on: the viewer's own, straight off the session.
  *  UnifiedAuth joins users -> subsidiaries at login and stores comp_id
@@ -940,9 +886,7 @@ if ($noScope) {
 $boss   = (isset($_GET['boss']) && $_GET['boss'] !== '') ? trim($_GET['boss']) : null;
 $gwBoss = (isset($_GET['gwboss']) && $_GET['gwboss'] !== '') ? trim($_GET['gwboss']) : null;
 
-/* AJAX: return just the detail row for one superior. Uses the SAME
- * renderDetail() as the full page, so there is one definition of that markup
- * and the JS never has to rebuild it. Everything below this block is skipped. */
+/* AJAX: one version's tasks. Everything below this block is skipped. */
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'tasks') {
     header('Content-Type: text/html; charset=UTF-8');
     $ajaxVersion = isset($_GET['version']) ? (int)$_GET['version'] : 0;
@@ -954,7 +898,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'tasks') {
             throw new RuntimeException('Missing version');
         }
         $ajaxRepo = new ApprovalReportRepository(Db::get());
-        renderTasks($ajaxRepo->itemsFor($ajaxVersion, $compId), 7, 'v-' . $ajaxVersion);
+        renderTasks($ajaxRepo->itemsFor($ajaxVersion, $compId === null ? null : homeCompId($compId)),
+                    7, 'v-' . $ajaxVersion);
     } catch (Exception $e) {
         error_log('jobSpecApprovalReport ajax tasks: ' . $e->getMessage());
         http_response_code(500);
@@ -964,6 +909,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'tasks') {
     exit;
 }
 
+/* AJAX: the detail row for one superior. Uses the SAME renderDetail() as the
+ * full page, so there is one definition of that markup and the JS never has
+ * to rebuild it. */
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail') {
     header('Content-Type: text/html; charset=UTF-8');
     $ajaxIsGw = (isset($_GET['is_gw']) && (int)$_GET['is_gw'] === 1);
@@ -975,19 +923,15 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail') {
         if ($ajaxBoss === '') {
             throw new RuntimeException('Missing superior');
         }
-        $ajaxRepo = $ajaxIsGw
-            ? new GwApprovalReportRepository(Db::get())
-            : new ApprovalReportRepository(Db::get());
-        if (!$ajaxIsGw) {
-            $ajaxHolders = capabilityHolders($ajaxRepo, $compId);
-            $ajaxRepo->setCapabilityHolders($ajaxHolders === null ? array() : $ajaxHolders);
-        }
-        renderDetail($ajaxRepo->staffForBoss($compId, $ajaxBoss), $ajaxIsGw, 7,
+        $ajaxPool   = new StaffPoolRepository(Db::get());
+        $ajaxReport = loadReport(Db::get(), $ajaxPool, $ajaxPool->companies(), $compId);
+        $ajaxPop    = $ajaxIsGw ? $ajaxReport['gw'] : $ajaxReport['staff'];
+        renderDetail($ajaxPop->forBoss($ajaxBoss), $ajaxIsGw, 8,
                      detailAnchor($ajaxIsGw, $ajaxBoss));
     } catch (Exception $e) {
         error_log('jobSpecApprovalReport ajax: ' . $e->getMessage());
         http_response_code(500);
-        echo '<tr class="detailrow"><td colspan="7"><div class="detailbox">'
+        echo '<tr class="detailrow"><td colspan="8"><div class="detailbox">'
            . '<div class="empty">Could not load this list.</div></div></td></tr>';
     }
     exit;
@@ -997,28 +941,30 @@ try {
     if ($noScope) {
         throw new RuntimeException('Viewer has no company');
     }
-    $repo      = new ApprovalReportRepository(Db::get());
-    $companies = withOwnCompany(
-        $repo->companies(),
+    $pool          = new StaffPoolRepository(Db::get());
+    $poolCompanies = $pool->companies();
+    $companies     = withOwnCompany(
+        $poolCompanies,
         $defaultCompId,
         isset($currentUser['company_name']) ? $currentUser['company_name'] : null
     );
-    $holders   = capabilityHolders($repo, $compId);
-    $capabilityDown = ($holders === null);
-    $repo->setCapabilityHolders($capabilityDown ? array() : $holders);
-    $totals    = $repo->totals($compId);
-    $bosses    = $repo->byBoss($compId);
-    $noReviewer = $repo->withoutReviewer($compId);
+
+    $report         = loadReport(Db::get(), $pool, $poolCompanies, $compId);
+    $poolSummary    = $report['summary'];
+    $capabilityDown = $report['capability_down'];
+
+    $totals     = $report['staff']->totals();
+    $bosses     = $report['staff']->byBoss();
+    $noReviewer = $report['staff']->withoutReviewer();
     if ($boss !== null) {
-        $detail = $repo->staffForBoss($compId, $boss);
+        $detail = $report['staff']->forBoss($boss);
     }
 
-    $gwRepo    = new GwApprovalReportRepository(Db::get());
-    $gwTotals  = $gwRepo->totals($compId);
-    $gwBosses  = $gwRepo->byBoss($compId);
-    $gwNoReviewer = $gwRepo->withoutReviewer($compId);
+    $gwTotals     = $report['gw']->totals();
+    $gwBosses     = $report['gw']->byBoss();
+    $gwNoReviewer = $report['gw']->withoutReviewer();
     if ($gwBoss !== null) {
-        $gwDetail = $gwRepo->staffForBoss($compId, $gwBoss);
+        $gwDetail = $report['gw']->forBoss($gwBoss);
     }
 } catch (Exception $e) {
     error_log('jobSpecApprovalReport: ' . $e->getMessage());
@@ -1026,6 +972,12 @@ try {
        something useful, the generic one does not. */
     if ($error === null) {
         $error = 'Could not load the report. Check the error log.';
+    }
+    /* The override tables are the one failure worth naming, as
+       staffPoolAPI.php names it: nothing counts until the DDL has run. */
+    if (strpos($e->getMessage(), 'staff_flag_override') !== false) {
+        $error = 'The staff pool override tables are not installed yet. Run '
+               . 'mkCommand_API/sql/staff_flag_override.sql on globportal.';
     }
 }
 
@@ -1036,11 +988,13 @@ $ownCompanyLabel = (isset($currentUser['company_name'])
     ? $currentUser['company_name']
     : ($defaultCompId !== null ? 'Company ' . $defaultCompId : '—');
 
-$totalVersions = $totals['pending'] + $totals['approved'] + $totals['rejected'];
-$done          = $totals['approved'] + $totals['rejected'];
+/* "Actioned" is a review question, so it is asked of the people who HAVE a
+ * spec to review; those with none are their own tile. */
+$withSpec = $totals['pending'] + $totals['approved'] + $totals['rejected'];
+$done     = $totals['approved'] + $totals['rejected'];
 
-$gwTotalVersions = $gwTotals['pending'] + $gwTotals['approved'] + $gwTotals['rejected'];
-$gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
+$gwWithSpec = $gwTotals['pending'] + $gwTotals['approved'] + $gwTotals['rejected'];
+$gwDone     = $gwTotals['approved'] + $gwTotals['rejected'];
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1091,6 +1045,10 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
     .pill.pending  { background:rgba(180,83,9,.10);  color:var(--warn); }
     .pill.approved { background:rgba(5,150,105,.10); color:var(--success); }
     .pill.rejected { background:rgba(220,38,38,.08); color:var(--danger); }
+    .pill.none     { background:rgba(100,116,139,.12); color:var(--muted); }
+    .n.none { color:var(--muted); }
+    .poolline { display:flex; flex-wrap:wrap; gap:6px 18px; align-items:baseline; }
+    .poolline .big { font-size:20px; font-weight:700; }
     .warnbox { border-left:4px solid var(--danger); background:rgba(220,38,38,.06); }
     .empty { color:var(--muted); text-align:center; padding:26px 0; }
     a { color:var(--primary); }
@@ -1165,19 +1123,40 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
 <?php if ($capabilityDown): ?>
     <div class="card warnbox">
         Capability lists could not be read from the company portals, so staff still on
-        their capability version are missing from the pending counts below.
+        their capability version are counted under "No job spec" below instead of
+        "Awaiting approval".
     </div>
 <?php endif; ?>
 
+<?php if ($poolSummary !== null): ?>
+<!-- The pool's own head count — the figure staffPoolAPI.php and the Staff
+     Headcount report give for this filter. The two sections below add up to it. -->
+<div class="card poolline">
+    <span><span class="big"><?php echo (int)$poolSummary['company_total_staff']; ?></span>
+        staff in the pool</span>
+    <span class="muted">
+        <?php echo (int)$poolSummary['company_total_by_type']['staff']; ?> staff
+        + <?php echo (int)$poolSummary['company_total_by_type']['gw']; ?> general workers
+        <?php if ((int)$poolSummary['company_excluded_staff'] > 0): ?>
+            &middot; <?php echo (int)$poolSummary['company_excluded_staff']; ?> taken out of the pool, not counted
+        <?php endif; ?>
+    </span>
+</div>
+<?php endif; ?>
+
 <div class="tiles">
+    <div class="tile"><div class="n"><?php echo (int)$totals['total']; ?></div>
+        <div class="l">Staff</div></div>
     <div class="tile"><div class="n pending"><?php echo (int)$totals['pending']; ?></div>
         <div class="l">Awaiting approval</div></div>
     <div class="tile"><div class="n approved"><?php echo (int)$totals['approved']; ?></div>
         <div class="l">Approved</div></div>
     <div class="tile"><div class="n rejected"><?php echo (int)$totals['rejected']; ?></div>
         <div class="l">Rejected</div></div>
-    <div class="tile"><div class="n"><?php echo pct($done, $totalVersions); ?>%</div>
-        <div class="l"><?php echo (int)$done; ?> of <?php echo (int)$totalVersions; ?> actioned</div></div>
+    <div class="tile"><div class="n none"><?php echo (int)$totals['none']; ?></div>
+        <div class="l">No job spec</div></div>
+    <div class="tile"><div class="n"><?php echo pct($done, $withSpec); ?>%</div>
+        <div class="l"><?php echo (int)$done; ?> of <?php echo (int)$withSpec; ?> actioned</div></div>
 </div>
 
 <div class="card">
@@ -1189,13 +1168,14 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <th class="num">Pending</th>
             <th class="num">Approved</th>
             <th class="num">Rejected</th>
+            <th class="num">No spec</th>
             <th>Progress</th>
             <th></th>
         </tr>
         </thead>
         <tbody>
         <?php if (empty($bosses)): ?>
-            <tr><td colspan="7" class="empty">Nothing to show for this filter.</td></tr>
+            <tr><td colspan="8" class="empty">Nothing to show for this filter.</td></tr>
         <?php endif; ?>
         <?php $i = 0; foreach ($bosses as $b):
             $i++;
@@ -1215,6 +1195,7 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <td class="num"><?php echo (int)$b['pending'] ? '<strong>' . (int)$b['pending'] . '</strong>' : '0'; ?></td>
             <td class="num"><?php echo (int)$b['approved']; ?></td>
             <td class="num"><?php echo (int)$b['rejected']; ?></td>
+            <td class="num muted"><?php echo (int)$b['none']; ?></td>
             <td>
                 <div class="bar"><i style="width:<?php echo pct($dn, $tot); ?>%"></i></div>
                 <div class="muted"><?php echo $dn; ?>/<?php echo $tot; ?></div>
@@ -1222,13 +1203,13 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <td class="num">
                 <a href="<?php echo h(selfUrl(array('boss' => $isOpen ? null : $b['boss_id']))); ?>#<?php echo h(detailAnchor(false, $b['boss_id'])); ?>"
                    data-boss="<?php echo h($b['boss_id']); ?>"
-                   data-span="7"
+                   data-span="8"
                    data-url="<?php echo h(selfUrl(array('ajax' => 'detail', 'is_gw' => 0, 'for' => $b['boss_id'], 'boss' => null, 'gwboss' => null))); ?>">
                     <?php echo $isOpen ? 'Hide' : 'View'; ?>
                 </a>
             </td>
         </tr>
-        <?php if ($isOpen) { renderDetail($detail, false, 7, detailAnchor(false, $b['boss_id'])); } ?>
+        <?php if ($isOpen) { renderDetail($detail, false, 8, detailAnchor(false, $b['boss_id'])); } ?>
         <?php endforeach; ?>
         </tbody>
     </table>
@@ -1247,14 +1228,18 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
 </div> -->
 
 <div class="tiles">
+    <div class="tile"><div class="n"><?php echo (int)$gwTotals['total']; ?></div>
+        <div class="l">General workers</div></div>
     <div class="tile"><div class="n pending"><?php echo (int)$gwTotals['pending']; ?></div>
         <div class="l">Awaiting approval</div></div>
     <div class="tile"><div class="n approved"><?php echo (int)$gwTotals['approved']; ?></div>
         <div class="l">Approved</div></div>
     <div class="tile"><div class="n rejected"><?php echo (int)$gwTotals['rejected']; ?></div>
         <div class="l">Rejected</div></div>
-    <div class="tile"><div class="n"><?php echo pct($gwDone, $gwTotalVersions); ?>%</div>
-        <div class="l"><?php echo (int)$gwDone; ?> of <?php echo (int)$gwTotalVersions; ?> actioned</div></div>
+    <div class="tile"><div class="n none"><?php echo (int)$gwTotals['none']; ?></div>
+        <div class="l">No job spec</div></div>
+    <div class="tile"><div class="n"><?php echo pct($gwDone, $gwWithSpec); ?>%</div>
+        <div class="l"><?php echo (int)$gwDone; ?> of <?php echo (int)$gwWithSpec; ?> actioned</div></div>
 </div>
 
 <div class="card">
@@ -1266,13 +1251,14 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <th class="num">Pending</th>
             <th class="num">Approved</th>
             <th class="num">Rejected</th>
+            <th class="num">No spec</th>
             <th>Progress</th>
             <th></th>
         </tr>
         </thead>
         <tbody>
         <?php if (empty($gwBosses)): ?>
-            <tr><td colspan="7" class="empty">No GW job specs for this filter.</td></tr>
+            <tr><td colspan="8" class="empty">No supervisors to show for this filter.</td></tr>
         <?php endif; ?>
         <?php $i = 0; foreach ($gwBosses as $b):
             $i++;
@@ -1292,6 +1278,7 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <td class="num"><?php echo (int)$b['pending'] ? '<strong>' . (int)$b['pending'] . '</strong>' : '0'; ?></td>
             <td class="num"><?php echo (int)$b['approved']; ?></td>
             <td class="num"><?php echo (int)$b['rejected']; ?></td>
+            <td class="num muted"><?php echo (int)$b['none']; ?></td>
             <td>
                 <div class="bar"><i style="width:<?php echo pct($dn, $tot); ?>%"></i></div>
                 <div class="muted"><?php echo $dn; ?>/<?php echo $tot; ?></div>
@@ -1299,13 +1286,13 @@ $gwDone          = $gwTotals['approved'] + $gwTotals['rejected'];
             <td class="num">
                 <a href="<?php echo h(selfUrl(array('gwboss' => $isOpen ? null : $b['boss_id']))); ?>#<?php echo h(detailAnchor(true, $b['boss_id'])); ?>"
                    data-boss="<?php echo h($b['boss_id']); ?>"
-                   data-span="7"
+                   data-span="8"
                    data-url="<?php echo h(selfUrl(array('ajax' => 'detail', 'is_gw' => 1, 'for' => $b['boss_id'], 'boss' => null, 'gwboss' => null))); ?>">
                     <?php echo $isOpen ? 'Hide' : 'View'; ?>
                 </a>
             </td>
         </tr>
-        <?php if ($isOpen) { renderDetail($gwDetail, true, 7, detailAnchor(true, $b['boss_id'])); } ?>
+        <?php if ($isOpen) { renderDetail($gwDetail, true, 8, detailAnchor(true, $b['boss_id'])); } ?>
         <?php endforeach; ?>
         </tbody>
     </table>

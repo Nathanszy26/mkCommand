@@ -33,11 +33,18 @@
  *                       granted is absent from the list columns AND from the
  *                       detail page, not merely hidden in the markup.
  *
- * POPULATION — the same one MK Command itself shows: active, undeleted users
- * with mk_command_excluded <> 1. General Workers are deliberately NOT here:
- * a GW is a monthly_assign_gw code, has no users.id, and therefore has no memo,
- * merit or app record to read — four of the five sections would be empty by
- * construction. GW job specs are reported by jobspecReport.php instead.
+ * POPULATION — the staff pool (staffPoolCore.php), the same people
+ * staffPoolAPI.php lists and jobspecReport.php counts. If the pool says a
+ * company has 665, this directory lists 665 — staff first, then General
+ * Workers — and nobody an override has taken out of the pool. MK Command
+ * exemption is a FLAG on a pool member, not a reason to leave them out, so an
+ * exempted person is listed and marked as such.
+ *
+ * Trillium (16) is listed as its own company, as the pool lists it, and a
+ * grant over Globinaco covers it (withTrillium()). Its people's records are
+ * filed under Globinaco (1), so every lookup and every link goes through
+ * homeCompId(). A GW has no users.id and so no memo, merit or app record —
+ * those columns read "—" for them.
  *
  * Read-only. Every query in this file is a SELECT.
  *
@@ -103,28 +110,30 @@ if (!UnifiedAuth::isLoggedIn()) {
 
 $currentUser = UnifiedAuth::getLoggedInUser();
 
-/* ---------- DB ------------------------------------------------------------ */
-
-class Db
-{
-    private static $pdo = null;
-
-    /** One shared PDO. Every schema this page reads is on this host. */
-    public static function get()
-    {
-        if (self::$pdo === null) {
-            $pdo = new PDO(
-                'mysql:host=localhost;charset=utf8mb4',
-                'prog4',
-                'prog42023',
-                array(PDO::ATTR_TIMEOUT => 5)
-            );
-            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-            self::$pdo = $pdo;
-        }
-        return self::$pdo;
-    }
+/* The staff pool — who this page counts — plus Db and displayName().
+ *
+ * On globportal staffPoolCore.php lives in accounts/mkPortal/hr, beside
+ * staffPoolAPI.php, while this page lives in accounts/mkPortal/mkCommand —
+ * so ../hr is tried first. The second path is the repo layout, where both
+ * sit in mkCommand_API/. A missing or out-of-date core says so on the page
+ * rather than failing as a blank HTTP 500. */
+$poolCore = null;
+foreach (array(__DIR__ . '/../hr/staffPoolCore.php', __DIR__ . '/staffPoolCore.php') as $candidate) {
+    if (file_exists($candidate)) { $poolCore = $candidate; break; }
+}
+if ($poolCore !== null) {
+    require_once $poolCore;
+}
+if ($poolCore === null || !function_exists('inPoolRows') || !function_exists('homeCompId')) {
+    http_response_code(500);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo '<p style="font:14px sans-serif;padding:24px">'
+       . ($poolCore === null
+            ? 'staffPoolCore.php was not found. Expected it at accounts/mkPortal/hr/staffPoolCore.php.'
+            : 'staffPoolCore.php at ' . htmlspecialchars($poolCore, ENT_QUOTES, 'UTF-8')
+              . ' is out of date (no inPoolRows / homeCompId). Upload the current one.')
+       . '</p>';
+    exit;
 }
 
 /** Shared bits of every repository below: bind-and-run, and IN() lists. */
@@ -281,6 +290,9 @@ class AccessScope
             }
         }
         $comps = array_values(array_unique(array_map('intval', $comps)));
+        /* Trillium's people are Globinaco's people under another banner, so a
+         * grant over Globinaco covers them — the pool's own rule. */
+        $comps = withTrillium($comps);
 
         $sections = array();
         $raw = strtolower(trim((string)$grant['assigned_categories']));
@@ -325,32 +337,11 @@ class AccessScope
 
 class DirectoryRepository extends Repository
 {
-    /** A user is visible to MK Command at all — identical to staffHierarchy.php,
-     *  so this page and the app never disagree about who exists. */
+    /** A user is visible to MK Command at all — identical to staffHierarchy.php.
+     *  It governs the reporting line, so a tree here matches the app's; WHO the
+     *  directory lists is the staff pool instead (see the controller). */
     const USER_VISIBLE = "u.status = 1 AND IFNULL(u.deleted, 0) = 0
                           AND IFNULL(u.mk_command_excluded, 0) <> 1";
-
-    /** Query: the staff directory for a set of companies, optionally searched. */
-    public function staff(array $compIds, $search)
-    {
-        $args = array();
-        $sql = "SELECT u.id, u.person, u.comp_id, u.fullname, u.department, u.position,
-                       u.email, u.mobile_no, u.join_date,
-                       COALESCE(NULLIF(TRIM(s.name), ''), CONCAT('Company ', u.comp_id)) AS company_name
-                FROM staff_portal2.users u
-                LEFT JOIN staff_portal2.subsidiaries s ON s.id = u.comp_id
-                WHERE u.comp_id IN (" . self::intList($compIds) . ")
-                  AND " . self::USER_VISIBLE;
-
-        if ($search !== null && $search !== '') {
-            $sql .= " AND (u.fullname LIKE :q OR u.person LIKE :q
-                        OR u.department LIKE :q OR u.position LIKE :q)";
-            $args[':q'] = '%' . $search . '%';
-        }
-
-        $sql .= " ORDER BY u.fullname ASC";
-        return $this->run($sql, $args);
-    }
 
     /**
      * Query: each staff member's CURRENT job spec, keyed 'person|comp_id'.
@@ -369,7 +360,7 @@ class DirectoryRepository extends Repository
      * items across every version the staff member has. The second query is an
      * IN() on a handful of primary keys.
      *
-     * Returns ['person|comp' => ['status' => string|null, 'items' => int]].
+     * Returns [strtolower(person)|comp => ['status' => string|null, 'items' => int]].
      */
     public function latestJobSpecs(array $compIds, $isGw = 0)
     {
@@ -402,7 +393,9 @@ class DirectoryRepository extends Repository
         $out = array();
         foreach ($rows as $r) {
             $id  = (int)$r['latest_id'];
-            $out[$r['person'] . '|' . (int)$r['comp_id']] = isset($summaries[$id])
+            // Lower-cased: GROUP BY above matched under a case-insensitive
+            // collation, so the PHP key must not be stricter than it.
+            $out[strtolower($r['person']) . '|' . (int)$r['comp_id']] = isset($summaries[$id])
                 ? $summaries[$id]
                 : self::NO_JOB_SPEC;
         }
@@ -610,6 +603,13 @@ class StaffRepository extends Repository
 
     const USER_VISIBLE = DirectoryRepository::USER_VISIBLE;
 
+    /** Who may be OPENED: anybody the pool can list — staffPoolCore.php's staff
+     *  rule. Wider than USER_VISIBLE on purpose: an MK Command-exempted staff
+     *  member is in the pool and in the directory, so their page must open.
+     *  The reporting line still reads USER_VISIBLE, as staffHierarchy.php does. */
+    const IN_POOL = "u.status = '1' AND u.deleted = '0'
+                     AND IFNULL(u.test_user, 0) <> 1 AND IFNULL(u.is_gw, 0) <> 1";
+
     /** Comp 1's reporting lines live in organization_chart_glob; everyone
      *  else's in evaluation.monthly_assign. Routing is on the STAFF-side
      *  comp_id — the same rule staffHierarchy.php and jobSpecWrite.php apply. */
@@ -626,7 +626,7 @@ class StaffRepository extends Repository
              FROM staff_portal2.users u
              LEFT JOIN staff_portal2.subsidiaries s ON s.id = u.comp_id
              WHERE u.person = :p AND u.comp_id = :c
-               AND " . self::USER_VISIBLE . "
+               AND " . self::IN_POOL . "
              LIMIT 1",
             array(':p' => (string)$person, ':c' => (int)$compId)
         );
@@ -765,51 +765,21 @@ class GwRepository extends Repository
      *  the day that changes, this reads the data rather than an assumption. */
     const COMP_ID = 1;
 
-    /** The live GW population — the clause jobspecReport.php, staffHierarchy.php
-     *  and manpower_summary.php all apply, so every page counts the same people. */
+    /** The GW the reporting-line TREE shows — staffHierarchy.php's clause, so a
+     *  boss's subtree here matches the app's Staff tab. */
     const ACTIVE_CLAUSE = "
         mag.monthly_assign_gw_status = '1'
         AND (mag.kpi_scorecard_exclude IS NULL OR mag.kpi_scorecard_exclude <> '1')";
 
-    /**
-     * Query: the GW directory for whichever of these companies has any.
-     *
-     * Grouped by code, not by row: a GW assigned to two supervisors has two
-     * monthly_assign_gw rows (13 of them do), and listing that person twice
-     * would double them in the count as well as on screen. MIN() over the
-     * grouped columns just picks one row's copy of what is the same value.
-     */
-    public function directory(array $compIds, $search)
-    {
-        $comps = self::intList($compIds);
-        $args  = array();
+    /** The GW the POOL holds — staffPoolCore.php's gw() rule. Every GW the
+     *  directory lists must open, and a KPI-exempted GW is still in the pool:
+     *  kpi_scorecard_exclude is one of its flags, not a pool rule. */
+    const POOL_CLAUSE = "
+        mag.monthly_assign_gw_status = '1'
+        AND IFNULL(mag.test_user, 0) <> 1";
 
-        $sql = "SELECT mag.monthly_assign_gw_code AS person,
-                       CAST(mag.comp_id AS UNSIGNED) AS comp_id,
-                       MIN(mag.monthly_assign_gw_id) AS id,
-                       MIN(mag.monthly_assign_gw_fullname) AS fullname,
-                       MIN(mag.monthly_assign_gw_district) AS district,
-                       COALESCE(NULLIF(TRIM(MIN(s.name)), ''),
-                                CONCAT('Company ', CAST(mag.comp_id AS UNSIGNED))) AS company_name
-                FROM evaluation.monthly_assign_gw mag
-                LEFT JOIN staff_portal2.subsidiaries s
-                       ON s.id = CAST(mag.comp_id AS UNSIGNED)
-                WHERE CAST(mag.comp_id AS UNSIGNED) IN ({$comps})
-                  AND " . self::ACTIVE_CLAUSE;
-
-        if ($search !== null && $search !== '') {
-            $sql .= " AND (mag.monthly_assign_gw_fullname LIKE :q
-                        OR mag.monthly_assign_gw_code LIKE :q
-                        OR mag.monthly_assign_gw_district LIKE :q)";
-            $args[':q'] = '%' . $search . '%';
-        }
-
-        $sql .= " GROUP BY mag.monthly_assign_gw_code, CAST(mag.comp_id AS UNSIGNED)
-                  ORDER BY fullname ASC";
-        return $this->run($sql, $args);
-    }
-
-    /** Query: one GW, or null. Same grouping rule as directory(). */
+    /** Query: one GW, or null. Grouped by code, not by row: a GW assigned to
+     *  two supervisors has two monthly_assign_gw rows, and is one person. */
     public function profile($code, $compId)
     {
         $rows = $this->run(
@@ -828,7 +798,7 @@ class GwRepository extends Repository
                     ON s.id = CAST(mag.comp_id AS UNSIGNED)
              WHERE mag.monthly_assign_gw_code = :p
                AND CAST(mag.comp_id AS UNSIGNED) = :c
-               AND " . self::ACTIVE_CLAUSE . "
+               AND " . self::POOL_CLAUSE . "
              GROUP BY mag.monthly_assign_gw_code, CAST(mag.comp_id AS UNSIGNED)",
             array(':p' => (string)$code, ':c' => (int)$compId)
         );
@@ -854,7 +824,7 @@ class GwRepository extends Repository
              LEFT JOIN staff_portal2.subsidiaries s ON s.id = u.comp_id
              WHERE mag.monthly_assign_gw_code = :p
                AND CAST(mag.comp_id AS UNSIGNED) = :c
-               AND " . self::ACTIVE_CLAUSE . "
+               AND " . self::POOL_CLAUSE . "
              GROUP BY u.person, u.comp_id, u.fullname, u.department, u.position, s.name
              ORDER BY u.fullname",
             array(':p' => (string)$code, ':c' => (int)$compId)
@@ -1402,16 +1372,8 @@ function titleCase($value)
     );
 }
 
-/** Display a name, but leave a bare login alone — title-casing a COALESCE that
- *  fell through to the login turns "sooCK" into "Soock". A blank fullname falls
- *  back to the login too: this name is the link text on every row, and an empty
- *  one is a link nobody can click. */
-function displayName($name, $code)
-{
-    $name = trim((string)$name);
-    if ($name === '') { return (string)$code; }
-    return ($name === (string)$code) ? $name : titleCase($name);
-}
+/* displayName() is staffPoolCore.php's: a blank name or a bare login prints
+ * as the login, everything else is title-cased. */
 
 /** "2026-07-16 08:29:00" -> "16 Jul 2026" */
 function fmtDate($dt)
@@ -1952,6 +1914,19 @@ function param($key)
     return (isset($_GET[$key]) && is_string($_GET[$key])) ? trim($_GET[$key]) : '';
 }
 
+/** Query: does a pool row match the directory's search box? Name, login,
+ *  department, position and district (a GW's only grouping), ignoring case —
+ *  the columns the search has always read. */
+function matchesSearch(array $row, $search)
+{
+    foreach (array('fullname', 'person', 'department', 'position', 'district') as $field) {
+        if (isset($row[$field]) && stripos((string)$row[$field], $search) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
 $error = null;
 
 $viewerPerson = '';
@@ -2166,6 +2141,7 @@ $issuerNames  = array();
 $directoryYears = array();
 $people       = array();   // the directory: staff
 $gwPeople     = array();   // the directory: General Workers, listed after them
+$poolSummary  = null;      // the pool's head count for the directory's companies
 $supervisors  = array();   // a GW's supervisors (they have no chart of their own)
 
 try {
@@ -2259,40 +2235,75 @@ try {
     }
 
     if ($staff === null) {
-        $dir    = new DirectoryRepository(Db::get());
-        $people = $dir->staff($activeCompIds, $search);
+        $dir = new DirectoryRepository(Db::get());
 
-        $specs  = $scope->sees('jobspec') ? $dir->latestJobSpecs($activeCompIds) : array();
+        /* WHO is listed is the staff pool, built exactly as staffPoolAPI.php
+         * builds it — so this directory's total is that API's
+         * company_total_staff for the same companies. The whole of it is
+         * loaded and counted before the search box is applied, as the API
+         * counts its summary before its filters: the head count must not move
+         * because someone typed a name. */
+        $poolRepo  = new StaffPoolRepository(Db::get());
+        $poolRows  = array_merge($poolRepo->staff($compId, $activeCompIds),
+                                 $poolRepo->gw($compId, $activeCompIds));
+        $overrides = $poolRepo->overrides($compId);
+        $poolSummary = publicSummary($poolRows, $overrides);
+
+        foreach (inPoolRows($poolRows, $overrides) as $r) {
+            if ($search !== '' && !matchesSearch($r, $search)) { continue; }
+            list($exempt) = effective($r, 'mk_command', $overrides);
+            $row = array(
+                'id'           => $r['mk_id'],     // users.id for staff; unused for GW
+                'person'       => $r['person'],
+                'comp_id'      => (int)$r['comp_id'],          // as the pool reports it
+                'home_comp_id' => homeCompId($r['comp_id']),   // where their records are filed
+                'fullname'     => $r['fullname'],
+                'department'   => $r['department'],
+                'position'     => $r['position'],
+                'district'     => $r['district'],
+                'company_name' => isset($companies[(int)$r['comp_id']])
+                    ? $companies[(int)$r['comp_id']] : 'Company ' . (int)$r['comp_id'],
+                'mk_command_exempted' => (bool)$exempt,
+            );
+            if ($r['person_type'] === 'gw') { $gwPeople[] = $row; } else { $people[] = $row; }
+        }
+
+        /* Every record below is read by where it is FILED, so Trillium's people
+         * are looked up under Globinaco. */
+        $dataCompIds = array_values(array_unique(array_map('homeCompId', $activeCompIds)));
+
+        $specs  = $scope->sees('jobspec') ? $dir->latestJobSpecs($dataCompIds) : array();
         $capability = array();
         if ($scope->sees('jobspec')) {
-            $capability = capabilityHolders($activeCompIds);
+            $capability = capabilityHolders($dataCompIds);
             if ($capability === null) {
                 $capabilityDown = true;
                 $capability = array();
             }
         }
-        $appN   = $scope->sees('app')     ? $dir->appCounts($activeCompIds)
+        $appN   = $scope->sees('app')     ? $dir->appCounts($dataCompIds)
                                       : array('personal' => array(), 'company' => array());
         $memoN  = $scope->sees('memo')    ? $dir->memoCounts()                  : array('per' => array(), 'broadcast' => 0);
-        $merits = $scope->sees('merit')   ? $dir->meritTotals($activeCompIds, $year) : array();
+        $merits = $scope->sees('merit')   ? $dir->meritTotals($dataCompIds, $year) : array();
         if ($scope->sees('merit')) {
-            $directoryYears = yearOptions($dir->performanceYears($activeCompIds), $year);
+            $directoryYears = yearOptions($dir->performanceYears($dataCompIds), $year);
         }
 
         foreach ($people as $i => $p) {
-            $key = $p['person'] . '|' . (int)$p['comp_id'];
-            $uid = (int)$p['id'];
+            $home    = (int)$p['home_comp_id'];
+            $key     = $p['person'] . '|' . $home;
+            $specKey = strtolower($p['person']) . '|' . $home;
+            $uid     = (int)$p['id'];
 
-            $capKey = strtolower($p['person']) . '|' . (int)$p['comp_id'];
-            $people[$i]['spec'] = isset($specs[$key])
-                ? $specs[$key]
-                : (isset($capability[$capKey])
-                    ? DirectoryRepository::capabilitySpec($capability[$capKey]['items'])
+            $people[$i]['spec'] = isset($specs[$specKey])
+                ? $specs[$specKey]
+                : (isset($capability[$specKey])
+                    ? DirectoryRepository::capabilitySpec($capability[$specKey]['items'])
                     : DirectoryRepository::NO_JOB_SPEC);
             // Personal assignments unioned with the company-wide ones, so an app
             // held both ways counts once.
             $mine = isset($appN['personal'][$key]) ? $appN['personal'][$key] : array();
-            $ours = isset($appN['company'][(int)$p['comp_id']]) ? $appN['company'][(int)$p['comp_id']] : array();
+            $ours = isset($appN['company'][$home]) ? $appN['company'][$home] : array();
             $people[$i]['apps'] = count(array_unique(array_merge($mine, $ours)));
             $people[$i]['memos'] = (isset($memoN['per'][$uid]) ? $memoN['per'][$uid] : 0) + $memoN['broadcast'];
 
@@ -2308,48 +2319,43 @@ try {
          * them: their record is a different shape (a job spec and nothing else),
          * and running the two populations together would imply four columns of
          * zeroes mean the same thing for both. */
-        $gwSpecs = array();
-        if (in_array(GwRepository::COMP_ID, $activeCompIds, true)) {
-            $gwPeople = (new GwRepository(Db::get()))->directory(
-                array(GwRepository::COMP_ID), $search);
-            $gwSpecs = $scope->sees('jobspec')
-                ? $dir->latestJobSpecs(array(GwRepository::COMP_ID), 1)
-                : array();
-        }
+        $gwComps = array_values(array_intersect($dataCompIds, StaffPoolRepository::gwComps()));
+        $gwSpecs = ($scope->sees('jobspec') && !empty($gwComps))
+            ? $dir->latestJobSpecs($gwComps, 1)
+            : array();
         foreach ($gwPeople as $i => $g) {
-            $key = $g['person'] . '|' . (int)$g['comp_id'];
-            $gwPeople[$i]['spec'] = isset($gwSpecs[$key])
-                ? $gwSpecs[$key]
+            $specKey = strtolower($g['person']) . '|' . (int)$g['home_comp_id'];
+            $gwPeople[$i]['spec'] = isset($gwSpecs[$specKey])
+                ? $gwSpecs[$specKey]
                 : DirectoryRepository::NO_JOB_SPEC;
         }
 
         // Sorted here rather than in SQL: three of the four keys are assembled in
         // PHP from separate aggregates, so one comparator covers all of them and
-        // the directory can never sort by a column it did not build.
-        if ($sort !== 'name') {
-            $bySort = function ($a, $b) use ($sort) {
-                // Sorts on what the column now shows: whose CURRENT spec is
-                // waiting on somebody. A tally of historic pending versions
-                // would order the list by a number that is no longer on screen.
-                if ($sort === 'pending') {
-                    $isPending = function ($row) {
-                        return (isset($row['spec']['status']) && $row['spec']['status'] === 'pending') ? 1 : 0;
-                    };
-                    $d = $isPending($b) - $isPending($a);
-                }
-                elseif ($sort === 'demerits') {
-                    // GW carry no merit record at all, so the key may be absent.
-                    $d = (isset($b['demerits']) ? $b['demerits'] : 0)
-                       - (isset($a['demerits']) ? $a['demerits'] : 0);
-                } elseif ($sort === 'memos') {
-                    $d = (isset($b['memos']) ? $b['memos'] : 0)
-                       - (isset($a['memos']) ? $a['memos'] : 0);
-                } else { $d = 0; }
-                return $d !== 0 ? $d : strcasecmp($a['fullname'], $b['fullname']);
-            };
-            usort($people, $bySort);
-            usort($gwPeople, $bySort);
-        }
+        // the directory can never sort by a column it did not build. Run for
+        // 'name' too — the pool arrives in department order.
+        $bySort = function ($a, $b) use ($sort) {
+            // Sorts on what the column now shows: whose CURRENT spec is
+            // waiting on somebody. A tally of historic pending versions
+            // would order the list by a number that is no longer on screen.
+            if ($sort === 'pending') {
+                $isPending = function ($row) {
+                    return (isset($row['spec']['status']) && $row['spec']['status'] === 'pending') ? 1 : 0;
+                };
+                $d = $isPending($b) - $isPending($a);
+            }
+            elseif ($sort === 'demerits') {
+                // GW carry no merit record at all, so the key may be absent.
+                $d = (isset($b['demerits']) ? $b['demerits'] : 0)
+                   - (isset($a['demerits']) ? $a['demerits'] : 0);
+            } elseif ($sort === 'memos') {
+                $d = (isset($b['memos']) ? $b['memos'] : 0)
+                   - (isset($a['memos']) ? $a['memos'] : 0);
+            } else { $d = 0; }
+            return $d !== 0 ? $d : strcasecmp($a['fullname'], $b['fullname']);
+        };
+        usort($people, $bySort);
+        usort($gwPeople, $bySort);
     }
 } catch (Exception $e) {
     error_log('mkCommand staffOverview: ' . $e->getMessage());
@@ -2441,6 +2447,8 @@ foreach ($performance as $p) {
             font-weight:800; font-size:12.5px; display:flex; align-items:center; justify-content:center; }
     .mono.lg { width:56px; height:56px; border-radius:14px; font-size:19px; }
     .name { font-weight:600; }
+    .poolline { display:flex; flex-wrap:wrap; gap:6px 18px; align-items:baseline; }
+    .poolline .big { font-size:20px; font-weight:700; }
 
     /* detail */
     .backbar { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
@@ -3011,6 +3019,23 @@ foreach ($performance as $p) {
         </form>
     </div>
 
+    <?php if ($poolSummary !== null): ?>
+        <!-- The pool's own head count — the figure staffPoolAPI.php and the Staff
+             Headcount report give for these companies. The list below holds
+             exactly these people until a search narrows it. -->
+        <div class="card poolline">
+            <span><span class="big"><?php echo (int)$poolSummary['company_total_staff']; ?></span>
+                staff in the pool</span>
+            <span class="muted">
+                <?php echo (int)$poolSummary['company_total_by_type']['staff']; ?> staff
+                + <?php echo (int)$poolSummary['company_total_by_type']['gw']; ?> General Workers
+                <?php if ((int)$poolSummary['company_excluded_staff'] > 0): ?>
+                    &middot; <?php echo (int)$poolSummary['company_excluded_staff']; ?> taken out of the pool, not listed
+                <?php endif; ?>
+            </span>
+        </div>
+    <?php endif; ?>
+
     <div class="card">
         <table>
             <thead>
@@ -3043,7 +3068,7 @@ foreach ($performance as $p) {
                 </td></tr>
             <?php endif; ?>
             <?php $n = 0; foreach ($people as $p): $n++;
-                $url = selfUrl(array('person' => $p['person'], 'scomp' => (int)$p['comp_id']));
+                $url = selfUrl(array('person' => $p['person'], 'scomp' => (int)$p['home_comp_id']));
             ?>
                 <tr class="rowlink" data-href="<?php echo h($url); ?>">
                     <td class="idx"><?php echo $n; ?></td>
@@ -3052,6 +3077,7 @@ foreach ($performance as $p) {
                             <span class="mono" style="background:<?php echo h(colorFor($p['fullname'])); ?>"><?php echo h(initialsOf($p['fullname'])); ?></span>
                             <span>
                                 <a class="name" href="<?php echo h($url); ?>"><?php echo h(displayName($p['fullname'], $p['person'])); ?></a>
+                                <?php if ($p['mk_command_exempted']): ?><span class="pill off" title="In the staff pool, but exempted from MK Command">MK Command exempted</span><?php endif; ?>
                                 <div class="muted">
                                     <?php echo h($p['person']); ?>
                                     <?php if (!empty($p['position'])): ?> &middot; <?php echo h(titleCase($p['position'])); ?><?php endif; ?>
@@ -3098,7 +3124,7 @@ foreach ($performance as $p) {
                     </td>
                 </tr>
                 <?php foreach ($gwPeople as $g): $n++;
-                    $gurl = selfUrl(array('person' => $g['person'], 'scomp' => (int)$g['comp_id'], 'gw' => 1));
+                    $gurl = selfUrl(array('person' => $g['person'], 'scomp' => (int)$g['home_comp_id'], 'gw' => 1));
                 ?>
                     <tr class="rowlink" data-href="<?php echo h($gurl); ?>">
                         <td class="idx"><?php echo $n; ?></td>
@@ -3108,6 +3134,7 @@ foreach ($performance as $p) {
                                 <span>
                                     <a class="name" href="<?php echo h($gurl); ?>"><?php echo h(displayName($g['fullname'], $g['person'])); ?></a>
                                     <span class="pill gw">GW</span>
+                                    <?php if ($g['mk_command_exempted']): ?><span class="pill off" title="In the staff pool, but exempted from MK Command">MK Command exempted</span><?php endif; ?>
                                     <div class="muted">
                                         <?php echo h($g['person']); ?>
                                         <?php if (!empty($g['district'])): ?> &middot; <?php echo h($g['district']); ?><?php endif; ?>
@@ -3135,8 +3162,14 @@ foreach ($performance as $p) {
     <div class="muted">
         <?php echo count($people); ?> staff shown<?php
             echo $gwPeople ? ', plus ' . count($gwPeople) . ' General Workers' : ''; ?>.
-        <?php if (!in_array(GwRepository::COMP_ID, $activeCompIds, true)): ?>
-            General Workers exist at Globinaco only, so none are listed under this filter.
+        <?php
+        /* GW exist only where the pool says they do. */
+        $gwNames = array();
+        foreach (StaffPoolRepository::gwComps() as $gc) {
+            $gwNames[] = isset($companies[$gc]) ? $companies[$gc] : 'Company ' . $gc;
+        }
+        if (!array_intersect(array_map('homeCompId', $activeCompIds), StaffPoolRepository::gwComps())): ?>
+            General Workers exist at <?php echo h(implode(' and ', $gwNames)); ?> only, so none are listed under this filter.
         <?php endif; ?>
     </div>
 
