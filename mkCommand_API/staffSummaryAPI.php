@@ -54,10 +54,10 @@ header('Content-Type: application/json; charset=UTF-8');
  *   action=summary     one person's summary, as JSON, with the ticks so far.
  *     t=TOKEN            the mail's token — no login, one person, one day
  *     OR a portal session, as that person
- *     OR person= & date= with key=, for an app server
+ *     OR person= (& comid=, date=), key= optional
  *
  *   action=acknowledge write ticks. Records WHICH PLATFORM it came from.
- *     t=TOKEN | a session as that person | person= & date= with key=
+ *     t=TOKEN | a session | person= (& comid=, date=), key= optional
  *     platform=          email | web | mobile   (required — see below)
  *     items[]=           late, leave, comp — the sections being ticked
  *     mode=replace       the default: items[] IS the answer, and anything
@@ -95,19 +95,20 @@ header('Content-Type: application/json; charset=UTF-8');
  *
  *   person=    a login named in the request, resolved against users — the
  *              identity the app already sends to staffDirectory.php. IT IS
- *              NOT PROOF: anybody can type any login. It READS and never
- *              WRITES — apiWriteIdentity() still refuses it — but since
- *              28 Oct 2026 a read includes ack_url, which is a token, which
- *              can write. apiAckUrl() says what that costs and how to undo
- *              it.
+ *              NOT PROOF: anybody can type any login. It READS, and since
+ *              28 Oct 2026 IT WRITES — because the same read already returns
+ *              ack_url, which is this person's token, which acknowledges
+ *              without proving anything either. apiWriteIdentity() has the
+ *              whole of that reasoning and what to undo to reverse it.
  *
  *   key=       SUMMARY_API_KEY. Any person, any day, the whole company, and
  *              it may write — so it belongs in the APP SERVER or the cron and
  *              NEVER in a mobile binary or a page's JavaScript, because
  *              anything shipped to a device can be read off it.
  *
- * ACKNOWLEDGING TAKES THE TOKEN, A MATCHING SESSION, OR THE KEY. Not a bare
- * person=. See apiWriteIdentity(), which is where that line is drawn.
+ * ACKNOWLEDGING TAKES THE TOKEN, A SESSION, THE KEY, OR person= NAMING WHOSE
+ * SUMMARY IT IS. See apiWriteIdentity(), which is where that line is drawn —
+ * and what is left guarding it, which is who can reach this file at all.
  *
  * `platform` IS NOT AUTHORITY either. It is a label the caller supplies and
  * anybody holding a token could supply any of them. It is recorded because it
@@ -356,22 +357,34 @@ function apiCaller(PDO $pdo)
  * Command: refuse unless this caller may WRITE an acknowledgement for this
  * row. Returns the platform-worthy description of how they proved it.
  *
- * THREE WAYS TO PROVE IT, AND A BARE person= IS NOT ONE OF THEM:
+ * FOUR WAYS, AND A BARE person= IS NOW ONE OF THEM:
  *
  *   the token    it names this row and only this row — the mail's route,
  *                and the reason somebody can acknowledge without logging in
  *   the session  UnifiedAuth says who they are, and it is this row's person
  *   the key      the server key, held by the app's backend
+ *   person=      a login named in the request, which found this row
  *
- * An acknowledgement is a record that somebody read something and accepted
- * it. Letting ?person=jeff write one would let anybody acknowledge in
- * anybody's name, which is the one thing it must not be possible to do —
- * even though the same parameter is fine for READING, where naming somebody
- * else only ever narrows what comes back.
+ * person= WAS REFUSED HERE UNTIL 28 OCT 2026, on the reasoning that anybody
+ * can type any login and an acknowledgement is a record of somebody accepting
+ * something. What changed is that the refusal had stopped protecting anything:
+ * since the same date a bare person= read is answered with ack_url, which is
+ * this row's token, and that token acknowledges through staffSummaryAck.php
+ * with no further proof. Refusing the same caller one call later only forced
+ * them through the page — so the gate cost the app its tick box and bought
+ * nothing. The decision is the one in apiAckUrl(): either this endpoint is
+ * reachable only by things that may act for a person, or naming a person is
+ * enough. It is the second.
+ *
+ * SO AN ACKNOWLEDGEMENT IS ONLY AS TRUSTWORTHY AS WHO CAN REACH THIS FILE.
+ * acked_platform and the event log say which route and which address it came
+ * from, which is what there is to go on. To tighten it again: drop 'login'
+ * from the list below AND from apiAckUrl(), and have the app server pass
+ * key=. Both, or the token route puts it straight back.
  */
 function apiWriteIdentity(PDO $pdo, array $row, $via)
 {
-    if ($via === 'token' || $via === 'key') {
+    if ($via === 'token' || $via === 'key' || $via === 'login') {
         return $via;
     }
 
@@ -381,8 +394,8 @@ function apiWriteIdentity(PDO $pdo, array $row, $via)
     }
 
     apiFail('cannot_write',
-            'Acknowledging needs the link from the email, a portal login as '
-          . 'that person, or the server key. Naming a person is not enough.', 403);
+            'Acknowledging needs the link from the email, a portal login, '
+          . 'person= naming who it is for, or the server key.', 403);
 }
 
 /* ---------- finding the row ----------------------------------------------- */
@@ -403,9 +416,10 @@ function apiRowColumns()
  * Query: the one notify row this request is about, with the authority it was
  * found by — array('row', 'via'), or a refusal.
  *
- * A TOKEN NAMES ITS OWN ROW AND CANNOT REACH ANOTHER. person+date needs the
- * server key, because that pair is guessable and a summary is somebody's
- * department laid out by name.
+ * A TOKEN NAMES ITS OWN ROW AND CANNOT REACH ANOTHER. person+date reaches any
+ * row there is, and takes no key — a summary is somebody's department laid out
+ * by name, so what guards it is who can reach this file, not this function.
+ * See apiWriteIdentity() for when that was decided and what to undo.
  */
 function apiFindRow(PDO $pdo)
 {
@@ -430,14 +444,24 @@ function apiFindRow(PDO $pdo)
         return array('row' => $row, 'via' => 'token');
     }
 
-    /* NO TOKEN. Then either the caller is logged in as the person they are
-     * asking about — the web popup and the app — or they hold the server
-     * key. The session is tried FIRST so an ordinary logged-in user never
-     * needs a key, and the key is only ever required of something acting on
-     * somebody else's behalf. */
+    /* NO TOKEN. Then the caller is logged in — as this person or another —
+     * or they named a person, with or without the server key.
+     *
+     * A NAMED person= WINS OVER THE SESSION, as it does in apiCaller(): the
+     * request says who the question is about, and a session cookie that
+     * happens to be in the browser does not get to answer about somebody
+     * else. The session is still what answers when nobody is named, so an
+     * ordinary logged-in user never needs anything else.
+     *
+     * NO KEY IS DEMANDED OF A NAMED PERSON any more. It used to be, to keep
+     * one person's department from being read by name; ack_url has handed a
+     * bare person= this row's token since 28 Oct 2026, which reads and writes
+     * it, so the key was a gate with a door beside it. See
+     * apiWriteIdentity(). The key still names itself when it is sent, because
+     * 'key' in the log means an app server and 'login' means a request. */
     $session = apiSessionCaller();
     $person  = apiIn('person');
-    $via     = 'key';
+    $via     = 'login';
 
     if ($session !== null
         && ($person === null || strcasecmp((string)$person, $session['person']) === 0)) {
@@ -445,11 +469,17 @@ function apiFindRow(PDO $pdo)
         $comp   = (int)$session['comp_id'];
         $via    = 'session';
     } else {
-        apiRequireKey();
         if ($person === null) {
             apiFail('no_person',
-                    'Pass t=TOKEN, log in as that person, or pass person= with '
-                  . 'the server key.', 400);
+                    'Pass t=TOKEN, log in, or pass person= naming whose '
+                  . 'summary this is.', 400);
+        }
+        /* A key that was SENT is still checked, and a wrong one is refused
+         * outright rather than quietly demoted to a login: somebody who meant
+         * to prove something and failed should be told. */
+        if ((string)apiIn('key', '') !== '') {
+            apiRequireKey();
+            $via = 'key';
         }
         /* Both spellings, because the app already sends comid to
          * staffDirectory.php and nobody should have to remember which file
@@ -501,8 +531,11 @@ function apiRequireKey()
  * endpoint.
  *
  * IF THAT EVER MATTERS, the fix is not here: put this file behind the same
- * network restriction the app's other endpoints use, or drop 'login' from
- * the list below and let the app server pass key=. One line either way.
+ * network restriction the app's other endpoints use, or drop 'login' from the
+ * list below AND from apiWriteIdentity() and let the app server pass key=.
+ * Both lists, since 28 Oct 2026 — a token handed out here acknowledges
+ * through staffSummaryAck.php whatever this API refuses, which is exactly why
+ * apiWriteIdentity() stopped refusing it.
  */
 function apiAckUrl(array $row, $via)
 {
@@ -766,7 +799,12 @@ try {
              * the mail, the web, the app — means acknowledged everywhere, so
              * this is false the moment any of the three completes it. */
             'show_popup'  => !$done,
-            'can_write'   => ($caller['via'] === 'session'),
+            /* WHETHER TO DRAW THE TICK BOXES. Every route apiCaller() can
+             * return may now acknowledge — see apiWriteIdentity() — but it is
+             * written as a list and not as true, so that a weaker route added
+             * later does not inherit the right by default. */
+            'can_write'   => in_array($caller['via'],
+                                      array('session', 'login', 'key'), true),
             /* THE PAGE, READY TO FRAME. Empty unless the caller proved who
              * they are — see apiAckUrl(). A popup that would rather show
              * staffSummaryAck.php than draw the table itself puts this
@@ -810,8 +848,10 @@ try {
         }
         $platform = summaryPlatform($platform);
 
-        /* WHO MAY WRITE THIS. A token, a session that IS this person, or the
-         * server key — never a bare person=. See apiWriteIdentity(). */
+        /* WHO MAY WRITE THIS. A token, a session that IS this person, the
+         * server key, or person= naming whose row this is — and $proved is
+         * which of them, which is what the log records. See
+         * apiWriteIdentity(). */
         $proved = apiWriteIdentity($pdo, $row, $found['via']);
 
         $payload = json_decode((string)$row['payload'], true);

@@ -9,8 +9,8 @@ if (!UnifiedAuth::isLoggedIn()) {
 }
 
 $currentUser = UnifiedAuth::getLoggedInUser();
-$person = $currentUser['person'];
-// $person = 'sooCK';   // TODO: restore the line above before deploying
+// $person = $currentUser['person'];
+$person = 'justin';   // TODO: restore the line above before deploying
 
 // Only Heads of Department and Area Managers / Assistant Area Managers can use this page.
 // Add any other person ids that should also be allowed (e.g. the CEO) here.
@@ -1171,6 +1171,6 @@ setInterval(() => {
 })();
 </script>
 
- <!-- <?php include 'staffSummaryWidget.php'; ?> -->
+ <?php include 'staffSummaryWidget.php'; ?>
 </body>
 </html>
