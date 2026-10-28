@@ -144,25 +144,30 @@ header('Content-Type: application/json; charset=UTF-8');
  *        afternoon too, and every one of these thirty-odd people would read
  *        has_data every day.
  *     3. the face log — evaluation.staff_attendance_face_log, the HQ door
- *        terminal's own record, loaded from a spreadsheet one row per person
+ *        terminals' own record, loaded from a spreadsheet one row per person
  *        per day. first_in is the morning and last_out the afternoon.
  *
- *        MATCHED ON users.attendance_face_id, int to int, and on nothing
- *        else, so this arm is staff only: a GW has no users row and so no
- *        face id. It is LAST because it is a machine's record of a door and
- *        not a person's statement about their day — where somebody both
- *        submitted the app and walked past the reader, the submission is the
- *        answer.
+ *        MATCHED THROUGH evaluation.staff_attendance_device, which says who
+ *        a given number on a given terminal is: a reading's person_id only
+ *        means something next to the device its upload header names, and
+ *        HQ1,3 and HQ2 number their people differently. The face id on the
+ *        users row is HQ1,3's numbering, and stands in as a fallback for that
+ *        one terminal; faceLog() has the whole of it. Either way the answer
+ *        is a users.id, so this arm is staff only: a GW has no users row and no
+ *        terminal enrolment. It is LAST because it is a machine's record of a
+ *        door and not a person's statement about their day — where somebody
+ *        both submitted the app and walked past the reader, the submission is
+ *        the answer.
  *
  *        last_out IS TAKEN AS IT STANDS, with no 16:30 window — unlike site
  *        check-in, which has one. A face-log row holds one first_in and one
  *        last_out for a date and there is nothing to mistake for a departure;
- *        and the terminals do not agree about the hour anyway, one of them
- *        writing a midday last_out for everybody it covers.
+ *        and the hour means little anyway, since a file exported at 10am
+ *        records everybody's last_out as a morning one.
  *     4. nothing: no_data.
  *
  *   The order is the point. On 20 Oct 2026 the app had 505 of Globinaco's
- *   people and site check-in had 30, with almost nobody in both; of the 98
+ *   people and site check-in had 30, with almost nobody in both; of the 104
  *   people the face log matched on 23 Oct 2026, 5 had also submitted the app.
  *   These are three populations doing three jobs, so each is a fallback for
  *   the one before it and never a tie-break.
@@ -334,6 +339,25 @@ define('ATT_LATE_FROM', '08:01:00');
  * NOT a lateness boundary. Nothing at 4:30pm is late; see ATT_LATE_FROM.
  */
 define('ATT_PM_FROM', '16:30:00');
+
+/**
+ * WHICH FACE TERMINAL users.attendance_face_id IS THE NUMBERING OF.
+ *
+ * evaluation.staff_attendance_device_type id 1 is HQ1,3, the iVMS-4200 — the
+ * only door there was when attendance_face_id was filled in, and the reason
+ * that column exists. For all 91 people HQ1,3 has in staff_attendance_device,
+ * attendance_face_id and staff_device_id are the same number.
+ *
+ * NOT A SECOND WAY TO MATCH ANYBODY, and not a default. Every terminal has
+ * its own numbering — on HQ2 (id 2, a ZKBio) the same numbers are different
+ * people — so staff_attendance_device is what resolves a reading, and this is
+ * only who HQ1,3's unmapped numbers mean. faceLog() applies it to that
+ * device_id and no other; see the long note there for why.
+ *
+ * It becomes dead weight the day staff_attendance_device has a row for every
+ * number HQ1,3 exports, and can be dropped then.
+ */
+define('ATT_FACE_DEVICE_LEGACY', 1);
 
 /* ---------- the working week ---------------------------------------------- */
 
@@ -714,25 +738,74 @@ class AttendanceRepository
     }
 
     /**
-     * Query: the face terminal's day, keyed by mk_id — the HQ door readings,
+     * Query: the face terminals' day, keyed by mk_id — the HQ door readings,
      * evaluation.staff_attendance_face_log.
      *
      * NOT A CHECK-IN ANYBODY MAKES. The other two sources are somebody
      * deciding to submit; this one is a machine export, loaded from a
-     * spreadsheet (source_file is 'HQ3 report.xls'), one row per person per
-     * day with the first time they were seen and the last. It is the only
-     * source here nobody can forget to use, which is also why it is the only
-     * one that can show a person who never touched the app.
+     * spreadsheet, one row per person per day with the first time they were
+     * seen and the last. It is the only source here nobody can forget to use,
+     * which is also why it is the only one that can show a person who never
+     * touched the app.
      *
-     * MATCHED ON attendance_face_id, AND ONLY ON THAT. users.attendance_face_id
-     * is the number the terminal knows a person by, and person_id here is that
-     * number; the join is int to int, so there is no name to spell wrong and
-     * no collation to trip over. The 104 ids in use are unique across every
-     * users row, deleted ones included, so one id is one person.
+     * THERE IS MORE THAN ONE TERMINAL, AND person_id IS ONLY A NUMBER ON ONE
+     * OF THEM. That is the whole of the difficulty here. Four tables carry an
+     * upload:
      *
-     * STAFF ONLY, which falls out of the join rather than being a rule: the
-     * key is users.id — the pool's mk_id — and a GW has none. A GW has no
-     * face id either, and no row here.
+     *   staff_attendance_device_type  one row per terminal — HQ1,3 (an
+     *                                 iVMS-4200) is id 1, HQ2 (a ZKBio) is 2
+     *   staff_attendance_face         the upload header: one row per terminal
+     *                                 per date, with the file and who loaded it
+     *   staff_attendance_face_log     the readings, face_id -> face.id
+     *   staff_attendance_device       what a terminal's numbers mean:
+     *                                 (device_id, staff_device_id) -> staff_id
+     *
+     * A reading is identified by the PAIR — which terminal, and what number on
+     * it — and the terminal is on the header, not on the reading:
+     * face_log.face_id -> face.id -> face.device_id. person_id by itself is
+     * not a person. Number 1 is Elien on HQ2 and Jackson Chan on HQ1,3; number
+     * 96 is Vincent Ng on HQ2 and Samantha Chu on HQ1,3. The two terminals
+     * were enrolled separately and their numbering has nothing in common.
+     *
+     * users.attendance_face_id IS HQ1,3's NUMBERING AND NOTHING ELSE. For all
+     * 91 people HQ1,3 has in staff_attendance_device the two agree exactly,
+     * which is what makes it usable at all; for every one of the 16 on HQ2
+     * they differ. Joining person_id straight to attendance_face_id — what
+     * this read used to do, when HQ1,3 was the only terminal — therefore gave
+     * HQ2's readings to whichever HQ1,3 person held that number. Over 23-28
+     * Oct 2026 that moved 41 people's first_in and 15 people's last_out onto
+     * the wrong person, and because MIN() takes the earlier of the two, a
+     * 14:18 arrival was reported as 06:45 — a late morning read as on time.
+     *
+     * SO THE MAPPING TABLE DECIDES, AND attendance_face_id IS A FALLBACK FOR
+     * ONE TERMINAL. staff_attendance_device is the authority wherever it has a
+     * row for (device_id, person_id). Where it has none and the reading came
+     * from ATT_FACE_DEVICE_LEGACY, attendance_face_id answers instead: 13
+     * people a day are enrolled on that terminal and carry a face id but have
+     * no mapping row yet, and dropping them would report them absent. The
+     * fallback is scoped to that one device_id on purpose — on any other
+     * terminal the same number is a different person, so there it would not be
+     * a weaker answer but a wrong one. As HR fills the mapping table in, the
+     * fallback quietly stops mattering.
+     *
+     * A READING NEITHER SOURCE CAN NAME IS DROPPED, which is the only honest
+     * thing to do with it: with no staff_id there is nobody to report it
+     * against. 35 to 48 readings a day are interns, trainees and visitors with
+     * no users row at all.
+     *
+     * staff_id IS users.id — the pool's mk_id — so this stays staff only, as
+     * it was before: a GW has neither a users row nor a terminal enrolment. It
+     * also settles who a reading belongs to where somebody has two users rows:
+     * HQ1,3 number 97 is Bayo Kleden, whose face id sits on his old, resigned
+     * row (409) while the mapping table points at the live one (4262). He was
+     * being credited to a row the pool excludes, so the face log showed him
+     * absent every day of the range.
+     *
+     * THE MAPPING IS READ AT status = 1, the enrolment admin's own live flag.
+     * A terminal number is reassigned when somebody leaves, so honouring a
+     * retired mapping would let one number resolve to two people and credit
+     * both. The cost is that retiring a mapping takes that person's past days
+     * with it, which is the lesser of the two.
      *
      * TWO INDEXES OUT OF ONE ROW, because the row holds both ends of the day:
      *   first_in   the morning, judged against the person's own late_from
@@ -742,10 +815,12 @@ class AttendanceRepository
      * NO WINDOW ON last_out, and that is deliberate. It used to be ignored
      * unless it fell at 16:30 or later, on the reasoning that "the last time
      * the terminal saw somebody" is not "the time they went home". The data
-     * says otherwise: these terminals are exported per site, and one of them
-     * writes a midday last_out — on 27 Oct 2026 not one of 65 readings was at
-     * or after 16:30, and on 24 Oct only 5 of 50. Holding them to that line
-     * reported a whole company as never having checked out.
+     * says otherwise: a file is exported whenever somebody gets round to it,
+     * often the same morning, and then last_out is only "last seen by export
+     * time". The HQ1,3 file for 28 Oct 2026 was loaded at 10:49am and not one
+     * of its 44 last_out readings was at or after 16:30; on 24 Oct only 5 of
+     * 23 were. Holding them to that line reported a whole company as never
+     * having checked out.
      *
      * A last_out IS the check-out this row recorded. Reading it as anything
      * else is this file inventing a rule the terminal never applied. The site
@@ -754,32 +829,51 @@ class AttendanceRepository
      * departure; a face-log row has one first_in and one last_out and no such
      * ambiguity.
      *
-     * EITHER END CAN BE BLANK and they are kept apart for that reason — 41 of
-     * the 110 rows that day had no first_in and 47 no last_out. A person
-     * carrying one and not the other is found for that slot and no_data for
-     * the other, which is what the terminal actually knows about them.
+     * EITHER END CAN BE BLANK and they are kept apart for that reason — 47 of
+     * the 156 readings on 23 Oct 2026 had no first_in and 64 no last_out. A
+     * person carrying one and not the other is found for that slot and no_data
+     * for the other, which is what the terminal actually knows about them.
      *
      * MIN(first_in) / MAX(last_out) because the name of each column is the
-     * rule: first in, last out. One row per person per day today, so the
-     * grouping changes nothing — it is there for the day the same date is
-     * uploaded twice, or a second terminal's file lands beside this one.
+     * rule: first in, last out. One reading per person per terminal per day,
+     * so within a terminal the grouping changes nothing — but somebody
+     * enrolled on both doors now falls in one group, and first in and last out
+     * across the two is exactly the answer wanted.
      */
     public function faceLog($fromIso, $toIso)
     {
         /* Cross-schema, like the reads above — both are local under prog4.
          * NULLIF(TRIM(...)) first so a blank cell cannot win a MIN(): '' sorts
-         * before every real time. */
-        $sql = "SELECT u.id AS mk_id,
-                       f.attendance_date AS d,
-                       MIN(NULLIF(TRIM(f.first_in), '')) AS first_in,
-                       MAX(NULLIF(TRIM(f.last_out), '')) AS last_out
-                  FROM staff_portal2.users u
-                  JOIN evaluation.staff_attendance_face_log f
-                    ON f.person_id = u.attendance_face_id
-                 WHERE u.attendance_face_id IS NOT NULL
+         * before every real time.
+         *
+         * The header join is an INNER one: the device is the half of the key
+         * that says what person_id means, so a reading with no header is a
+         * number nobody can resolve rather than a reading to keep. All 731
+         * rows have one today.
+         *
+         * COALESCE appears in the SELECT, the GROUP BY and the WHERE because
+         * MySQL 5.6 has no column alias to reuse — it is one rule written
+         * three times: the mapping table if it knows this number, else the
+         * legacy terminal's face id, else nobody and the row goes. */
+        $sql = "SELECT COALESCE(dev.staff_id, u.id) AS mk_id,
+                       l.attendance_date AS d,
+                       MIN(NULLIF(TRIM(l.first_in), '')) AS first_in,
+                       MAX(NULLIF(TRIM(l.last_out), '')) AS last_out
+                  FROM evaluation.staff_attendance_face_log l
+                  JOIN evaluation.staff_attendance_face h
+                    ON h.id = l.face_id
+                  LEFT JOIN evaluation.staff_attendance_device dev
+                    ON dev.device_id = h.device_id
+                   AND dev.staff_device_id = l.person_id
+                   AND dev.status = 1
+                  LEFT JOIN staff_portal2.users u
+                    ON dev.staff_id IS NULL
+                   AND h.device_id = " . ATT_FACE_DEVICE_LEGACY . "
+                   AND u.attendance_face_id = l.person_id
                    AND u.attendance_face_id > 0
-                   AND f.attendance_date BETWEEN :f AND :t
-                 GROUP BY u.id, f.attendance_date";
+                 WHERE l.attendance_date BETWEEN :f AND :t
+                   AND COALESCE(dev.staff_id, u.id) IS NOT NULL
+                 GROUP BY COALESCE(dev.staff_id, u.id), l.attendance_date";
 
         /* No company predicate and no status predicate on users: the key is
          * users.id, which the pool already handed us for people it decided
@@ -1228,9 +1322,10 @@ function attFind(array $row, $date, array $reads)
         /* No site-check-in arm for a GW on purpose: that table is keyed on
          * users.person, which a GW does not have, so a code landing on
          * somebody's login there would be a different person. No face-log arm
-         * either, for the same reason one step further back — the face log is
-         * keyed on users.attendance_face_id, and a GW has no users row to
-         * carry one. The app is the whole of a GW's answer. */
+         * either, for the same reason one step further back — a face reading
+         * resolves to a users.id, through the terminal's enrolment table, and
+         * a GW has neither a users row nor an enrolment on a door. The app is
+         * the whole of a GW's answer. */
         return null;
     }
 
@@ -1251,9 +1346,9 @@ function attFind(array $row, $date, array $reads)
         return array('time' => $site['by_mk_id'][$mkId][$date],
                      'source' => 'site_check_in');
     }
-    /* By mk_id ONLY. The face log is joined through users.attendance_face_id,
-     * so a hit here is already a hit on a users row — there is no second,
-     * by-name arm to try, and nothing to spell wrong. */
+    /* By mk_id ONLY. faceLog() has already turned (terminal, person_id) into
+     * a users.id, so a hit here is already a hit on a users row — there is no
+     * second, by-name arm to try, and nothing to spell wrong. */
     if ($mkId > 0 && isset($face['by_mk_id'][$mkId][$date])) {
         return array('time' => $face['by_mk_id'][$mkId][$date],
                      'source' => 'face_log');
@@ -1721,15 +1816,19 @@ try {
     respond($payload);
 } catch (Exception $e) {
     error_log('attendanceAPI: ' . $e->getMessage());
-    /* Longest name first: 'staff_attendance' is a prefix of both
-     * 'staff_attendance_logs' and 'staff_attendance_face_log', so testing it
-     * first would blame the app for a site check-in or face log failure. */
+    /* Longest name first, because these are prefixes of each other:
+     * 'staff_attendance' opens three of the others, and 'staff_attendance_face'
+     * opens 'staff_attendance_face_log'. Testing a short one first would blame
+     * the app for a site check-in failure, or the readings for a bad upload
+     * header. */
     foreach (array('staff_attendance_face_log' => 'the face log',
-                   'staff_attendance_logs'    => 'site check-in',
-                   'gw_attendance'            => 'the GW attendance app',
-                   'staff_attendance'         => 'the staff attendance app',
-                   'organization_chart_glob'  => 'the reporting line',
-                   'department_head'          => 'the reporting line') as $table => $what) {
+                   'staff_attendance_device'   => 'the face terminal enrolment',
+                   'staff_attendance_face'     => 'the face log uploads',
+                   'staff_attendance_logs'     => 'site check-in',
+                   'gw_attendance'             => 'the GW attendance app',
+                   'staff_attendance'          => 'the staff attendance app',
+                   'organization_chart_glob'   => 'the reporting line',
+                   'department_head'           => 'the reporting line') as $table => $what) {
         if (strpos($e->getMessage(), $table) !== false) {
             fail('Could not read ' . $what . ' (' . $table . '). Check the '
                . 'error log.', 500);

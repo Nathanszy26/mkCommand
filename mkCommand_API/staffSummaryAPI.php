@@ -35,8 +35,13 @@ header('Content-Type: application/json; charset=UTF-8');
  *   action=mine        THE POPUP'S CALL. Does the person using this web page
  *                      or app owe an acknowledgement today? No token.
  *     date=              which day. Default today.
- *     person= & comid=   only when there is no portal session — the login
- *                        the app already sends to staffDirectory.php.
+ *     person= & comid=   WHO THE QUESTION IS ABOUT — the login the app
+ *                        already sends to staffDirectory.php. IT BEATS THE
+ *                        SESSION: a logged-in browser asking about
+ *                        person=justin is answered about Justin, not about
+ *                        whoever is logged in. Leave it out and the session
+ *                        answers for itself. comid= only matters where the
+ *                        same login exists at more than one company.
  *     -> has_summary     false when they are not on the list at all, or it
  *                        is a Sunday or a holiday. NOT an error.
  *     -> show_popup      the one field to branch on. False the moment ANY
@@ -301,17 +306,33 @@ function apiLoginCaller(PDO $pdo, $person, $ownComp)
  *                 session cookie still gets a link.
  *   person        a login named in the request and nothing else. Reads, and
  *                 is told nothing it could not ask for by name.
+ *
+ * A NAMED person= IS THE SUBJECT, AND IT BEATS THE SESSION. The session is
+ * only consulted when the request names nobody, or names the session's own
+ * user. Otherwise ?person=justin from a logged-in browser answered about
+ * whoever was logged in — the question was about Justin and the answer was
+ * about Nathan, with via:'session' as the only hint that it had happened.
+ * This is the rule apiFindRow() already applies to action=summary, written
+ * once more here so action=mine cannot drift from it.
+ *
+ * WHICH IS NOT A WAY ROUND THE SESSION, because a bare person= never could
+ * write: it is read authority only, and the session still wins for the one
+ * person who holds it, so a popup asking about itself keeps can_write.
  */
 function apiCaller(PDO $pdo)
 {
-    $c = apiSessionCaller();
-    if ($c !== null) { return $c; }
-
     $person = apiIn('person');
+    $comp   = apiIn(array('comid', 'comp_id'));
+
+    $c = apiSessionCaller();
+    if ($c !== null
+        && ($person === null || strcasecmp((string)$person, $c['person']) === 0)) {
+        return $c;
+    }
+
     if ($person === null) {
         return null;
     }
-    $comp = apiIn(array('comid', 'comp_id'));
 
     /* The key is checked only when one was sent, so an ordinary person= call
      * is not turned into a 401 for want of a key it never needed. A WRONG
