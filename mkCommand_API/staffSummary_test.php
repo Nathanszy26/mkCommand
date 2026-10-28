@@ -191,9 +191,16 @@ foreach (array_slice($words, 0, 2) as $w) {
     .pm-attendance {
         display: block;
         margin-top: 4px;
-        font-size: 10px;
         overflow-wrap: anywhere;
-    } 
+    }
+
+    .pm-attendance .st.ok,
+    .pm-attendance .st.bad {
+        background: transparent !important;
+        box-shadow: none !important;
+        border: none !important;
+    }
+    .pmrow { display:block; margin-top:4px; }
     .mlists { margin-top:14px; }
     .mh { font-weight:700; font-size:13px; margin:12px 0 4px; }
     .ctbl { width:100%; border-collapse:collapse; font-size:13px; }
@@ -395,7 +402,23 @@ function stHtml(d) {
   return d.status === 'late' ? '<span class="st bad" title="Late">' + CROSS + ' ' + t + '</span>'
                              : '<span class="st ok" title="On time">' + CHECK + ' ' + t + '</span>';
 }
-// Current month: only today's check-in (blank when there is none). Other months: late-day summary (blank when none).
+// PM check-out is shown only from 4.30pm. Green = checked out at or after 4.30pm; red = checked out earlier or not at all.
+const PM_FROM = '16:30';
+function pmLateHtml(t, person, now) {
+  const hhmm = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  if (hhmm < PM_FROM || now.getDay() === 0) return '';                  // not before 4.30pm, never on Sunday
+  const ds = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+  const md = (monthCache[ym()] || {})[person];
+  if (md && (md.leave || []).some(r => (r.days_in_month || []).some(d => String(d).slice(0, 10) === ds))) return '';   // on leave today
+  const pm = t && t.pm_status === 'has_data' && t.pm_time ? String(t.pm_time).slice(0, 5) : '';
+  if (!pm) return '<span class="pmrow"><span class="st bad" title="No PM check-out recorded">' + CROSS + ' Missed</span></span>';
+  return pm >= PM_FROM
+    ? '<span class="pmrow"><span class="st ok" title="PM check-out at or after 4.30pm">' + CHECK + ' ' + esc(pm) + '</span></span>'
+    : '<span class="pmrow"><span class="st bad" title="PM check-out before 4.30pm">' + CROSS + ' ' + esc(pm) + '</span></span>';
+}
+
+// Current month: today's check-in, plus today's PM check-out from 4.30pm (blank when there is none).
+// Other months: late-day summary (blank when none).
 function lateCell(person) {
   const y = +$('fy').value, m = +$('fm').value, e = (attCache[y + '-' + m] || {})[person];
   if (!e) return '';
@@ -403,91 +426,12 @@ function lateCell(person) {
   if (y === now.getFullYear() && m === now.getMonth() + 1) {
     const t = e.days && e.days[now.getDate()];
     if (isPH(t) && (!t.status || t.status === 'no_data')) return '<span class="st ph" title="' + esc(phName(t)) + '">PH</span>';
-    return t && t.time && t.status !== 'no_data' ? stHtml(t) : '';
+    return (t && t.time && t.status !== 'no_data' ? stHtml(t) : '') + pmLateHtml(t, person, now);
   }
   const s = e.summary || {};
   if (s.late > 0) return '<span class="st bad" title="Late days this month">' + CROSS + ' ' + s.late + '</span>';
   if (s.on_time > 0) return '<span class="st ok" title="No late days this month">' + CHECK + '</span>';
   return '';
-}
-
-function pmAttendanceCell(person) {
-    const y = +$('fy').value;
-    const m = +$('fm').value;
-
-    const e = (attCache[y + '-' + m] || {})[person];
-
-    if (!e) {
-        return '<span class="st none">–</span>';
-    }
-
-    const now = new Date();
-    const isCurrentMonth =
-        y === now.getFullYear() &&
-        m === now.getMonth() + 1;
-
-    // Current month: show only today's PM attendance.
-    // Other months: show the selected month's PM attendance status.
-    if (isCurrentMonth) {
-        const t = e.days && e.days[now.getDate()];
-
-        if (!t) {
-            return '';
-        }
-
-        if (isPH(t)) {
-            return '<span class="st ph">PH</span>';
-        }
-
-        return renderPMTime(t);
-    }
-
-    const days = e.days || {};
-    const pmRecords = Object.values(days).filter(t =>
-        t &&
-        !isPH(t) &&
-        t.pm_status === 'has_data' &&
-        t.pm_time
-    );
-
-    if (pmRecords.length > 0) {
-        return '<span class="st ok">' +
-            CHECK + ' ' + pmRecords.length +
-            '</span>';
-    }
-
-    return '<span class="st none">–</span>';
-}
-
-function renderPMTime(t) {
-    const pmTime = String(t.pm_time || '').trim();
-
-    if (t.pm_status === 'has_data' && pmTime) {
-        return '<span class="st ok" title="PM attendance recorded">' +
-            CHECK + ' ' + esc(pmTime.slice(0, 5)) +
-            '</span>';
-    }
-
-    if (t.pm_status !== 'has_data' || !pmTime) {
-        return '<span class="st bad" title="PM attendance missed">' +
-            CROSS + ' Missed' +
-            '</span>';
-    }
-
-    return '';
-}
-
-function pmAttendanceHtml(x) {
-    if (x.pm_status === 'has_data' && x.pm_time) {
-        return '<div class="pm-attendance">' +
-            '<span class="st ok" title="PM attendance recorded">' +
-            CHECK + ' ' + esc(x.pm_time) +
-            '</span></div>';
-    }
-
-    return '<div class="pm-attendance">' +
-        '<span class="st bad" title="PM attendance missed">' +
-        CROSS + ' Missed</span></div>';
 }
 
 // ---------- calendar modal ----------
@@ -497,8 +441,6 @@ function openCal(person, name) {
   $('mdl').hidden = false;
   renderCal();
 }
-
-
 async function renderCal() {
   const c = cal, tok = ++calTok, key = c.y + '-' + c.m;
   $('mtitle').textContent = c.name;
@@ -590,6 +532,8 @@ async function renderCal() {
 
     if (ph) phCount++;
     const isToday = c.y === now.getFullYear() && c.m === now.getMonth() + 1 && d === now.getDate();
+    // Today's PM check-out is not "missed" until 4.30pm; earlier days are always due.
+    const pmDue = !isToday || (String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0')) >= PM_FROM;
     const ms = !!missed[key2];
     const cls = st === 'late' ? ' bad'
       : st === 'on_time' ? ' ok'
@@ -614,15 +558,6 @@ async function renderCal() {
       x.source || ''
     ].filter(Boolean).join(' · ');
 
-    // grid += '<div class="cday' + cls + (isToday ? ' today' : '') + '" title="' + esc(tip) + '"><span class="tags">' +
-    //   (cw.length ? '<span class="wn">⚠️</span>' : '') + (ph ? '<span class="pht">PH</span>' : '') + '</span><span class="d">' + d + '</span>' +
-    //   '<span class="v' + (ms ? ' ms' : '') + '">' + val + '</span>' + (lv.length
-    //     ? '<span class="lvp">' +
-    //       esc(lv.map(r => r.leave_type || r.leave_type_name || 'On Leave').join(', ')) +
-    //       '</span>'
-    //     : '') + '</div>';
-
-    
     grid += '<div class="cday' + cls + (isToday ? ' today' : '') + '" title="' + esc(tip) + '">' +
         '<span class="tags">' +
         (cw.length ? '<span class="wn">⚠️</span>' : '') +
@@ -631,23 +566,20 @@ async function renderCal() {
 
         '<span class="v' + (ms ? ' ms' : '') + '">' + val + '</span>' +
 
-        // PM attendance: show time if recorded, otherwise missed
-        // PM attendance: show only up to the current day, Monday-Saturday
-        // PM attendance: Monday-Saturday, up to the current day only
-        // PM attendance: show Monday-Saturday, up to today only
-(
-    !ph &&
-    new Date(c.y, c.m - 1, d) <= today &&
-    new Date(c.y, c.m - 1, d).getDay() !== 0
-        ? '<span class="pm-attendance">' +
-            (
-                x.pm_status === 'has_data' && x.pm_time
-                    ? '<span class="st ok">' + CHECK + ' ' + esc(x.pm_time) + '</span>'
-                    : '<span class="st bad">' + CROSS + ' Missed</span>'
-            ) +
-          '</span>'
-        : ''
-) +
+        // PM attendance: Monday-Saturday, up to today only,
+        // excluding public holidays and leave dates
+        (
+            !ph &&
+            lv.length === 0 &&
+            new Date(c.y, c.m - 1, d) <= today &&
+            new Date(c.y, c.m - 1, d).getDay() !== 0
+                ? (
+                    x.pm_status === 'has_data' && x.pm_time
+                        ? '<span class="pm-attendance"><span class="st ok">' + CHECK + ' ' + esc(x.pm_time.slice(0, 5)) + '</span></span>'
+                        : (pmDue ? '<span class="pm-attendance"><span class="st bad">' + CROSS + ' Missed</span></span>' : '')
+                  )
+                : ''
+        ) +
 
         (lv.length
             ? '<span class="lvp">' +
@@ -675,24 +607,30 @@ async function renderCal() {
     '<div style="overflow-x:auto">' +
     '<table class="ctbl">' +
     '<thead><tr>' +
+    (hasMissedCol ? '<th>Missed Dates</th>' : '') +
+    '<th>Action Date</th>' +
     '<th>Type</th>' +
-    '<th>Date</th>' +
     '<th>Reference</th>' +
     '<th>Title</th>' +
     '<th>Classification</th>' +
-    (hasMissedCol ? '<th>Missed Dates</th>' : '') +
     '</tr></thead><tbody>' +
     list.map(r =>
-      '<tr>' +
-      '<td>' + esc(ucw(r.type)) + '</td>' +
-      '<td>' + fd(r.date) + '</td>' +
-      '<td>' + esc(r.reference || r.ref || '') + '</td>' +
-      '<td>' + esc(r.title || r.label || '') + '</td>' +
-      '<td>' + esc(ucw(r.classification || r.merit_demerit || '')) + '</td>' +
-      (hasMissedCol
-        ? '<td>' + (r.missed_dates || []).map(m => esc(dmy(m.date)) + (m.periods ? ' (' + esc(m.periods) + ')' : '')).join('<br>') + '</td>'
-        : '') +
-      '</tr>'
+        '<tr>' +
+        (hasMissedCol
+            ? '<td>' + (r.missed_dates || [])
+                .map(m =>
+                    esc(dmy(m.date)) +
+                    (m.periods ? ' (' + esc(m.periods) + ')' : '')
+                )
+                .join('<br>') +
+              '</td>'
+            : '') +
+        '<td>' + fd(r.date) + '</td>' +
+        '<td>' + esc(ucw(r.type)) + '</td>' +
+        '<td>' + esc(r.reference || r.ref || '') + '</td>' +
+        '<td>' + esc(r.title || r.label || '') + '</td>' +
+        '<td>' + esc(ucw(r.classification || r.merit_demerit || '')) + '</td>' +
+        '</tr>'
     ).join('') +
     '</tbody></table></div>';
 
@@ -730,20 +668,31 @@ async function renderCal() {
     (leaves.length
       ? '<div style="overflow-x:auto"><table class="ctbl">' +
         '<thead><tr>' +
-        '<th>Type</th><th>Date</th><th>Period</th>' +
-        '<th>Status</th><th>Reason</th><th>Receipt Date</th>' +
+        '<th>Date</th>' +
+        '<th>Period</th>' +
+        '<th>Applied Date</th>' +
+        '<th>Type</th>' +
+        '<th>Status</th>' +
+        '<th>Reason</th>' +
+        '<th>Receipt Date</th>' +
         '</tr></thead><tbody>' +
         leaves.map(r =>
           '<tr>' +
-          '<td>' + esc(r.leave_type_name || r.leave_type || '') + '</td>' +
           '<td>' + esc(dmy(r.date_from || '')) +
             (r.date_to && r.date_to !== r.date_from
-              ? ' – ' + esc(dmy(r.date_to)) : '') + '</td>' +
+              ? ' – ' + esc(dmy(r.date_to)) : '') +
+          '</td>' +
           '<td>' + esc(r.from_apm || '') + ' – ' +
             esc(r.to_apm || '') + '</td>' +
+          '<td>' + esc(dmy(r.applied_date || '')) + '</td>' +
+          '<td>' + esc(r.leave_type_name || r.leave_type || '') + '</td>' +
           '<td>' + (r.status_name
-            ? '<span class="lg ' + (String(r.status_name).trim().toLowerCase() === 'approved' ? 'ok' : 'bad') + '">' + esc(r.status_name) + '</span>'
-            : '') + '</td>' +
+            ? '<span class="lg ' +
+              (String(r.status_name).trim().toLowerCase() === 'approved'
+                ? 'ok' : 'bad') +
+              '">' + esc(r.status_name) + '</span>'
+            : '') +
+          '</td>' +
           '<td>' + esc(r.reason || '') + '</td>' +
           '<td>' + esc(dmy(r.receipt_dates || '')) + '</td>' +
           '</tr>'
@@ -943,7 +892,7 @@ function rowsHtml(subs, prefix, level) {
 }
 
 function tableHtml(subs, head) {
-  return '<table class="stbl"><thead><tr><th class="no">No</th><th>Staff name</th><th class="c" title="Check-in today (current month) or late days (other months). Click for the month calendar.">Lateness</th>' +
+  return '<table class="stbl"><thead><tr><th class="no">No</th><th>Staff name</th><th class="c" title="Check-in today, plus PM check-out from 4.30pm (current month) or late days (other months). Click for the month calendar.">Lateness</th>' +
     '<th class="c" title="Click for the month calendar">Excessive Leave</th><th class="c" title="Click for the month calendar">Compliance</th></tr></thead><tbody>' +
     (head ? rowsHtml([head], '', 1) : '') +
     (subs.length ? rowsHtml(subs, '', 1) : '<tr><td colspan="5" class="state">No subordinates.</td></tr>') + '</tbody></table>';
@@ -1192,6 +1141,11 @@ async function setMode(m) {
 }
 $('tiles').addEventListener('click', e => { const t = e.target.closest('.tile'); if (t) setMode(t.dataset.act); });
 
+setInterval(() => {
+  const n = new Date();
+  if (data && +$('fy').value === n.getFullYear() && +$('fm').value === n.getMonth() + 1) refreshCells();
+}, 60000);
+
 (function initPeriod() {
   const now = new Date(), y = now.getFullYear();
   $('fm').innerHTML = MONTHS.map((n, i) => '<option value="' + (i + 1) + '"' + (i === now.getMonth() ? ' selected' : '') + '>' + n + '</option>').join('');
@@ -1216,5 +1170,7 @@ $('tiles').addEventListener('click', e => { const t = e.target.closest('.tile');
   }
 })();
 </script>
+
+ <!-- <?php include 'staffSummaryWidget.php'; ?> -->
 </body>
 </html>
