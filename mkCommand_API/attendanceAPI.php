@@ -59,13 +59,17 @@ header('Content-Type: application/json; charset=UTF-8');
  *     am_person,  am_unit               nearest department head above them,
  *                                       and the nearest sub-department head.
  *                                       Themselves, when they are one.
- *     daily:  time, status, source                 the 8:00am slot
+ *     schedule{}                        the week they are SUPPOSED to work —
+ *                                       see SCHEDULES below
+ *     daily:  time, status, source, late_from      the 8:00am slot
  *             pm_time, pm_status, pm_source        the 4:30pm slot
  *             is_public_holiday
+ *             is_off_day, shift_start, shift_end
  *     month:  summary{on_time,late,no_data}        the 8:00am slot
  *             pm_summary{has_data,no_data}         the 4:30pm slot
- *             days{ "1": {time,status,source,
- *                         pm_time,pm_status,pm_source,is_public_holiday} }
+ *             days{ "1": {time,status,source,late_from,
+ *                         pm_time,pm_status,pm_source,is_public_holiday,
+ *                         is_off_day,shift_start,shift_end} }
  *
  *   TWO SLOTS, ONE CELL. The unprefixed fields are the morning and keep the
  *   names and the meanings they have always had, so a caller written before
@@ -83,15 +87,24 @@ header('Content-Type: application/json; charset=UTF-8');
  * THE RULES — two slots, 8:00am and 4:30pm, and nothing else is judged.
  *
  *   8:00am — PUNCTUALITY. Were they on time?
- *     status   on_time   checked in before 08:01:00
- *              late      08:01:00 or after
- *              no_data   no source has them that day
- *     source   attendance_app | site_check_in | face_log | "" when no_data
+ *     status     on_time   checked in before late_from
+ *                late      late_from or after
+ *                no_data   no source has them that day
+ *     source     attendance_app | site_check_in | face_log | "" when no_data
+ *     late_from  the line THIS person was judged against THIS day
  *
- *   THE WHOLE 8:00 MINUTE IS ON TIME. 08:00:04 has not reached 8:01, so it is
- *   not late; 08:01:00 is the first late second. rules.late_from publishes
- *   that one number, so a caller applying it with < gets exactly what this
- *   file got.
+ *   LATE IS MEASURED FROM THEIR OWN SHIFT, NOT FROM 8:01. It is that day's
+ *   shift_start plus one minute, so somebody on the 7:00am schedule is late
+ *   from 07:01:00 while most of the company is late from 08:01:00. The slot
+ *   is still called 8AM — that is the app's period code, not a time — and
+ *   SCHEDULES below says where each person's start comes from.
+ *
+ *   THE WHOLE STARTING MINUTE IS ON TIME. On an 8:00am shift 08:00:04 has
+ *   not reached 8:01, so it is not late, and 08:01:00 is the first late
+ *   second; on a 7:00am shift the same rule lands on 07:01:00. Every cell
+ *   publishes its own late_from, so a caller applying it with < gets exactly
+ *   what this file got. rules.periods.am.late_from is only the fallback for
+ *   a day with no shift to read.
  *
  *   4:30pm — PRESENCE. Did they check in at all?
  *     pm_status   has_data   a source has them in that slot that day
@@ -141,10 +154,11 @@ header('Content-Type: application/json; charset=UTF-8');
  *        submitted the app and walked past the reader, the submission is the
  *        answer.
  *
- *        last_out GETS THE SAME 16:30 WINDOW as site check-in, and needs it
- *        more: last_out is the last time the terminal saw somebody, not the
- *        time they went home. On 23 Oct 2026, 17 of the 63 were before 16:30
- *        and the earliest was 07:00:49.
+ *        last_out IS TAKEN AS IT STANDS, with no 16:30 window — unlike site
+ *        check-in, which has one. A face-log row holds one first_in and one
+ *        last_out for a date and there is nothing to mistake for a departure;
+ *        and the terminals do not agree about the hour anyway, one of them
+ *        writing a midday last_out for everybody it covers.
  *     4. nothing: no_data.
  *
  *   The order is the point. On 20 Oct 2026 the app had 505 of Globinaco's
@@ -159,6 +173,66 @@ header('Content-Type: application/json; charset=UTF-8');
  *   earlier. Anything else would let a late second entry erase an on-time
  *   first one. For 4:30pm, where nothing is scored, it simply means the time
  *   shown is the check-in nearest the slot.
+ *
+ * SCHEDULES — WHICH DAYS THEY OWE, AND UNTIL WHEN.
+ *   evaluation.staff_schedule_assign names a schedule_type for a person;
+ *   evaluation.schedule_type holds the five of them, as a Mon-Fri column and
+ *   a Saturday column of human strings — "8:00am - 4:30pm", or "Off".
+ *
+ *   ON THE PERSON, once:
+ *     schedule{ schedule_type_id, schedule_source,
+ *               mon_fri{is_off_day,start,end,label},
+ *               saturday{…} }
+ *
+ *   ON EACH DAY, from whichever of those two patterns the date falls under:
+ *     is_off_day   '1' nobody expected them in — Sunday, or a Saturday their
+ *                      schedule has off
+ *                  '0' they were due in, and the two below say when
+ *     shift_start  'HH:MM:SS', or '' on an off day
+ *     shift_end    'HH:MM:SS', or '' on an off day
+ *
+ *   A STRING, AND '0' IS TRUTHY IN JAVASCRIPT — test is_off_day as === '1',
+ *   exactly like is_public_holiday.
+ *
+ *   schedule_source IS THE FIELD TO READ BEFORE TRUSTING THE HOURS:
+ *     assigned   staff_schedule_assign names this person's schedule
+ *     default    it does not, so ATT_SCHEDULE_DEFAULT_STAFF (2) or
+ *                ATT_SCHEDULE_DEFAULT_GW (3) applied — a guess about them,
+ *                and it says so rather than reading like a fact. At comp 1
+ *                on 27 Oct 2026 that was 36 of 347 staff and 6 of 353 GW.
+ *
+ *   WHO IS LOOKED UP HOW. A staff member by users.id against
+ *   staff_schedule_assign.staff_id, which resolves all 311 staff rows on its
+ *   own; a GW by monthly_assign_gw_code, which is the same string the pool
+ *   prints as their `person`. gw_staff_id is not used for it — three rows
+ *   carry 0 there, so it is not an identity.
+ *
+ *   THE START SETS THE MORNING'S LINE. shift_start plus one minute is that
+ *   cell's late_from, so the schedule decides punctuality: a 7:00am person
+ *   is late from 07:01:00, an 8:00am person from 08:01:00. Change a
+ *   schedule_type row and the verdicts move with it, which is the point of
+ *   reading the table rather than hard-coding a time.
+ *
+ *   IT EXCUSES NOTHING, like the holiday flag beside it. A no_data on
+ *   somebody's day off is still a no_data, and 4:30pm on a 12:30pm Saturday
+ *   is still no_data: this endpoint judges the two slots, and whether a day
+ *   off excuses an absence is a policy question the CALLER owns. Reports are
+ *   expected to drop or grey the off days; counts.off_day says how many
+ *   person-days that is, and those days are still inside the six status
+ *   figures beside it.
+ *
+ *   AN OFF DAY HAS NO START, so its late_from falls back to ATT_LATE_FROM
+ *   rather than being blank. Nothing is scored on those days anyway; the
+ *   fallback is there so the field always holds a comparable time.
+ *
+ *   SUNDAY IS OFF FOR EVERYBODY, because schedule_type has no Sunday column.
+ *   That is the shape of the table, not a rule invented here.
+ *
+ *   shift_end DOES NOT SCOPE THE 4:30PM READ. Site check-in is still windowed
+ *   from ATT_PM_FROM for everyone — see ATT_PM_FROM — so somebody whose
+ *   Saturday ends at 12:30pm has their afternoon looked for from 16:30
+ *   regardless. Marking the schedule and reading by it are two changes, and
+ *   this is the first.
  *
  * PUBLIC HOLIDAYS — MARKED, NEVER SCORED.
  *   is_public_holiday  '1'  that calendar day is a public holiday
@@ -217,14 +291,30 @@ define('ATT_PERIOD_AM', '8AM');
 define('ATT_PERIOD_PM', '4.30PM');
 
 /**
- * THE MOMENT THE MORNING BECOMES LATE. Anything before this is on time, so
- * the whole of the 8:00 minute counts — 08:00:04 has not reached 8:01 and is
- * on time, 08:01:00 is the first late second.
+ * HOW LONG THE STARTING MINUTE LASTS. Anything before start + this is on
+ * time, so the whole of the starting minute counts: on an 8:00am shift
+ * 08:00:04 has not reached 8:01 and is on time, and 08:01:00 is the first
+ * late second. On a 7:00am shift the same rule puts it at 07:01:00.
  *
  * Expressed as the start of lateness rather than as a last-on-time value
  * because that is the rule in one unambiguous number: there is no "is the
  * boundary inclusive" question to get wrong. Compared as a string, which is
  * safe because both sides are zero-padded HH:MM:SS.
+ */
+define('ATT_LATE_GRACE_MINUTES', 1);
+
+/**
+ * THE MOMENT THE MORNING BECOMES LATE WHEN THERE IS NO SHIFT TO ASK.
+ *
+ * NOT THE COMPANY-WIDE LATENESS LINE ANY MORE — the line is each person's
+ * own shift_start plus ATT_LATE_GRACE_MINUTES, worked out per person per day
+ * by attLateFrom(). This is only the fallback for a day with no start time
+ * to add to: an off day, or a schedule_type cell nobody can parse. It is
+ * 08:01:00 because that is what a type-2 8:00am shift comes to, which is
+ * what most of the company is on.
+ *
+ * Every cell publishes the line it was actually judged against, as
+ * late_from, so no caller has to work out which of the two applied.
  *
  * THERE IS DELIBERATELY NO SUCH NUMBER FOR THE AFTERNOON. 4:30pm is a
  * presence check and not a punctuality one — has_data or no_data — which is
@@ -244,6 +334,30 @@ define('ATT_LATE_FROM', '08:01:00');
  * NOT a lateness boundary. Nothing at 4:30pm is late; see ATT_LATE_FROM.
  */
 define('ATT_PM_FROM', '16:30:00');
+
+/* ---------- the working week ---------------------------------------------- */
+
+/**
+ * WHICH SCHEDULE SOMEBODY IS ON WHEN NOBODY HAS SAID.
+ *
+ * evaluation.staff_schedule_assign names a schedule for most of the company
+ * but not all of it: at comp 1 on 27 Oct 2026 it covers 311 of 347 staff and
+ * 347 of 353 GW. The rest fall back to these, rather than to no schedule at
+ * all — an unassigned person still works a week, and guessing nothing would
+ * mean every Saturday reads as a working day for them.
+ *
+ * Staff default to 2 (Sat half day) and a GW to 3 (Sat full day), which is
+ * what each group is mostly assigned to where it IS assigned.
+ */
+define('ATT_SCHEDULE_DEFAULT_STAFF', 2);
+define('ATT_SCHEDULE_DEFAULT_GW',    3);
+
+/**
+ * THE DAY NOBODY HAS A SCHEDULE FOR. evaluation.schedule_type has a Mon-Fri
+ * column and a Saturday column and no third one, so Sunday is off for
+ * everybody by the shape of the table — not by a rule written here.
+ */
+define('ATT_SCHEDULE_SUNDAY_OFF', true);
 
 /* ---------- the calendar -------------------------------------------------- */
 
@@ -332,6 +446,74 @@ function attIsoDate($value)
     $iso = str_replace('/', '-', substr($value, 0, 10));
     $d   = DateTime::createFromFormat('Y-m-d', $iso);
     return ($d && $d->format('Y-m-d') === $iso) ? $iso : null;
+}
+
+/**
+ * Query: one cell of evaluation.schedule_type read as a shift —
+ * array('is_off_day', 'start', 'end', 'label').
+ *
+ * The column holds a human string: "8:00am - 5:30pm", or "Off". That is the
+ * stored form, so it is parsed here ONCE rather than compared as text
+ * anywhere else, and the raw string is handed back as `label` so a caller can
+ * print what the table actually says.
+ *
+ *   is_off_day  '1' no working hours that day — the cell reads Off, or is
+ *                   blank, or is something this parser does not recognise
+ *               '0' they are due in, and start/end say when
+ *   start, end  'HH:MM:SS', or '' on an off day
+ *
+ * A STRING, LIKE is_public_holiday, AND FOR THE SAME REASON: '0' is truthy
+ * in JavaScript. Test it as === '1'.
+ *
+ * AN UNREADABLE CELL READS AS OFF, which is the quiet direction: it leaves a
+ * day unjudged rather than inventing hours nobody works. label still carries
+ * the original text, so a cell the parser cannot read is visible rather than
+ * silently normal.
+ */
+function attShift($value)
+{
+    $label = trim((string)$value);
+    $off   = array('is_off_day' => '1', 'start' => '', 'end' => '', 'label' => $label);
+
+    if ($label === '' || strcasecmp($label, 'Off') === 0) {
+        return $off;
+    }
+
+    /* "8:00am - 12:30pm", and tolerant about the separator and the spacing
+     * around it, because this column is typed by hand. */
+    if (!preg_match('/^\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*([ap])\.?m\.?\s*[-–—to]+\s*'
+                  . '(\d{1,2})\s*[:.]\s*(\d{2})\s*([ap])\.?m\.?\s*$/i', $label, $m)) {
+        return $off;
+    }
+
+    $start = attClock24($m[1], $m[2], $m[3]);
+    $end   = attClock24($m[4], $m[5], $m[6]);
+    if ($start === null || $end === null) {
+        return $off;
+    }
+
+    return array('is_off_day' => '0', 'start' => $start, 'end' => $end,
+                 'label' => $label);
+}
+
+/**
+ * Query: a 12-hour clock as 'HH:MM:SS', or null when the hour or minute is
+ * not one. 12am is 00:xx and 12pm is 12:xx — the two the arithmetic would
+ * otherwise get backwards.
+ */
+function attClock24($hour, $minute, $meridiem)
+{
+    $h = (int)$hour;
+    $i = (int)$minute;
+    if ($h < 1 || $h > 12 || $i < 0 || $i > 59) {
+        return null;
+    }
+    if (strtolower($meridiem) === 'p') {
+        $h = ($h === 12) ? 12 : $h + 12;
+    } else {
+        $h = ($h === 12) ? 0 : $h;
+    }
+    return sprintf('%02d:%02d:00', $h, $i);
 }
 
 /**
@@ -553,15 +735,24 @@ class AttendanceRepository
      * face id either, and no row here.
      *
      * TWO INDEXES OUT OF ONE ROW, because the row holds both ends of the day:
-     *   first_in   the morning, judged against ATT_LATE_FROM like any arrival
-     *   last_out   the afternoon, and ONLY when it is at $outSince or later
+     *   first_in   the morning, judged against the person's own late_from
+     *              like any other arrival
+     *   last_out   the afternoon, WHATEVER THE HOUR
      *
-     * $outSince IS NOT OPTIONAL POLISH. last_out is "the last time this person
-     * was seen", not "the time they went home": 17 of the 63 on 23 Oct 2026
-     * are before 16:30 and the earliest is 07:00:49, somebody who was gone by
-     * breakfast. Counted unfiltered, every one of them would read has_data for
-     * the 4:30pm slot. The window is the same ATT_PM_FROM that scopes the site
-     * check-in read, so both fallbacks answer the afternoon on the same terms.
+     * NO WINDOW ON last_out, and that is deliberate. It used to be ignored
+     * unless it fell at 16:30 or later, on the reasoning that "the last time
+     * the terminal saw somebody" is not "the time they went home". The data
+     * says otherwise: these terminals are exported per site, and one of them
+     * writes a midday last_out — on 27 Oct 2026 not one of 65 readings was at
+     * or after 16:30, and on 24 Oct only 5 of 50. Holding them to that line
+     * reported a whole company as never having checked out.
+     *
+     * A last_out IS the check-out this row recorded. Reading it as anything
+     * else is this file inventing a rule the terminal never applied. The site
+     * check-in read still has its window, because that table is a stream of
+     * check-ins where a morning arrival really would be mistaken for a
+     * departure; a face-log row has one first_in and one last_out and no such
+     * ambiguity.
      *
      * EITHER END CAN BE BLANK and they are kept apart for that reason — 41 of
      * the 110 rows that day had no first_in and 47 no last_out. A person
@@ -573,7 +764,7 @@ class AttendanceRepository
      * grouping changes nothing — it is there for the day the same date is
      * uploaded twice, or a second terminal's file lands beside this one.
      */
-    public function faceLog($fromIso, $toIso, $outSince)
+    public function faceLog($fromIso, $toIso)
     {
         /* Cross-schema, like the reads above — both are local under prog4.
          * NULLIF(TRIM(...)) first so a blank cell cannot win a MIN(): '' sorts
@@ -612,14 +803,87 @@ class AttendanceRepository
             }
 
             $out = self::clockTime($r['last_out']);
-            /* The window, and the whole reason last_out is not simply
-             * trusted — see $outSince above. */
-            if ($out !== null && $out >= $outSince) {
+            if ($out !== null) {
                 self::keepLatest($lastOut, $mkId, $date, $out);
             }
         }
         return array('first_in' => array('by_mk_id' => $firstIn),
                      'last_out' => array('by_mk_id' => $lastOut));
+    }
+
+    /**
+     * Query: the five schedules, as attShift() has already read them —
+     * schedule_type_id => array('mon_fri' => shift, 'saturday' => shift).
+     *
+     * Five rows, read once for the whole answer. The column names are
+     * hyphenated and so are back-quoted: `Mon-Fri` without them is Mon MINUS
+     * Fri, which MySQL would try to evaluate.
+     */
+    public function scheduleTypes()
+    {
+        $sql = "SELECT t.schedule_type_id AS id,
+                       t.`Mon-Fri`  AS mon_fri,
+                       t.`Saturday` AS saturday
+                  FROM evaluation.schedule_type t";
+
+        $types = array();
+        foreach ($this->db->query($sql)->fetchAll() as $r) {
+            $id = (int)$r['id'];
+            if ($id <= 0) {
+                continue;
+            }
+            $types[$id] = array('mon_fri'  => attShift($r['mon_fri']),
+                                'saturday' => attShift($r['saturday']));
+        }
+        return $types;
+    }
+
+    /**
+     * Query: who is on which schedule — array('by_mk_id' => …, 'by_person' =>
+     * …), each mapping to a schedule_type_id.
+     *
+     * TWO INDEXES BECAUSE THERE ARE TWO KINDS OF PERSON, and the table says
+     * so itself with is_gw. A staff row carries staff_id (users.id) and a GW
+     * row carries monthly_assign_gw_code — which is exactly the key the pool
+     * prints as `person` for a GW, so the codes go in by_person and the staff
+     * ids in by_mk_id, and neither can answer for the other.
+     *
+     * gw_staff_id is deliberately NOT used: three rows carry 0 for it, so it
+     * is not an identity, while the code is unique across all 347 GW rows.
+     * staff_id is used rather than the staff row's own `person` because it
+     * resolves all 311 of them on its own and cannot be spelled two ways.
+     *
+     * No comp predicate. The table is comp 1 only today, and keying on it
+     * would lose Trillium, whose pool rows read comp 16 while their users row
+     * — and so any schedule assigned to them — is stored under comp 1.
+     */
+    public function scheduleAssign()
+    {
+        $sql = "SELECT a.is_gw, a.staff_id, a.monthly_assign_gw_code AS code,
+                       a.schedule_type_id AS type_id
+                  FROM evaluation.staff_schedule_assign a
+                 WHERE a.schedule_type_id IS NOT NULL";
+
+        $byMkId  = array();
+        $byPerson = array();
+        foreach ($this->db->query($sql)->fetchAll() as $r) {
+            $type = (int)$r['type_id'];
+            if ($type <= 0) {
+                continue;
+            }
+            if ((int)$r['is_gw'] === 1) {
+                $code = strtolower(trim((string)$r['code']));
+                if ($code !== '') {
+                    $byPerson[$code] = $type;
+                }
+                continue;
+            }
+            $mkId = (int)$r['staff_id'];
+            if ($mkId > 0) {
+                $byMkId[$mkId] = $type;
+            }
+        }
+        return array('by_mk_id' => $byMkId, 'by_person' => $byPerson);
     }
 
     /** Command: keep the earliest time seen for this key and day. The GROUP BY
@@ -650,7 +914,7 @@ class AttendanceRepository
     }
 
     /** Query: a stored time as HH:MM:SS, or null. Padded so that comparing it
-     *  against ATT_LATE_FROM as a string is the same as comparing clocks. */
+     *  against a late_from as a string is the same as comparing clocks. */
     private static function clockTime($value)
     {
         $value = trim((string)$value);
@@ -836,10 +1100,20 @@ function attHolidayFlag(array $holidays, $date)
  * NOT move either status: see PUBLIC HOLIDAYS at the top of this file. It is
  * attached here, in the one place every cell of both modes passes through, so
  * no caller has to remember which mode carries it.
+ *
+ * $schedule is this person's, already resolved by attSchedule() — once per
+ * person, not once per day, because a schedule is a fact about them and only
+ * WHICH of its two patterns applies changes with the date.
  */
-function attCell(array $row, $date, array $am, array $pm, array $holidays)
+function attCell(array $row, $date, array $am, array $pm, array $holidays,
+                 array $schedule)
 {
-    $cell = attArrival($row, $date, $am);
+    /* THE SHIFT FIRST, because the morning is judged against it: lateness is
+     * this person's own start plus the grace, not one company-wide time.
+     * is_off_day still scores nothing — see SCHEDULES at the top. */
+    $shift = attShiftOn($schedule, $date);
+
+    $cell = attArrival($row, $date, $am, attLateFrom($shift));
 
     $afternoon         = attPresence($row, $date, $pm);
     $cell['pm_time']   = $afternoon['time'];
@@ -847,7 +1121,81 @@ function attCell(array $row, $date, array $am, array $pm, array $holidays)
     $cell['pm_source'] = $afternoon['source'];
 
     $cell['is_public_holiday'] = attHolidayFlag($holidays, $date);
+
+    $cell['is_off_day']  = $shift['is_off_day'];
+    $cell['shift_start'] = $shift['start'];
+    $cell['shift_end']   = $shift['end'];
     return $cell;
+}
+
+/**
+ * Query: which schedule this person is on —
+ * array('schedule_type_id', 'schedule_source', 'mon_fri', 'saturday').
+ *
+ * schedule_source says where the id came from and is the field to read before
+ * trusting the hours:
+ *   assigned  staff_schedule_assign names it for this person
+ *   default   nobody has assigned them one, so ATT_SCHEDULE_DEFAULT_STAFF or
+ *             ATT_SCHEDULE_DEFAULT_GW applied — a guess, and it says so
+ *
+ * A GW is looked up by code and a staff member by users.id, which is what
+ * each half of the assignment table is keyed on; see scheduleAssign().
+ */
+function attSchedule(array $row, array $assign, array $types)
+{
+    $isGw = ($row['person_type'] === 'gw');
+
+    $typeId = 0;
+    if ($isGw) {
+        $person = strtolower(trim((string)$row['person']));
+        if ($person !== '' && isset($assign['by_person'][$person])) {
+            $typeId = (int)$assign['by_person'][$person];
+        }
+    } else {
+        $mkId = isset($row['mk_id']) ? (int)$row['mk_id'] : 0;
+        if ($mkId > 0 && isset($assign['by_mk_id'][$mkId])) {
+            $typeId = (int)$assign['by_mk_id'][$mkId];
+        }
+    }
+
+    $source = 'assigned';
+    if ($typeId <= 0 || !isset($types[$typeId])) {
+        /* Also the path for an assignment pointing at a schedule_type row
+         * that is not there — an id nobody can read is no better than none. */
+        $typeId = $isGw ? ATT_SCHEDULE_DEFAULT_GW : ATT_SCHEDULE_DEFAULT_STAFF;
+        $source = 'default';
+    }
+
+    /* Even the default can be missing, if schedule_type itself could not be
+     * read. Every day then reads as an off day, which attShift() already
+     * calls the quiet direction. */
+    $blank = attShift('');
+    $type  = isset($types[$typeId]) ? $types[$typeId]
+                                    : array('mon_fri' => $blank, 'saturday' => $blank);
+
+    return array(
+        'schedule_type_id' => $typeId,
+        'schedule_source'  => $source,
+        'mon_fri'          => $type['mon_fri'],
+        'saturday'         => $type['saturday'],
+    );
+}
+
+/**
+ * Query: the shift a schedule puts on ONE date — the array attShift() makes.
+ *
+ * Sunday is off for everybody: schedule_type has a Mon-Fri column and a
+ * Saturday column and no third one, so there are no Sunday hours to read.
+ * See ATT_SCHEDULE_SUNDAY_OFF.
+ */
+function attShiftOn(array $schedule, $date)
+{
+    $day = (int)date('N', strtotime($date));   /* 1 Mon … 6 Sat, 7 Sun */
+
+    if ($day === 7 && ATT_SCHEDULE_SUNDAY_OFF) {
+        return attShift('');
+    }
+    return ($day === 6) ? $schedule['saturday'] : $schedule['mon_fri'];
 }
 
 /**
@@ -913,11 +1261,48 @@ function attFind(array $row, $date, array $reads)
     return null;
 }
 
-/** Query: the MORNING cell — a punctuality judgement, on_time or late. */
-function attArrival(array $row, $date, array $reads)
+/**
+ * Query: the MORNING cell — a punctuality judgement, on_time or late,
+ * against $lateFrom, which is THIS person's line on THIS day. attLateFrom()
+ * works it out; see there for where it comes from.
+ */
+function attArrival(array $row, $date, array $reads, $lateFrom)
 {
     $hit = attFind($row, $date, $reads);
-    return ($hit === null) ? attJudge(null, '') : attJudge($hit['time'], $hit['source']);
+    return ($hit === null)
+        ? attJudge(null, '', $lateFrom)
+        : attJudge($hit['time'], $hit['source'], $lateFrom);
+}
+
+/**
+ * Query: the moment THIS shift becomes late — 'HH:MM:SS'.
+ *
+ * The shift's own start plus ATT_LATE_GRACE_MINUTES, so a 7:00am shift is
+ * late from 07:01:00 and an 8:00am one from 08:01:00. The grace is the whole
+ * starting minute, the rule the 8:00am line has always applied; what has
+ * changed is that the start is read from the person's schedule rather than
+ * assumed.
+ *
+ * ATT_LATE_FROM WHEN THERE IS NO START TO ADD TO — an off day, or a
+ * schedule_type cell attShift() could not read. Those days score nothing
+ * anyway, by policy; the fallback is there so the field is never empty and a
+ * caller comparing against it never has to handle ''.
+ */
+function attLateFrom(array $shift)
+{
+    if ($shift['is_off_day'] === '1' || $shift['start'] === '') {
+        return ATT_LATE_FROM;
+    }
+
+    /* Modulo a day: a start late enough that the grace would roll past
+     * midnight wraps rather than reading 24:00:xx. No schedule does that
+     * today — every start is a morning — but a time is only ever HH:MM:SS. */
+    $parts   = explode(':', $shift['start']);
+    $minutes = ((int)$parts[0] * 60) + (int)$parts[1] + ATT_LATE_GRACE_MINUTES;
+    $minutes = (($minutes % 1440) + 1440) % 1440;
+
+    return sprintf('%02d:%02d:%02d', intdiv($minutes, 60), $minutes % 60,
+                   isset($parts[2]) ? (int)$parts[2] : 0);
 }
 
 /**
@@ -939,16 +1324,25 @@ function attPresence(array $row, $date, array $reads)
     return array('time' => $hit['time'], 'status' => 'has_data', 'source' => $hit['source']);
 }
 
-/** Query: a morning time and source as the answer prints them. */
-function attJudge($time, $source)
+/**
+ * Query: a morning time and source as the answer prints them, judged against
+ * $lateFrom — the line attLateFrom() made for this person on this day.
+ *
+ * The line is published beside the verdict, on every cell including a
+ * no_data one, so a caller can see what was applied and reproduce it with <
+ * exactly as this file did.
+ */
+function attJudge($time, $source, $lateFrom)
 {
     if ($time === null) {
-        return array('time' => '', 'status' => 'no_data', 'source' => '');
+        return array('time' => '', 'status' => 'no_data', 'source' => '',
+                     'late_from' => $lateFrom);
     }
     return array(
-        'time'   => $time,
-        'status' => ($time < ATT_LATE_FROM) ? 'on_time' : 'late',
-        'source' => $source,
+        'time'      => $time,
+        'status'    => ($time < $lateFrom) ? 'on_time' : 'late',
+        'source'    => $source,
+        'late_from' => $lateFrom,
     );
 }
 
@@ -1069,16 +1463,17 @@ try {
      * person. The slot is a parameter to the two app reads, so the afternoon
      * is read exactly as the morning is and the two cannot drift.
      *
-     * THE OTHER TWO SOURCES HAVE NO SLOT OF THEIR OWN, so the slot is a time
-     * window instead, and ATT_PM_FROM is that window in both: site check-ins
-     * from 16:30 onwards, and a last_out from 16:30 onwards. The face log is
-     * ONE query for both slots, because one row carries both ends of a
-     * person's day — first_in for the morning, last_out for the afternoon. */
+     * THE OTHER TWO SOURCES HAVE NO SLOT OF THEIR OWN, and they answer that
+     * differently. Site check-in is a stream of check-ins with nothing to say
+     * which is a departure, so ATT_PM_FROM scopes it to 16:30 onwards. The
+     * face log needs no such window: one row carries BOTH ends of a person's
+     * day — first_in for the morning, last_out for the afternoon — so it is
+     * ONE query for both slots and the last_out stands as recorded. */
     $att      = new AttendanceRepository($pdo);
     $appFrom  = str_replace('-', '/', $fromIso);
     $appTo    = str_replace('-', '/', $toIso);
 
-    $face = $att->faceLog($fromIso, $toIso, ATT_PM_FROM);
+    $face = $att->faceLog($fromIso, $toIso);
 
     $am = array(
         'staff_app' => $att->staffApp($compId, $appFrom, $appTo, ATT_PERIOD_AM),
@@ -1092,6 +1487,14 @@ try {
         'site'      => $att->siteCheckIn($compId, $fromIso, $toIso, ATT_PM_FROM),
         'face'      => $face['last_out'],
     );
+
+    /* ---- and the working week ---- */
+    /* Two more queries for the whole company, not two per person: five
+     * schedules and one row per person who has been assigned one. Which of a
+     * schedule's two patterns applies is worked out per day, in attShiftOn(),
+     * from the date alone. */
+    $scheduleTypes  = $att->scheduleTypes();
+    $scheduleAssign = $att->scheduleAssign();
 
     /* ---- and the calendar, once ---- */
     /* A holiday is company-wide, so it is read for the range and not per
@@ -1113,6 +1516,9 @@ try {
     /* The afternoon is counted separately because it is counted in different
      * words: has_data / no_data, with no on_time or late to add to. */
     $pmTotals = array('has_data' => 0, 'no_data' => 0);
+    /* Counted on its own and added to NEITHER set above: an off day still has
+     * a morning status and an afternoon one, so it is already inside both. */
+    $offDays  = 0;
 
     foreach ($rows as $row) {
         $public = publicRow($row, $overrides, $compNames);
@@ -1122,6 +1528,10 @@ try {
          * unit each, so grouping a report by these covers everybody once.
          * See StaffPoolTree::placement(). */
         $where = $tree->placement($row['person'], $row['comp_id'], $row['person_type']);
+
+        /* Once per person. Which pattern a given date falls under is the only
+         * part that varies, and attCell() asks that per day. */
+        $schedule = attSchedule($row, $scheduleAssign, $scheduleTypes);
 
         $entry = array(
             /* The join key, first and in the order staffPoolAPI.php prints
@@ -1141,19 +1551,29 @@ try {
              * is in. They are all here either way: attendance is a fact about
              * a person who turned up, not about whether they are counted. */
             'total_staff'         => $public['total_staff'],
+            /* THE WEEK THEY ARE SUPPOSED TO WORK, on the person and not on
+             * the day, because that is what it is a fact about. The per-day
+             * cells carry which of its two patterns applied. */
+            'schedule'            => $schedule,
         ) + $where;
 
         if ($mode === 'daily') {
-            $cell  = attCell($row, $fromIso, $am, $pm, $holidays);
+            $cell  = attCell($row, $fromIso, $am, $pm, $holidays, $schedule);
             $entry = $entry + $cell;
             $totals[$cell['status']]++;
             $pmTotals[$cell['pm_status']]++;
+            if ($cell['is_off_day'] === '1') {
+                $offDays++;
+            }
         } else {
             $byDay     = array();
             $summary   = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
             $pmSummary = array('has_data' => 0, 'no_data' => 0);
             foreach ($days as $day) {
-                $cell = attCell($row, $day, $am, $pm, $holidays);
+                $cell = attCell($row, $day, $am, $pm, $holidays, $schedule);
+                if ($cell['is_off_day'] === '1') {
+                    $offDays++;
+                }
                 /* Keyed by day OF THE MONTH, which is what a month grid is
                  * indexed by on screen; the full date is derivable from
                  * year + month and is not repeated 31 times per person. */
@@ -1190,14 +1610,23 @@ try {
                 'am' => array(
                     'period'    => ATT_PERIOD_AM,
                     'judges'    => 'punctuality',
-                    /* The moment lateness begins. A caller comparing a time
-                     * against this uses <, the same way this file does, and
-                     * gets the same answer — which is why the rule is
-                     * published as one number and not as a boundary somebody
-                     * has to guess the inclusiveness of. */
+                    /* PER PERSON PER DAY, and every cell carries the line it
+                     * was judged against as late_from. A caller comparing a
+                     * time against that uses <, the same way this file does,
+                     * and gets the same answer — which is why the rule is
+                     * published as one number per cell and not as a boundary
+                     * somebody has to guess the inclusiveness of. */
+                    'late_from_rule'    => 'shift_start + '
+                                         . ATT_LATE_GRACE_MINUTES . ' minute',
+                    'late_from_default' => ATT_LATE_FROM,
+                    'grace_minutes'     => ATT_LATE_GRACE_MINUTES,
+                    /* The default under its old name, for a caller written
+                     * when this was the one company-wide line. Read the
+                     * cell's own late_from instead: on a 7:00am shift this
+                     * number is an hour out. */
                     'late_from' => ATT_LATE_FROM,
                     'statuses'  => array('on_time', 'late', 'no_data'),
-                    'fields'    => array('time', 'status', 'source'),
+                    'fields'    => array('time', 'status', 'source', 'late_from'),
                     'summary'   => 'summary',
                 ),
                 'pm' => array(
@@ -1218,10 +1647,33 @@ try {
             /* The three below are the morning's rule under the names it was
              * published with before the afternoon slot existed, kept so a
              * caller written against that answer still reads the same thing.
-             * rules.periods.am is the same rule and is where to read it. */
+             * rules.periods.am is the same rule and is where to read it.
+             *
+             * late_from HERE IS NOW ONLY THE FALLBACK. It was the one line
+             * for the whole company; lateness is each person's shift_start
+             * plus the grace, and the cell's own late_from is the number
+             * that was applied to it. */
             'period'    => ATT_PERIOD_AM,
             'late_from' => ATT_LATE_FROM,
             'statuses'  => array('on_time', 'late', 'no_data'),
+            /* THE WORKING WEEK, published so a caller can see which schedule
+             * a person's hours came from rather than inferring it. The five
+             * are the whole of evaluation.schedule_type, parsed exactly as
+             * every staff[].schedule was. */
+            'schedule'  => array(
+                'fields'      => array('is_off_day', 'shift_start', 'shift_end'),
+                'defaults'    => array('staff' => ATT_SCHEDULE_DEFAULT_STAFF,
+                                       'gw'    => ATT_SCHEDULE_DEFAULT_GW),
+                'sunday_off'  => ATT_SCHEDULE_SUNDAY_OFF ? '1' : '0',
+                /* WHAT THE SCHEDULE DECIDES, and what it does not. It sets
+                 * the morning's line — shift_start + the grace — so a 7:00am
+                 * person is late an hour before an 8:00am one. It does NOT
+                 * excuse an off day, scope the afternoon, or touch pm_status;
+                 * those stay the caller's to apply. */
+                'scores'      => 'late_from',
+                'excuses'     => 'nothing',
+                'types'       => $scheduleTypes,
+            ),
         ),
         'scope'        => $scope,
         /* The calendar for the range, keyed by Y-m-d EVEN IN MONTH MODE,
@@ -1242,6 +1694,12 @@ try {
             'no_data'     => $totals['no_data'],
             'pm_has_data' => $pmTotals['has_data'],
             'pm_no_data'  => $pmTotals['no_data'],
+            /* Person-days nobody was due in for — Sundays, and whichever
+             * Saturdays each schedule has off. Inside the six figures above
+             * rather than beside them: an off day is still counted as
+             * whatever its two statuses were, because this endpoint marks
+             * the schedule and scores nothing by it. */
+            'off_day'     => $offDays,
             /* Days in the range, NOT people x days — a holiday is one fact
              * about the company. 0 when the calendar could not be read, which
              * holidays.source says plainly rather than implying here. */
