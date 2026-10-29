@@ -121,6 +121,15 @@ function ackHead($title)
        . 'table.t tr.miss td{background:#fff1f2;box-shadow:inset 0 0 0 1px rgba(220,38,38,.3)}'
        . 'table.t tr:hover td{filter:brightness(.985)}'
        . '.nm{font-size:14px;font-weight:700;color:var(--ink);line-height:1.35}'
+       /* Five days of EL in one month, marked beside the name — the same mark
+        * the mail prints and the app shows, from the same rule. */
+       . '.elb{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:9px;'
+       . 'background:#fef2f2;color:var(--red);font-size:11px;font-weight:700;'
+       . 'white-space:nowrap;vertical-align:1px}'
+       /* The whole row washed, so a flagged person is found while scrolling
+        * and not only while reading. The entry sub-row under it is washed
+        * with it — see ackLeaveEntries(). */
+       . 'tr.elrow>td,tr.elrow.ent>td{background:#fef2f2}'
        . '.un{font-size:11.5px;color:var(--muted);line-height:1.35}'
        . '.c{text-align:center}'
        /* A SECTION HEADING, LOUD ENOUGH TO SPLIT THE PAGE INTO THREE. The
@@ -351,10 +360,25 @@ function ackSection($no, $heading, $kind, array $groups, array $dayCols, $ym,
            . '</td></tr>';
 
         foreach ($g['rows'] as $row) {
-            echo '<tr>'
+            /* THREE DAYS OF EL, OR THREE OF LWP, IN ONE MONTH — beside the
+             * name, one pill a code. The rule lives in summaryLeaveMarks()
+             * and is shared with the mail and the app, so the three cannot
+             * flag different people. */
+            $elMarks = ($kind === 'leave' && $ym !== '')
+                     ? summaryLeaveMarks($row, $ym) : array();
+            $elRow   = !empty($elMarks);
+            $elPills = '';
+            foreach ($elMarks as $m) {
+                $elPills .= '<span class="elb">'
+                          . htmlspecialchars($m['text'], ENT_QUOTES, 'UTF-8') . '</span>';
+            }
+
+            echo '<tr' . ($elRow ? ' class="elrow"' : '') . '>'
                . '<td class="c no">' . (++$n) . '</td>'
                . '<td><div class="nm">'
-               . htmlspecialchars($row['fullname'], ENT_QUOTES, 'UTF-8') . '</div>'
+               . htmlspecialchars($row['fullname'], ENT_QUOTES, 'UTF-8')
+               . $elPills
+               . '</div>'
                . ($row['position'] !== ''
                    ? '<div class="un">'
                      . htmlspecialchars($row['position'], ENT_QUOTES, 'UTF-8') . '</div>'
@@ -390,7 +414,7 @@ function ackSection($no, $heading, $kind, array $groups, array $dayCols, $ym,
                         $taken[] = $line;
                     }
                 }
-                ackLeaveEntries($taken, $coming);
+                ackLeaveEntries($taken, $coming, $elRow);
                 continue;
             }
 
@@ -423,12 +447,12 @@ function ackSection($no, $heading, $kind, array $groups, array $dayCols, $ym,
 
 /** Command: the leave sub-row — taken applications under Taken, upcoming
  *  under Upcoming, each numbered from 1 within its own column. */
-function ackLeaveEntries(array $taken, array $coming)
+function ackLeaveEntries(array $taken, array $coming, $tinted = false)
 {
     if (empty($taken) && empty($coming)) {
         return;
     }
-    echo '<tr class="ent mid"><td></td><td></td>';
+    echo '<tr class="ent mid' . ($tinted ? ' elrow' : '') . '"><td></td><td></td>';
     foreach (array($taken, $coming) as $items) {
         echo '<td>';
         foreach ($items as $i => $line) {
@@ -656,9 +680,10 @@ try {
            . '<div class="btns">'
            . '<button type="submit" class="btn" id="go">Acknowledge</button>'
            . '</div>'
-           . '<div class="und">'
-           . htmlspecialchars(summaryAckLine($row['notify_date']), ENT_QUOTES, 'UTF-8')
-           . '</div>'
+           /* NOTHING UNDER THE BUTTON. "Acknowledge records my name and the
+            * time for <date>" told the reader what the record keeps rather
+            * than what they are saying, and the boxes above already say that
+            * in the first person. What is recorded has not changed. */
            . '</div></div>';
     }
     echo '</form>';

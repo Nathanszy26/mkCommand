@@ -36,6 +36,13 @@
  *   change log at the foot of the page reads. The log is how "who turned this
  *   person off, and when" stays answerable after the tick has been put back.
  *
+ *   THE FIFTH COLUMN IS NOT ONE OF THESE. "Daily Summary Report" writes
+ *   staff_portal2.users.daily_summary_report directly, because nothing else
+ *   writes that column and so there is no source to pin a value away from.
+ *   It has no override row, no pin marker and no entry in the change log.
+ *   See the Daily Summary Report section below for the whole of it, and
+ *   sql/daily_summary_report.sql for the column.
+ *
  * ACCESS
  *   View : any logged-in user, their own company. Super admins see every
  *          company and "All companies"; a company admin sees the companies
@@ -91,12 +98,179 @@ function selfUrl(array $changes)
     return basename(__FILE__) . ($qs === '' ? '' : '?' . $qs);
 }
 
+/* ---------- the Daily Summary Report column ------------------------------- */
+
+/**
+ * WHO GETS THE DAILY SUMMARY ON THEIR PHONE. The fifth tick column, and the
+ * only one that is NOT one of the pool's four flags.
+ *
+ * IT IS NOT AN OVERRIDE AND IT DOES NOT GO NEAR staff_flag_override. The four
+ * flags above it exist to PIN a value away from a source column other systems
+ * write; this one has no such source to disagree with — nothing else writes
+ * it — so it is kept where it is read from, as users.daily_summary_report, and
+ * a tick is an UPDATE on that row. See sql/daily_summary_report.sql.
+ *
+ * WHAT IT CHANGES, AND WHAT IT DOES NOT. staffSummaryAPI.php reads it when
+ * the app asks (source=mobile), so this list decides who is STOPPED at Staff
+ * Utility until they acknowledge. The morning mail is NOT on this list: the
+ * cron still writes to every HOD and AM it finds in the tree, exactly as
+ * before, so unticking somebody takes the popup away and leaves their mail
+ * alone.
+ *
+ * STAFF ONLY, which falls out of where it is stored: a GW has no users row to
+ * carry the column and no Staff Utility to be stopped at. A GW row shows a
+ * dash in this column rather than a box.
+ */
+define('HC_DAILY_SUMMARY_FLAG', 'daily_summary');
+
+/**
+ * WHICH COMPANIES SHOW THE COLUMN — a comma list of comp ids, '1' today.
+ *
+ * The list is here rather than in the markup so a second company is one edit:
+ * put its id in, and the column appears for it, saves for it and counts for
+ * it. An empty string turns the column off everywhere without removing any
+ * of the code — and without touching the data, which stays on the users rows
+ * and comes back the moment the id goes back in.
+ *
+ * It is matched against homeCompId(), so Trillium (16) is covered by 1: its
+ * people are reported as company 16 and stored under Globinaco.
+ */
+define('HC_DAILY_SUMMARY_COMPS', '1');
+
+/** Query: HC_DAILY_SUMMARY_COMPS as a list of ints. */
+function hcDsComps()
+{
+    $out = array();
+    foreach (explode(',', HC_DAILY_SUMMARY_COMPS) as $c) {
+        $c = trim($c);
+        if ($c !== '' && ctype_digit($c)) { $out[] = (int)$c; }
+    }
+    return $out;
+}
+
+/**
+ * Query / command: is the column there to be read?
+ *
+ * THE PAGE MUST SURVIVE THE DAY BEFORE THE DDL IS RUN. The four flags live in
+ * their own tables and the page says plainly when those are missing; this one
+ * is a column on users, and a missing column would otherwise take the whole
+ * report down with it. So the first read decides, once, and everything else
+ * asks here — no column, no column on screen, and the rest of the report is
+ * exactly as it was. Run sql/daily_summary_report.sql and it appears.
+ */
+function hcDsInstalled($set = null)
+{
+    static $ok = true;
+    if ($set !== null) { $ok = (bool)$set; }
+    return $ok;
+}
+
+/** Query: does the column appear on THIS view? '' is "all companies", where
+ *  it appears as soon as any company is on the list — each row then decides
+ *  for itself whether it has a box. */
+function hcDsOnView($compId)
+{
+    $comps = hcDsComps();
+    if (empty($comps) || !hcDsInstalled()) { return false; }
+    if ($compId === null || $compId === '') { return true; }
+    return in_array(homeCompId((int)$compId), $comps, true);
+}
+
+/** Query: does THIS row get a box — a staff row at a listed company. */
+function hcDsOnRow(array $row)
+{
+    return $row['person_type'] === 'staff'
+        && in_array(homeCompId($row['comp_id']), hcDsComps(), true);
+}
+
+/** Query: the key one person is held under. Lower-cased because a login is
+ *  typed by people and users.person is not consistently cased; the company is
+ *  the home one, so a Trillium row and its users row agree. */
+function hcDsKey($compId, $person)
+{
+    return homeCompId($compId) . "\x1f" . strtolower(trim((string)$person));
+}
+
+/** Query: everybody ticked, as a set keyed by hcDsKey(). One query for the
+ *  page, not one per row. */
+function hcDsTicks(PDO $db, $compId)
+{
+    if (!hcDsOnView($compId)) { return array(); }
+
+    $sql  = "SELECT u.person, u.comp_id
+               FROM staff_portal2.users u
+              WHERE IFNULL(u.daily_summary_report, 0) = 1
+                AND u.status = '1' AND u.deleted = '0'";
+    $args = array();
+    /* One company on screen narrows the read; "all companies" does not, since
+     * the table then holds rows from every one of them. */
+    if ($compId !== null && $compId !== '') {
+        $sql .= " AND u.comp_id = :c";
+        $args[':c'] = homeCompId((int)$compId);
+    }
+
+    $out = array();
+    try {
+        $stmt = $db->prepare($sql);
+        $stmt->execute($args);
+        foreach ($stmt->fetchAll() as $r) {
+            $out[hcDsKey($r['comp_id'], $r['person'])] = 1;
+        }
+    } catch (PDOException $e) {
+        /* Almost certainly the column not being there yet. The report is not
+         * worth losing over a column it gained last week, so it is noted and
+         * the column stands down. */
+        error_log('staffHeadcountReport daily_summary_report: ' . $e->getMessage());
+        hcDsInstalled(false);
+        return array();
+    }
+    return $out;
+}
+
+/** Query: is this row ticked? */
+function hcDsValue(array $row, array $ticks)
+{
+    return isset($ticks[hcDsKey($row['comp_id'], $row['person'])]) ? 1 : 0;
+}
+
+/** Command: tick or untick one person. The company is the home one, because
+ *  that is where their users row is filed. */
+function hcDsWrite(PDO $db, $compId, $person, $value)
+{
+    try {
+        $stmt = $db->prepare(
+            "UPDATE staff_portal2.users
+                SET daily_summary_report = :v
+              WHERE person = :p AND comp_id = :c
+                AND status = '1' AND deleted = '0'");
+        $stmt->execute(array(':v'  => $value ? 1 : 0,
+                             ':p'  => (string)$person,
+                             ':c'  => homeCompId($compId)));
+        return true;
+    } catch (PDOException $e) {
+        error_log('staffHeadcountReport daily_summary_report write: ' . $e->getMessage());
+        hcDsInstalled(false);
+        return false;
+    }
+}
+
+/** Query: how many of these rows are ticked — the column's foot total. */
+function hcDsFoot(array $rows, array $ticks)
+{
+    $n = 0;
+    foreach ($rows as $row) {
+        if (hcDsOnRow($row) && hcDsValue($row, $ticks)) { $n++; }
+    }
+    return $n;
+}
+
 /* ---------- controller ---------------------------------------------------- */
 
 $error    = null;
 $staff    = array();
 $gw       = array();
 $overrides = array();
+$dsTicks  = array();
 $companies = array();
 $logRows  = array();
 
@@ -249,7 +423,12 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'save') {
             $value  = (!isset($it['v']) || $it['v'] === null || $it['v'] === '')
                 ? null : (int)$it['v'];
 
-            if (!isset($defs[$flag]) || ($type !== 'staff' && $type !== 'gw')) {
+            /* The fifth column is accepted here and written differently
+             * below — everything between is the same rule for all five: a
+             * value of 0 or 1, a company this user may edit, and a person who
+             * is really in the report. */
+            $isDs = ($flag === HC_DAILY_SUMMARY_FLAG);
+            if ((!isset($defs[$flag]) && !$isDs) || ($type !== 'staff' && $type !== 'gw')) {
                 $refused++;
                 continue;
             }
@@ -267,6 +446,20 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'save') {
                 continue;
             }
 
+            if ($isDs) {
+                /* NOT AN OVERRIDE — straight onto the users row. Refused for
+                 * a row that has no box: a GW, a company not on the list, or
+                 * the null the other four use to mean "remove the override",
+                 * which has no meaning for a column that IS the source. */
+                if ($value === null || !hcDsOnRow($pool[$pk])
+                    || !hcDsWrite(Db::get(), $pool[$pk]['comp_id'], $person, $value)) {
+                    $refused++;
+                    continue;
+                }
+                $saved++;
+                continue;
+            }
+
             $repo->applyChange(
                 $type, $comp, $person,
                 displayName($pool[$pk]['fullname'], $person),
@@ -281,6 +474,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'save') {
         $freshOv = $repo->overrides($viewComp);
         $shown   = filterRows($viewRows, $viewQ, $viewDept, $viewChanged, $freshOv,
                               $viewFlag);
+        /* Re-read for the same reason the overrides are: the foot cell this
+         * answer feeds has to come from the database and not from the batch. */
+        $freshDs = hcDsTicks(Db::get(), $viewComp);
 
         $msg = $saved . ($saved === 1 ? ' change saved' : ' changes saved');
         if ($refused > 0) {
@@ -291,7 +487,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'save') {
             'refused' => $refused,
             'totals'  => array(
                 'summary' => summarise($viewRows, $freshOv),
-                'foot'    => footTotals($shown, $freshOv),
+                'foot'    => footTotals($shown, $freshOv)
+                             + array(HC_DAILY_SUMMARY_FLAG => hcDsFoot($shown, $freshDs)),
                 'shown'   => count($shown),
             ),
         ));
@@ -341,6 +538,9 @@ try {
     $staff     = $repo->staff($compId, $scopeComps);
     $gw        = $repo->gw($compId, $scopeComps);
     $overrides = $repo->overrides($compId);
+    /* The fifth column's values, which live on the users rows themselves and
+     * not in the override table — one query for the page. */
+    $dsTicks   = hcDsTicks(Db::get(), $compId);
     if ($showChangeLog) {
         $logRows = $repo->log($compId);
     }
@@ -464,9 +664,40 @@ function renderFlagCell(array $row, $flag, array $overrides, $editable)
     echo '</label></td>';
 }
 
+/** Command: the Daily Summary Report cell.
+ *
+ *  THE SAME BOX AS THE OTHER FOUR as far as the browser is concerned — same
+ *  data- attributes, so the single-tick handler, the row selection and the
+ *  bulk bar all work on it without knowing it is stored somewhere else. What
+ *  differs is behind the save endpoint, not here.
+ *
+ *  A row with no box at all (a GW, or a company not on the list) gets a dash
+ *  rather than an empty cell, so the column reads as "not applicable" and not
+ *  as "unticked". */
+function renderDsCell(array $row, array $ticks, $editable)
+{
+    if (!hcDsOnRow($row)) {
+        echo '<td class="flagcell"><span class="muted">—</span></td>';
+        return;
+    }
+
+    echo '<td class="flagcell">';
+    echo '<label class="flag" title="Gets the daily summary pop-up in the app">';
+    echo '<input type="checkbox"';
+    echo ' data-type="' . h($row['person_type']) . '"';
+    echo ' data-comp="' . (int)$row['comp_id'] . '"';
+    echo ' data-person="' . h($row['person']) . '"';
+    echo ' data-flag="' . h(HC_DAILY_SUMMARY_FLAG) . '"';
+    echo hcDsValue($row, $ticks) ? ' checked' : '';
+    echo $editable ? '' : ' disabled';
+    echo '>';
+    echo '<span class="n">1</span>';
+    echo '</label></td>';
+}
+
 /** Command: the rows of one population, grouped or flat. */
 function renderRows(array $rows, $groupBy, array $overrides, $isSuper, array $adminComps,
-                    $canEditAny, $colspan)
+                    $canEditAny, $colspan, $dsOn, array $dsTicks)
 {
     if (empty($rows)) {
         echo '<tr><td colspan="' . (int)$colspan . '"><div class="empty">Nobody matches these filters.</div></td></tr>';
@@ -521,16 +752,17 @@ function renderRows(array $rows, $groupBy, array $overrides, $isSuper, array $ad
         foreach ($flags as $flag) {
             renderFlagCell($row, $flag, $overrides, $editable);
         }
+        if ($dsOn) { renderDsCell($row, $dsTicks, $editable); }
         echo '</tr>';
     }
 }
 
 /** Command: one population's table, head and body. */
 function renderTable(array $rows, $groupBy, array $overrides, $isSuper, array $adminComps,
-                     $canEditAny)
+                     $canEditAny, $dsOn, array $dsTicks)
 {
     $defs    = flagDefs();
-    $colspan = 2 + count($defs) + ($canEditAny ? 1 : 0);
+    $colspan = 2 + count($defs) + ($canEditAny ? 1 : 0) + ($dsOn ? 1 : 0);
 
     /* Footer totals count the rows ON SCREEN, so they follow the filters —
      * the tiles above are the whole company and do not. */
@@ -546,11 +778,14 @@ function renderTable(array $rows, $groupBy, array $overrides, $isSuper, array $a
                 <?php foreach ($defs as $key => $d): ?>
                     <th class="flagcol"><?php echo h($d['label']); ?></th>
                 <?php endforeach; ?>
+                <?php if ($dsOn): ?>
+                    <th class="flagcol" title="Ticked people are stopped at Staff Utility in the app until they acknowledge the day. The morning mail is not affected.">Daily Summary Report</th>
+                <?php endif; ?>
             </tr>
             </thead>
             <tbody>
             <?php renderRows($rows, $groupBy, $overrides, $isSuper, $adminComps,
-                             $canEditAny, $colspan); ?>
+                             $canEditAny, $colspan, $dsOn, $dsTicks); ?>
             </tbody>
             <?php if (!empty($rows)): ?>
             <tfoot>
@@ -562,6 +797,10 @@ function renderTable(array $rows, $groupBy, array $overrides, $isSuper, array $a
                     <td class="flagcell" id="f_<?php echo h($f); ?>"><?php
                         echo (int)$foot[$f]; ?></td>
                 <?php endforeach; ?>
+                <?php if ($dsOn): ?>
+                    <td class="flagcell" id="f_<?php echo h(HC_DAILY_SUMMARY_FLAG); ?>"><?php
+                        echo hcDsFoot($rows, $dsTicks); ?></td>
+                <?php endif; ?>
             </tr>
             </tfoot>
             <?php endif; ?>
@@ -861,7 +1100,7 @@ function tileUrl($flag, $flagWant)
  * and a GW row is marked as one - but they are no longer split into two
  * tables, so the last number on the page is the head count. */
 renderTable(array_merge($staffShown, $gwShown), $groupBy, $overrides,
-            $isSuper, $adminComps, $canEditAny);
+            $isSuper, $adminComps, $canEditAny, hcDsOnView($compId), $dsTicks);
 ?>
 
 <?php if ($canEditAny): ?>
@@ -872,6 +1111,9 @@ renderTable(array_merge($staffShown, $gwShown), $groupBy, $overrides,
         <?php foreach (flagDefs() as $key => $d): ?>
             <option value="<?php echo h($key); ?>"><?php echo h($d['label']); ?></option>
         <?php endforeach; ?>
+        <?php if (hcDsOnView($compId)): ?>
+            <option value="<?php echo h(HC_DAILY_SUMMARY_FLAG); ?>">Daily Summary Report</option>
+        <?php endif; ?>
     </select>
     <span>to</span>
     <select id="bulkvalue">

@@ -9,7 +9,7 @@ if (!UnifiedAuth::isLoggedIn()) {
 }
 
 $currentUser = UnifiedAuth::getLoggedInUser();
-// $person = $currentUser['person'];
+$person = $currentUser['person'];
 $person = 'justin';   // TODO: restore the line above before deploying
 
 // Only Heads of Department and Area Managers / Assistant Area Managers can use this page.
@@ -42,7 +42,7 @@ foreach (array_slice($words, 0, 2) as $w) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Staff Structure</title>
+<title>Staff Summary</title>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 <style>
     :root {
@@ -226,7 +226,7 @@ foreach (array_slice($words, 0, 2) as $w) {
 <div class="main-content">
 <div class="wrap">
 
-<h1>Staff Structure</h1>
+<h1>Staff Summary</h1>
 <div class="sub">Open a department to see its staff, or use the totals above to expand everything at once. Click a name with an arrow to see who reports to them, or a Lateness / Excessive Leave / Compliance cell to open that person’s month calendar.</div>
 
 <div class="tiles" id="tiles"></div>
@@ -481,21 +481,23 @@ async function renderCal() {
     }
   });
 
-  // Automatically detect missed attendance submissions (working days with no attendance record)
+  // Automatically detect missed attendance submissions:
+  //  - working day (Mon-Sat) with no check-in at all   -> "Missed Attendance Submission"
+  //  - working day with a check-in but no PM check-out -> "Missed PM Check-out"
   const autoCompliance = [], missed = {};
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+  const nowT = new Date();
+  const nowHHMM = String(nowT.getHours()).padStart(2, '0') + ':' + String(nowT.getMinutes()).padStart(2, '0');
 
   for (let day = 1; day <= new Date(c.y, c.m, 0).getDate(); day++) {
     const date = dk(day);
     const dayDate = new Date(c.y, c.m - 1, day);
 
-    // Only check Monday to Saturday
-    if (dayDate.getDay() === 0) continue;
-
-    // Do not check today or future dates (today's submission may still come in)
-    if (dayDate >= today) continue;
+    if (dayDate.getDay() === 0) continue;          // Sunday
+    if (dayDate > today) continue;                 // future
+    const isTodayD = dayDate.getTime() === today.getTime();
 
     const attendance = (e.days || {})[day] || {};
     const hasLeave = (leaveBy[date] || []).length > 0;
@@ -503,20 +505,24 @@ async function renderCal() {
     // Skip public holidays and leave dates
     if (isPH(attendance) || hasLeave) continue;
 
-    // Skip dates that already have attendance (status "no_data" means nothing was submitted)
-    if (attendance.time || (attendance.status && attendance.status !== 'no_data')) continue;
+    const hasIn  = !!(attendance.time || (attendance.status && attendance.status !== 'no_data'));
+    const hasOut = attendance.pm_status === 'has_data' && !!attendance.pm_time;
 
-    const record = {
-      date: date,
-      reference: 'AUTO',
-      type: 'System-Detected',
-      title: 'Missed Attendance Submission',
-      source: 'system'
-    };
+    if (!hasIn) {
+      if (isTodayD) continue;                      // today's check-in may still come in
+      const record = { date: date, reference: 'AUTO', type: 'System-Detected',
+                       title: 'Missed Attendance Submission', source: 'system' };
+      autoCompliance.push(record);
+      missed[date] = record;
+      continue;
+    }
 
-    autoCompliance.push(record);
-    missed[date] = record;
-
+    if (!hasOut) {
+      // Today's PM check-out is only due from 4.30pm
+      if (isTodayD && nowHHMM < PM_FROM) continue;
+      autoCompliance.push({ date: date, reference: 'AUTO', type: 'System-Detected',
+                            title: 'Missed PM Check-out', source: 'system' });
+    }
   }
 
   const n = new Date(c.y, c.m, 0).getDate(), first = new Date(c.y, c.m - 1, 1).getDay(), now = new Date();
@@ -594,7 +600,8 @@ async function renderCal() {
   );
 
   // Compliance has two parts:
-  //  1. Missed attendance submissions detected by the system (working days, Mon-Sat, with no attendance at all).
+  //  1. Missed attendance submissions detected by the system (working days, Mon-Sat, with no check-in
+  //     at all, or with a check-in but no PM check-out).
   //     A date that is already in a compliance record's missed_dates is not listed here again.
   //  2. Official compliance records from the compliance API (performanceAPI).
   const apiComps = (md.compliance || []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
@@ -1171,6 +1178,6 @@ setInterval(() => {
 })();
 </script>
 
- <?php include 'staffSummaryWidget.php'; ?>
+ <?php// include 'staffSummaryWidget.php'; ?>
 </body>
 </html>

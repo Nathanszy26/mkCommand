@@ -42,8 +42,18 @@ header('Content-Type: application/json; charset=UTF-8');
  *                        whoever is logged in. Leave it out and the session
  *                        answers for itself. comid= only matters where the
  *                        same login exists at more than one company.
+ *     source=mobile      THE APP, which is stopped at Staff Utility by this
+ *                        answer and so asks a narrower question: only people
+ *                        HR has ticked for Daily Summary Report
+ *                        (users.daily_summary_report, the column on
+ *                        staffHeadcountReport.php) are stopped. Everybody
+ *                        else is answered has_summary:false with
+ *                        on_list:false, whatever their summary holds. The
+ *                        morning mail ignores this list entirely.
  *     -> has_summary     false when they are not on the list at all, or it
  *                        is a Sunday or a holiday. NOT an error.
+ *     -> on_list         source=mobile only: whether the Daily Summary
+ *                        Report tick is what decided it. null otherwise.
  *     -> show_popup      the one field to branch on. False the moment ANY
  *                        platform acknowledges, which is the whole point.
  *     -> ack_url         staffSummaryAck.php with this person's token, ready
@@ -514,6 +524,60 @@ function apiRequireKey()
     }
 }
 
+/* ---------- who the app stops -------------------------------------------- */
+
+/**
+ * Query: is this request the mobile app asking?
+ *
+ * source=mobile, and nothing is inferred from a user agent: the app says so
+ * because the answer is different for it, and a browser that says the same
+ * gets the same answer. It is not authority and decides nothing about who may
+ * read or write — only which population the question is asked about.
+ */
+function apiFromMobile()
+{
+    return strtolower(trim((string)apiIn('source', ''))) === 'mobile';
+}
+
+/**
+ * Query: is this person on the Daily Summary Report list —
+ * staff_portal2.users.daily_summary_report, the tick column on
+ * staffHeadcountReport.php.
+ *
+ * THE APP HAS ITS OWN LIST AND THE MAIL DOES NOT. staffSummaryCron.php writes
+ * to every HOD and AM it finds in the staff tree; this column is a shorter
+ * list HR keeps by hand, and it decides one thing only — who the app stops at
+ * Staff Utility until they acknowledge. Somebody ticked off it still gets the
+ * morning mail and can still acknowledge from it; the app simply lets them
+ * through.
+ *
+ * homeCompId() because a Trillium person is reported as company 16 and their
+ * users row is filed under Globinaco, which is where the tick is.
+ *
+ * IT FAILS OPEN, AND THAT IS THE WHOLE POINT OF A GATE NOBODY ASKED FOR. The
+ * column not being there yet — sql/daily_summary_report.sql not run — would
+ * otherwise 500 every app on every launch. Nobody on the list means nobody is
+ * stopped, which is where this started, so the error is logged and the app
+ * carries on.
+ */
+function apiOnDailyList(PDO $pdo, $person, $compId)
+{
+    try {
+        $stmt = $pdo->prepare(
+            "SELECT IFNULL(u.daily_summary_report, 0) AS on_list
+               FROM staff_portal2.users u
+              WHERE u.person = :p AND u.comp_id = :c
+                AND u.status = '1' AND u.deleted = '0'
+              LIMIT 1");
+        $stmt->execute(array(':p' => (string)$person, ':c' => homeCompId($compId)));
+        $row = $stmt->fetch();
+        return ($row !== false) && ((int)$row['on_list'] === 1);
+    } catch (PDOException $e) {
+        error_log('staffSummaryAPI daily_summary_report: ' . $e->getMessage());
+        return false;
+    }
+}
+
 /**
  * Query: this row's acknowledgement page, with its token. It exists so a web
  * or app popup can frame the page without going to the database for a token
@@ -589,7 +653,35 @@ function apiSummaryBody(array $row)
         foreach ($groups as $g) {
             $keep = array();
             foreach (isset($g['rows']) ? $g['rows'] : array() as $r) {
-                if (!empty($r[$flag])) { $keep[] = $r; }
+                if (!empty($r[$flag])) {
+                    /* EMERGENCY LEAVE AND LEAVE WITHOUT PAY, COUNTED AT SERVE
+                     * TIME and not stored. It is a reading of the
+                     * applications the snapshot already holds, so it is the
+                     * same answer for a payload written this morning as for
+                     * one written before the rule existed — no re-run, no
+                     * backfill. summaryLeaveMarks() is the rule; this only
+                     * publishes it.
+                     *
+                     * el_marks IS WHAT THE APP DRAWS, one entry a code, each
+                     * carrying its own text; el_days and lwp_days are the
+                     * plain counts for anything that wants a number. el_alert
+                     * stays the single yes/no so a reader never has to know
+                     * the rule to honour it.
+                     *
+                     * ON THE EXCESSIVE LEAVES ROWS AND NOWHERE ELSE. Three EL
+                     * or three LWP in a month IS the excessive leave this
+                     * section is about, so it belongs to it. Carried onto a
+                     * Compliance or a Lateness row it read as a second,
+                     * unrelated charge against the same person — the same red
+                     * mark in a list about something else entirely. */
+                    if ($kind === 'leave') {
+                        $r['el_marks'] = summaryLeaveMarks($r, $row['notify_date']);
+                        $r['el_days']  = summaryElDays($r, $row['notify_date']);
+                        $r['lwp_days'] = summaryLwpDays($r, $row['notify_date']);
+                        $r['el_alert'] = !empty($r['el_marks']);
+                    }
+                    $keep[] = $r;
+                }
             }
             if (!empty($keep)) {
                 $g['rows'] = $keep;
@@ -641,7 +733,12 @@ function apiSummaryBody(array $row)
             'acked_from'   => $done ? $row['acked_platform'] : null,
             'opened_at'    => $row['opened_datetime'],
             'opened_from'  => $row['opened_platform'],
-            'confirm_line' => summaryAckLine($row['notify_date']),
+            /* THERE IS NO confirm_line ANY MORE. It carried "Acknowledge
+             * records my name and the time for <date>", which told the reader
+             * what the record keeps rather than what they are saying; the
+             * section sentences in sections[].confirm say that, in the first
+             * person. A client still drawing the old field simply finds
+             * nothing there. */
             'platforms'    => summaryPlatforms(),
         ),
     );
@@ -764,6 +861,30 @@ try {
             apiFail('bad_date', 'date must be a calendar date in YYYY-MM-DD form.', 400);
         }
 
+        /* THE APP'S LIST, CHECKED BEFORE ANYTHING ELSE. source=mobile asks a
+         * narrower question than the web popup does — "should this person be
+         * stopped at Staff Utility" — and the answer is no for everybody HR
+         * has not ticked, however full their summary is. Answered as
+         * has_summary:false rather than as an error, because that is the
+         * field the app already branches on; on_list says which of the two
+         * reasons it was. */
+        $fromMobile = apiFromMobile();
+        if ($fromMobile
+            && !apiOnDailyList($pdo, $caller['person'], (int)$caller['comp_id'])) {
+            apiOut(array(
+                'success'     => true,
+                'action'      => 'mine',
+                'via'         => $caller['via'],
+                'source'      => 'mobile',
+                'on_list'     => false,
+                'date'        => $date,
+                'person'      => $caller['person'],
+                'has_summary' => false,
+                'show_popup'  => false,
+                'complete'    => null,
+            ));
+        }
+
         $stmt = $pdo->prepare('SELECT ' . apiRowColumns() . '
                                  FROM mkPortal.staff_summary_notify
                                 WHERE person = :p AND notify_date = :d AND comp_id = :c');
@@ -780,6 +901,11 @@ try {
                 'success'     => true,
                 'action'      => 'mine',
                 'via'         => $caller['via'],
+                'source'      => $fromMobile ? 'mobile' : '',
+                /* On the list, but with no row today — a Sunday, a holiday,
+                 * or a morning with nothing to report. The app is told the
+                 * same thing either way: nothing to stop them for. */
+                'on_list'     => $fromMobile ? true : null,
                 'date'        => $date,
                 'person'      => $caller['person'],
                 'has_summary' => false,
@@ -794,6 +920,8 @@ try {
             'success'     => true,
             'action'      => 'mine',
             'via'         => $caller['via'],
+            'source'      => $fromMobile ? 'mobile' : '',
+            'on_list'     => $fromMobile ? true : null,
             'has_summary' => true,
             /* THE ONE FIELD THE POPUP BRANCHES ON. Acknowledged anywhere —
              * the mail, the web, the app — means acknowledged everywhere, so

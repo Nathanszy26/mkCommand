@@ -1009,13 +1009,12 @@ function summaryHtml(array $recipient, array $groups, $todayIso, $ackUrl, array 
         . 'background:' . SUM_BLUE . ';border:0;border-radius:12px;padding:24px 72px;'
         . 'cursor:pointer;">'
         . '</td></tr></table>'
-        /* THE UNDERTAKING, UNDER THE BUTTON. The same sentence the page puts
-         * there, so what somebody pressed in the mail and what the record
-         * says they agreed to are one text. */
-        . '<div style="max-width:620px;margin:16px auto 0;font-size:13px;'
-        . 'color:' . SUM_BODY . ';line-height:1.6;">'
-        . summaryEsc(summaryAckLine($todayIso))
-        . '</div>'
+        /* NOTHING UNDER THE BUTTON ANY MORE. It used to carry "Acknowledge
+         * records my name and the time for <date>", which told somebody what
+         * the record keeps rather than what they are saying — and the tick
+         * boxes above already say that, in the first person. The record is
+         * unchanged: the name and the time are still written, and the event
+         * log still has the platform and the address. */
         . '<div style="padding-top:12px;">'
         . '<a href="' . summaryEsc($ackUrl) . '" style="font-size:13px;font-weight:bold;'
         . 'color:' . SUM_BLUE . ';text-decoration:underline;">'
@@ -1135,7 +1134,7 @@ function summarySectionHtml($no, $heading, $kind, array $groups, array $dayCols,
     foreach ($shown as $g) {
         $h .= summaryGroupHtml($g, $cols);
         foreach ($g['rows'] as $row) {
-            $h .= summarySectionRowHtml($row, $kind, $dayCols, ++$n);
+            $h .= summarySectionRowHtml($row, $kind, $dayCols, ++$n, $ym);
         }
     }
     $h .= '</table>';
@@ -1238,18 +1237,43 @@ function summaryGroupHtml(array $g, $cols)
 }
 
 /** Query: one person's row in one section, plus the sub-row of entries that
- *  Leaves and Compliance list beneath the figures. */
-function summarySectionRowHtml(array $row, $kind, array $dayCols, $no)
+ *  Leaves and Compliance list beneath the figures.
+ *
+ *  $ym is the month the section covers, and it is here for one reason: the
+ *  Emergency Leave mark below. */
+function summarySectionRowHtml(array $row, $kind, array $dayCols, $no, $ym = '')
 {
-    $td = 'padding:9px 6px;border-top:1px solid ' . SUM_HAIR . ';';
+    /* THREE DAYS OF EMERGENCY LEAVE — OR THREE OF LEAVE WITHOUT PAY — IN ONE
+     * MONTH IS A PATTERN, and it is the one thing in this table a manager is
+     * meant to act on rather than note. The mark rides beside the name — not
+     * in a column — because it is a fact about the person and the columns are
+     * about the month, and THE WHOLE ROW IS WASHED RED so it is found while
+     * scrolling a section of eighty-six and not only while reading one.
+     * summaryLeaveMarks() is the rule, shared with the page and the app so
+     * all three flag the same people; ONE PILL A CODE, so somebody over on
+     * both reads '3 EL  4 LWP' rather than one number standing for two
+     * different things. */
+    $elMarks = ($kind === 'leave' && $ym !== '') ? summaryLeaveMarks($row, $ym) : array();
+    $elRow   = !empty($elMarks);
+
+    $td = 'padding:9px 6px;border-top:1px solid ' . SUM_HAIR . ';'
+        . ($elRow ? 'background:' . SUM_TINT . ';' : '');
     $lt = $td . 'border-left:1px solid ' . SUM_HAIR . ';';
+
+    $elMark = '';
+    foreach ($elMarks as $m) {
+        $elMark .= '<span style="display:inline-block;margin-left:6px;padding:1px 6px;'
+                 . 'border-radius:9px;background:' . SUM_TINT . ';color:' . SUM_RED . ';'
+                 . 'font-size:11px;font-weight:bold;white-space:nowrap;">'
+                 . summaryEsc($m['text']) . '</span>';
+    }
 
     $h = '<tr>'
        . '<td align="center" style="' . $td . 'font-size:12px;color:' . SUM_FAINT . '">'
        . (int)$no . '</td>'
        . '<td style="' . $td . '">'
        . '<div style="font-size:14px;font-weight:bold;color:' . SUM_INK . '">'
-       . summaryEsc($row['fullname']) . '</div></td>';
+       . summaryEsc($row['fullname']) . $elMark . '</div></td>';
 
     if ($kind === 'late') {
         foreach ($dayCols as $col) {
@@ -1279,7 +1303,9 @@ function summarySectionRowHtml(array $row, $kind, array $dayCols, $no)
                   . ' - ' . $l['from'] . ' to ' . $l['to'];
             if ($l['when'] === 'upcoming') { $coming[] = $line; } else { $taken[] = $line; }
         }
-        return $h . summaryLeaveEntriesHtml($taken, $coming);
+        /* The entries carry the same wash, so a flagged person reads as one
+         * block rather than a red row with a white tail. */
+        return $h . summaryLeaveEntriesHtml($taken, $coming, $elRow);
     }
 
     /* compliance */
@@ -1300,27 +1326,29 @@ function summarySectionRowHtml(array $row, $kind, array $dayCols, $no)
 /** Query: the leave sub-row — the taken applications under Taken, the
  *  upcoming ones under Upcoming, each numbered from 1 within its own column
  *  because they are two lists and not one split in half. */
-function summaryLeaveEntriesHtml(array $taken, array $coming)
+function summaryLeaveEntriesHtml(array $taken, array $coming, $tinted = false)
 {
     if (empty($taken) && empty($coming)) {
         return '';
     }
-    $cell = function (array $items) {
+    $wash = $tinted ? 'background:' . SUM_TINT . ';' : '';
+    $cell = function (array $items) use ($wash) {
         if (empty($items)) {
-            return '<td></td>';
+            return '<td style="' . $wash . '"></td>';
         }
         /* CENTRED, under the figure each list belongs to. Left-aligned they
          * hung off the side of a centred number and read as a separate
          * column. The compliance list below is still left — it runs the
          * width of the table and is prose, not dates. */
         $h = '<td align="center" valign="top" style="padding:1px 10px 11px;font-size:12px;'
-           . 'color:' . SUM_MUTED . ';line-height:1.75;text-align:center;">';
+           . 'color:' . SUM_MUTED . ';line-height:1.75;text-align:center;' . $wash . '">';
         foreach ($items as $i => $line) {
             $h .= '<div>' . ($i + 1) . '. ' . summaryEsc($line) . '</div>';
         }
         return $h . '</td>';
     };
-    return '<tr><td></td><td></td>' . $cell($taken) . $cell($coming) . '</tr>';
+    return '<tr><td style="' . $wash . '"></td><td style="' . $wash . '"></td>'
+         . $cell($taken) . $cell($coming) . '</tr>';
 }
 
 /** Query: the sub-row that lists a person's entries under their figures. One

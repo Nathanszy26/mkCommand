@@ -37,6 +37,154 @@ define('STAFF_SUMMARY_SHARED_LOADED', true);
  *  one place, so the table does not read as a mix of '-', '–' and ''. */
 define('SUM_DASH', '—');
 
+/* ------- emergency leave and leave without pay: when a month stops -------
+ * ------------------------- being an accident ---------------------------- */
+
+/**
+ * HOW MUCH OF ONE KIND OF LEAVE IS TOO MUCH IN ONE MONTH.
+ *
+ * THREE DAYS, OF EITHER CODE: three of Emergency Leave, or three of Leave
+ * Without Pay. One EL is an emergency; three in the same month is a pattern,
+ * and it is the pattern the manager reading this is meant to act on. LWP is
+ * the same question asked of a different code — unpaid days keep turning up
+ * — so it is flagged the same way and at the same number.
+ *
+ * THE TWO CODES ARE COUNTED SEPARATELY AND NEVER ADDED. One EL and two LWP is
+ * NOT flagged: that is two unremarkable things in one month, not one pattern,
+ * and the person has gone over nothing. A code has to reach the line on its
+ * own. Adding them would also flag whoever happens to have one of each kind
+ * of ordinary absence, which is most of a company.
+ *
+ * THE COMPARISON IS >=, so "3 or more" means exactly what it says. The codes
+ * and the number are here and nowhere else, so the mail's red mark, the
+ * acknowledgement page's and the app's badge cannot start disagreeing about
+ * who is flagged.
+ */
+define('SUMMARY_EL_CODE', 'EL');
+define('SUMMARY_LWP_CODE', 'LWP');
+define('SUMMARY_EL_ALERT', 3);
+
+/** The codes this rule watches, in the order their marks are shown. Named
+ *  once so nothing has to repeat the pair. */
+function summaryAlertCodes()
+{
+    return array(SUMMARY_EL_CODE, SUMMARY_LWP_CODE);
+}
+
+/**
+ * Query: how many days of ONE leave code this person has in the month shown.
+ *
+ * COUNTED OFF THE APPLICATIONS, not off the leave figures, because the
+ * figures are every kind of leave added together and this is a question about
+ * one kind. Each application of that code contributes the days it covers
+ * INSIDE THIS MONTH — a span running into the next month is clipped, so
+ * October's figure is October's and November gets the rest.
+ *
+ * DAYS ARE COUNTED ONCE, WHICH IS WHY THIS COLLECTS DATES RATHER THAN ADDING
+ * SPANS UP. Two applications can land on the SAME DAY — a morning and an
+ * afternoon filed separately, or a correction filed over the top — and adding
+ * their lengths counted that day twice. Axther Adver Anthony had two EL
+ * applications both dated 14 Oct 2026 and read as 8 days of EL when leaveAPI,
+ * which keys leave by day, said 7. A day somebody was away is one day however
+ * many forms it took.
+ *
+ * A HALF DAY STILL COUNTS AS A DAY, and that is the one place this figure can
+ * differ from leaveAPI's by_type for the code. Applications carry a date range and
+ * no half flag, so there is nothing to halve: two half days on two different
+ * dates read as 2 here and 1.0 there. It makes the alert very slightly eager,
+ * which is the right way round for a warning.
+ *
+ * $monthYm is 'YYYY-MM' — the month the summary is about, which is the
+ * notify_date's month and not today's. $code is the short code as leaveAPI
+ * prints it: 'EL', 'LWP'.
+ */
+function summaryLeaveCodeDays($staffRow, $monthYm, $code)
+{
+    $want = strtoupper(trim((string)$code));
+    $ym   = substr((string)$monthYm, 0, 7);
+    if ($want === '' || $ym === '' || !is_array($staffRow) || empty($staffRow['leaves'])) {
+        return 0;
+    }
+
+    $first = $ym . '-01';
+    $t     = strtotime($first);
+    $last  = $t ? date('Y-m-t', $t) : $ym . '-31';
+
+    /* The set of dates, so a date reached twice is still one day. */
+    $days = array();
+    foreach ($staffRow['leaves'] as $l) {
+        $code = strtoupper(trim(isset($l['code']) ? (string)$l['code'] : ''));
+        if ($code !== $want) { continue; }
+
+        $from = substr(isset($l['from']) ? (string)$l['from'] : '', 0, 10);
+        $to   = substr(isset($l['to']) ? (string)$l['to'] : $from, 0, 10);
+        if ($from === '') { continue; }
+        if ($to === '' || $to < $from) { $to = $from; }
+
+        /* Clipped to the month before counting, so the figure is about the
+         * month this summary covers. */
+        if ($from < $first) { $from = $first; }
+        if ($to > $last)    { $to = $last; }
+        if ($to < $from)    { continue; }
+
+        $a = strtotime($from);
+        $b = strtotime($to);
+        if ($a === false || $b === false) { continue; }
+
+        /* Walked a day at a time with strtotime('+1 day') rather than by
+         * adding 86400: a clock change would make some days 23 hours long and
+         * quietly skip one. */
+        for ($d = $a; $d <= $b; $d = strtotime('+1 day', $d)) {
+            $days[date('Y-m-d', $d)] = true;
+        }
+    }
+    return count($days);
+}
+
+/** Query: days of Emergency Leave in the month shown. */
+function summaryElDays($staffRow, $monthYm)
+{
+    return summaryLeaveCodeDays($staffRow, $monthYm, SUMMARY_EL_CODE);
+}
+
+/** Query: days of Leave Without Pay in the month shown. */
+function summaryLwpDays($staffRow, $monthYm)
+{
+    return summaryLeaveCodeDays($staffRow, $monthYm, SUMMARY_LWP_CODE);
+}
+
+/**
+ * Query: every code this person has reached the line on, as a list of
+ * array('code' => 'EL', 'days' => 4, 'text' => '4 EL'). EMPTY MEANS NOT
+ * FLAGGED, which is the whole test — nothing else needs to know the number.
+ *
+ * A LIST AND NOT A BOOLEAN-PLUS-A-COUNT, because a person can be over on both
+ * codes and the mark has to say which. 'text' is built here so the mail, the
+ * page and the app cannot label the same mark three ways.
+ */
+function summaryLeaveMarks($staffRow, $monthYm)
+{
+    $marks = array();
+    foreach (summaryAlertCodes() as $code) {
+        $days = summaryLeaveCodeDays($staffRow, $monthYm, $code);
+        if ($days >= SUMMARY_EL_ALERT) {
+            $marks[] = array(
+                'code' => $code,
+                'days' => $days,
+                'text' => $days . ' ' . $code,
+            );
+        }
+    }
+    return $marks;
+}
+
+/** Query: is this person over the line on EITHER code in the month shown?
+ *  The one test the mail, the page and the app all make. */
+function summaryElAlert($staffRow, $monthYm)
+{
+    return summaryLeaveMarks($staffRow, $monthYm) !== array();
+}
+
 /** Query: a person key that can be compared. Every API prints `person` as it
  *  is stored, and the same login turns up as 'sooCK' and 'soock' across
  *  tables, so nothing in this family compares them any other way. */
@@ -300,37 +448,24 @@ function summaryItemKeys(array $groups)
 /**
  * Query: what ticking a section's box says, in the first person.
  *
- * ONE WORDING, USED BY BOTH THE MAIL AND THE PAGE, so what somebody agreed
- * to in the email is word for word what the page records them as agreeing
- * to. Each names the list it sits under and what the reader is undertaking
- * to do about it — an acknowledgement nobody can later read as "I clicked a
- * box" has to say what was understood.
+ * ONE SENTENCE, THE SAME FOR ALL THREE SECTIONS, and used by the mail, the
+ * page and the app alike — so what somebody agreed to in the email is word
+ * for word what every other surface records them as agreeing to.
+ *
+ * IT NO LONGER PROMISES AN ACTION. The three used to read "...and will follow
+ * it up", "...and will arrange cover", "...and will act on it", which asked a
+ * manager to undertake something different in each box and made a tick an
+ * undertaking rather than a reading. What is actually being recorded is that
+ * this list was seen and understood, so that is what it says, once, in words
+ * that work under any of the three headings.
+ *
+ * $kind is kept in the signature although every section now answers the same:
+ * every caller passes it, and a section needing its own wording again would
+ * otherwise have to be threaded back through all of them.
  */
 function summaryConfirmLine($kind)
 {
-    /* SHORT, PLAIN, ONE LINE EACH. Read on a phone, at speed, by people
-     * whose first language is not always English. Nothing is lost by
-     * cutting "and missing check-ins" — the list above says what it is. */
-    $lines = array(
-        'late'  => 'I have read the lateness above and will follow it up.',
-        'leave' => 'I have read the leaves above and will arrange cover.',
-        'comp'  => 'I have read the compliance above and will act on it.',
-    );
-    return isset($lines[$kind]) ? $lines[$kind] : '';
-}
-
-/**
- * Query: the undertaking under the Acknowledge button — the whole of what
- * pressing it means, named day and all.
- *
- * $iso is the day, Y-m-d, AND IT IS PRINTED AS Y-m-d — the same form as the
- * subject line and the title, so all three say the day the same way. A
- * record with no year on it is one that has to be dated from its
- * surroundings.
- */
-function summaryAckLine($iso)
-{
-    return 'Acknowledge records my name and the time for ' . (string)$iso . '.';
+    return 'I have read and understand the above.';
 }
 
 /**
