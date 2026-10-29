@@ -74,6 +74,19 @@ function summaryAlertCodes()
 /**
  * Query: how many days of ONE leave code this person has in the month shown.
  *
+ * READ OFF leave_by_code WHEN THE ROW HAS IT, which is the day map counted
+ * per code at build time — half days included, exactly as the Taken figure
+ * beside it counts them. Eric John's three EL dates are 2.5 days because the
+ * 8th was a half, and a badge saying 3 EL beside a figure saying 2.5 was
+ * wrong twice over: it disagreed with its own row, and it turned somebody
+ * under the line into somebody over it.
+ *
+ * THE COUNT BELOW IS THE FALLBACK, for a payload written before the day map
+ * was carried. It counts whole dates off the applications and cannot see a
+ * half day, so it reads 3 where this reads 2.5 — eager, which is the right
+ * way round for a warning but not something to live with. A snapshot gets the
+ * exact figure the next time the cron writes it.
+ *
  * COUNTED OFF THE APPLICATIONS, not off the leave figures, because the
  * figures are every kind of leave added together and this is a question about
  * one kind. Each application of that code contributes the days it covers
@@ -88,11 +101,11 @@ function summaryAlertCodes()
  * which keys leave by day, said 7. A day somebody was away is one day however
  * many forms it took.
  *
- * A HALF DAY STILL COUNTS AS A DAY, and that is the one place this figure can
- * differ from leaveAPI's by_type for the code. Applications carry a date range and
- * no half flag, so there is nothing to halve: two half days on two different
- * dates read as 2 here and 1.0 there. It makes the alert very slightly eager,
- * which is the right way round for a warning.
+ * IN THE FALLBACK A HALF DAY COUNTS AS A WHOLE ONE, and that is the one place
+ * it can differ from leaveAPI's by_type for the code: applications carry a
+ * date range and no half flag, so there is nothing to halve and two half days
+ * on two dates read as 2 here and 1.0 there. leave_by_code above has no such
+ * problem, which is why it is tried first.
  *
  * $monthYm is 'YYYY-MM' — the month the summary is about, which is the
  * notify_date's month and not today's. $code is the short code as leaveAPI
@@ -101,8 +114,21 @@ function summaryAlertCodes()
 function summaryLeaveCodeDays($staffRow, $monthYm, $code)
 {
     $want = strtoupper(trim((string)$code));
-    $ym   = substr((string)$monthYm, 0, 7);
-    if ($want === '' || $ym === '' || !is_array($staffRow) || empty($staffRow['leaves'])) {
+    if ($want === '' || !is_array($staffRow)) {
+        return 0;
+    }
+
+    /* The day map's answer, if this row carries one. It is already the
+     * month's — leaveAPI was read for the month — so there is nothing to
+     * clip and nothing to de-duplicate: a day is one entry in it however
+     * many forms it took. */
+    if (isset($staffRow['leave_by_code']) && is_array($staffRow['leave_by_code'])) {
+        return isset($staffRow['leave_by_code'][$want])
+             ? (float)$staffRow['leave_by_code'][$want] : 0.0;
+    }
+
+    $ym = substr((string)$monthYm, 0, 7);
+    if ($ym === '' || empty($staffRow['leaves'])) {
         return 0;
     }
 
@@ -171,7 +197,9 @@ function summaryLeaveMarks($staffRow, $monthYm)
             $marks[] = array(
                 'code' => $code,
                 'days' => $days,
-                'text' => $days . ' ' . $code,
+                /* summaryNum() because a half day is half a day on the badge
+                 * too: '3.5 EL', never '3.5000 EL' and never a silent 4. */
+                'text' => summaryNum($days) . ' ' . $code,
             );
         }
     }
@@ -529,6 +557,40 @@ function summaryLeaveTypeNames($leave)
  *
  * TODAY COUNTS AS TAKEN. Somebody on leave this morning is not "upcoming".
  */
+/**
+ * Query: the month's leave counted PER CODE off the day map — 'EL' => 2.5,
+ * 'AL' => 1 — for the row the snapshot stores.
+ *
+ * THE SAME COUNT AS summaryLeaveCells(), SPLIT BY CODE. Both walk days{} and
+ * both call a half day half a day, so the badge beside a name and the Taken
+ * figure under it can never tell different stories about the same person.
+ * This is what leaveAPI prints as summary.by_type, arrived at from the same
+ * day map rather than trusted from a second field.
+ *
+ * $leaveRow is leaveAPI's own staff row, NOT the summary row — this is built
+ * at cron time, while that is still in hand, because the day map is not
+ * stored and the acknowledgement page hours later has only what was.
+ *
+ * A DAY WITH NO CODE IS COUNTED NOWHERE. It still belongs in the Taken
+ * figure, which is about days off whatever they were for, but this answers
+ * "how much EL" and an unnamed day is not evidence of any code.
+ */
+function summaryLeaveCodeTotals($leaveRow)
+{
+    $out = array();
+    if (!is_array($leaveRow) || !isset($leaveRow['days']) || !is_array($leaveRow['days'])) {
+        return $out;
+    }
+    foreach ($leaveRow['days'] as $cell) {
+        $code = (is_array($cell) && isset($cell['leave_type']))
+              ? strtoupper(trim((string)$cell['leave_type'])) : '';
+        if ($code === '') { continue; }
+        $worth = (is_array($cell) && isset($cell['half']) && $cell['half'] !== '') ? 0.5 : 1.0;
+        $out[$code] = (isset($out[$code]) ? $out[$code] : 0.0) + $worth;
+    }
+    return $out;
+}
+
 function summaryLeaveCells($staffRow, $todayDay)
 {
     $out = array('taken' => 0.0, 'upcoming' => 0.0, 'total' => 0.0);

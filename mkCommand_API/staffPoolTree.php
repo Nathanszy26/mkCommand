@@ -383,6 +383,14 @@ class StaffPoolTree
                 'Fleet',
                 'Workshop',
             )),
+
+            /* Vincent Ng — Admin beside his own HR. He heads HR, so that
+             * line is his either way; it is named here as well so the grant
+             * says the whole of what he may see rather than half of it. */
+            array('person' => 'vincentng', 'comp_id' => 1, 'departments' => array(
+                'Admin',
+                'HR',
+            )),
         );
     }
 

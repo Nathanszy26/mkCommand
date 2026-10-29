@@ -647,6 +647,12 @@ function summaryStaffRows(array $people, array $attByDay, $leave, $performance, 
              * these say what and when. */
             'leaves'   => summaryLeaveEntries(isset($leaveBy[$key]) ? $leaveBy[$key] : null,
                                               $todayIso),
+            /* The month's leave per code, counted off the day map while it is
+             * still in hand. The day map itself is not stored — it is big and
+             * nothing renders it — but the EL / LWP mark needs HALF DAYS,
+             * which only it knows about, and the acknowledgement page reads
+             * this row hours later with no leaveAPI in reach. */
+            'leave_by_code' => summaryLeaveCodeTotals(isset($leaveBy[$key]) ? $leaveBy[$key] : null),
             'comp_recs' => isset($compBy[$key]) ? $compBy[$key] : array(),
             'comp'     => isset($compBy[$key]) ? count($compBy[$key]) : 0,
         );
@@ -1504,6 +1510,29 @@ if (!hash_equals(SUMMARY_CRON_KEY, $key)) {
 $dryRun = !empty($_GET['dry_run']);
 $force  = !empty($_GET['force']);
 
+/**
+ * rebuild=1 — REWRITE TODAY'S SNAPSHOTS, SEND NOTHING.
+ *
+ * The payload a person's app and acknowledgement page read is written once,
+ * when the mail goes out, and never looked at again. So a rule that changes
+ * during the day leaves every stored day behind it: the 29th of October was
+ * written at 09:25 counting whole dates, and no amount of correct code could
+ * make it say 2.5 EL afterwards, because the half day was never in it.
+ *
+ * dry_run cannot do this — it deliberately skips the save — and re-running the
+ * mail to fix a badge means mailing a hundred people twice. This writes the
+ * payload and nothing else.
+ *
+ * ONLY ROWS THAT ALREADY EXIST, AND ONLY UNACKNOWLEDGED ONES. A person with
+ * no row today was not mailed, and inventing one here would hand out a
+ * working acknowledgement link for a mail that was never sent. A person who
+ * has already acknowledged keeps what they acknowledged — their record is of
+ * what they were shown, and this is not entitled to rewrite it. The sent
+ * status, the response and the send time are carried over untouched, so a row
+ * still reads as the mail that was actually sent this morning.
+ */
+$rebuild = !empty($_GET['rebuild']);
+
 /* ---- which day ---- */
 $todayIso = isset($_GET['date']) ? trim((string)$_GET['date']) : date('Y-m-d');
 $d = DateTime::createFromFormat('Y-m-d', $todayIso);
@@ -1513,7 +1542,8 @@ if (!$d || $d->format('Y-m-d') !== $todayIso) {
 $yesterdayIso = date('Y-m-d', strtotime($todayIso . ' -1 day'));
 
 summaryLog('Staff Summary — ' . summaryDay($todayIso) . ' (' . $todayIso . ')'
-         . ($dryRun ? '   [DRY RUN — nothing will be sent]' : ''));
+         . ($dryRun ? '   [DRY RUN — nothing will be sent]' : '')
+         . ($rebuild && !$dryRun ? '   [REBUILD — snapshots rewritten, nothing sent]' : ''));
 summaryLog(str_repeat('-', 72));
 
 if ((int)date('w', strtotime($todayIso)) === 0 && !$force) {
@@ -1620,10 +1650,11 @@ try {
 }
 
 $now  = date('Y-m-d H:i:s');
-$sent = 0; $skipped = 0; $failed = 0;
+$sent = 0; $skipped = 0; $failed = 0; $rebuilt = 0;
 
 $doneStmt = $pdo->prepare(
-    'SELECT token, acked_datetime FROM mkPortal.staff_summary_notify
+    'SELECT token, acked_datetime, status, response, sent_datetime
+       FROM mkPortal.staff_summary_notify
       WHERE notify_date = :d AND person = :p AND comp_id = :c');
 
 $saveStmt = $pdo->prepare(
@@ -1737,6 +1768,39 @@ foreach ($recipients as $key => $recipient) {
         continue;
     }
 
+    /* The snapshot, rewritten in place — see rebuild=1 at the top. Nothing is
+     * sent and nothing but the table itself changes: the token, the sent
+     * status and the send time are the ones already in the row, so the link
+     * in somebody's inbox still opens and the row still records the mail that
+     * actually went this morning. */
+    if ($rebuild) {
+        if (!$existing) {
+            summaryLog(sprintf('  %-20s no row today — not created by a rebuild',
+                               $recipient['person']));
+            $skipped++;
+            continue;
+        }
+        $saveStmt->execute(array(
+            ':d' => $todayIso, ':p' => $recipient['person'], ':c' => SUMMARY_COMP_ID,
+            ':fullname' => $recipient['fullname'], ':role' => $recipient['role'],
+            ':intended' => $intended, ':sent_to' => $to,
+            ':payload'  => $payload,
+            ':late'     => $lateN,
+            ':leave'    => $leaveN,
+            ':comp'     => $compN,
+            ':items'    => count(summaryItemKeys($groups)),
+            ':token'    => $token,
+            ':status'   => $existing['status'],
+            ':response' => (string)$existing['response'],
+            ':sent_at'  => $existing['sent_datetime'],
+            ':now'      => $now, ':now2' => $now,
+        ));
+        $rebuilt++;
+        summaryLog(sprintf('  %-20s %3d staff, %3d flagged   -> snapshot rewritten',
+                           $recipient['person'], count($rows), $flagged));
+        continue;
+    }
+
     $result = ($to === '')
         ? array('ok' => false, 'response' => 'no email address on file')
         : summarySend($to, $subject, $html);
@@ -1768,9 +1832,12 @@ foreach ($recipients as $key => $recipient) {
 }
 
 summaryLog(str_repeat('-', 72));
-summaryLog(sprintf('%d sent, %d skipped (nothing flagged, already acknowledged, or dry run), %d failed',
-                   $sent, $skipped, $failed));
-if (SUMMARY_EMAIL_OVERRIDE !== '' && !$dryRun) {
+summaryLog($rebuild
+    ? sprintf('%d snapshots rewritten, %d skipped (nothing flagged, already acknowledged, '
+              . 'or no row today). Nothing was sent.', $rebuilt, $skipped)
+    : sprintf('%d sent, %d skipped (nothing flagged, already acknowledged, or dry run), %d failed',
+              $sent, $skipped, $failed));
+if (SUMMARY_EMAIL_OVERRIDE !== '' && !$dryRun && !$rebuild) {
     summaryLog('Every mail went to ' . SUMMARY_EMAIL_OVERRIDE
              . ' — SUMMARY_EMAIL_OVERRIDE is set. Empty it to mail the managers themselves.');
 }
