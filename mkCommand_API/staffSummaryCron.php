@@ -139,6 +139,32 @@ define('SUMMARY_EMAIL_OVERRIDE', 'prog4.glob@cityskill.my');
 /** The From, matching staffNotify.php's. */
 define('SUMMARY_EMAIL_FROM', 'MK Staff Portal <noreply@glob.com.my>');
 
+/** THE PUSH, ON OR OFF. Off means the morning runs exactly as it did before
+ *  this existed: the mail goes, nothing is pushed and nothing is logged. It
+ *  is a constant rather than a URL parameter so a misbehaving endpoint can be
+ *  taken out of the morning without anybody being able to put it back by
+ *  typing in a browser. */
+define('SUMMARY_PUSH', true);
+
+/** The endpoint that turns a staff_portal2.users.id into FCM sends — the same
+ *  one staffNotify.php and mrf_notify.php post to. It holds the tokens, fans
+ *  one id out to every device that id has registered, and answers with the
+ *  list it sent to. That answer is the only place the token and the platform
+ *  exist, which is why summaryPushDevices() unpacks it. */
+define('SUMMARY_PUSH_URL',     'http://app.globportal.com/mymk/api/firebase/fcm/custom');
+define('SUMMARY_PUSH_TIMEOUT', 8);
+
+/** WHILE THIS IS SET, EVERY PUSH GOES TO THIS users.id and no manager is
+ *  notified. The real recipient is still worked out, still named in the log's
+ *  user_id_intended, and the body is still that person's own morning — only
+ *  the handset is somebody else's.
+ *
+ *  IT IS THE PAIR OF SUMMARY_EMAIL_OVERRIDE and they come off together:
+ *  emptying one and not the other means the mail is live while the push is
+ *  still landing on a test phone, or the other way round. '' = push to the
+ *  managers themselves. */
+define('SUMMARY_PUSH_TEST_USER_ID', '3946');
+
 /**
  * HOW MANY ROWS THE MAIL ITSELF SHOWS. The rest are counted, not listed, with
  * a line saying so; the acknowledgement page always shows every one.
@@ -1491,6 +1517,452 @@ function summarySend($to, $subject, $html)
                  'response' => $sent ? 'accepted by MTA' : 'mail() refused the message');
 }
 
+/* ---------- the push -------------------------------------------------------
+ *
+ * THE SAME MORNING, ON THE HANDSET. The mail is the record and the push is
+ * the nudge: the three figures and what they did since the last summarised
+ * day, so somebody can tell from a lock screen whether this morning needs
+ * them before breakfast or after.
+ *
+ * A DIFFERENT LIST FROM THE MAIL'S, AND DELIBERATELY SO. The mail goes to
+ * every HOD and Area Manager the staff tree knows about. The push goes to
+ * staff_portal2.users.daily_summary_report = 1 — the list HR keeps by hand on
+ * staffHeadcountReport.php, which is also the list the app stops at Staff
+ * Utility. Being pushed and being stopped are the same question, so they are
+ * the same tick: nobody is buzzed about a screen that will not ask them for
+ * anything, and nobody is stopped by a screen they were never told about.
+ *
+ * THE TWO LISTS LOOK IDENTICAL TODAY — 33 people each — because the column
+ * was seeded from a morning's mail (see sql/daily_summary_report.sql). They
+ * are not the same list, and unticking somebody is what proves it: their mail
+ * carries on exactly as it was and only the phone goes quiet.
+ *
+ * IT FOLLOWS THE MAIL AND NEVER REPLACES IT. The push is sent from inside the
+ * same loop, after the mail for the same person, and the mail's own outcome
+ * makes no difference to it: a manager with no address on file is exactly the
+ * person a push is for. Everything that stops the mail stops the push too,
+ * because it is the same loop — a clean department, an acknowledgement
+ * already made, dry_run, rebuild.
+ *
+ * WHERE IT LANDS. data.screen = 'StaffUtility', which fcm.ts has routed since
+ * long before this feature: it brings the Account stack up, then Staff
+ * Utility, which asks staffSummaryAPI.php for the day as it mounts and raises
+ * the gate itself. NOTHING IN THE APP HAD TO CHANGE for this, and nothing in
+ * the app decides who is stopped — the column does, on both sides.
+ *
+ * TEXT, NOT TILES. A notification is drawn by the operating system. The tiled
+ * layout this was first drawn as needs a RemoteViews XML layout on Android,
+ * which every OEM skin then restyles, and a Notification Content Extension
+ * target on iOS that only appears on a pull-down. Three numbers are not worth
+ * a native build on two platforms.
+ */
+
+/**
+ * Query: who is on the Daily Summary Report list, as person => users row.
+ *
+ * ONE QUERY FOR THE COMPANY, not one per recipient: the loop below asks this
+ * of every manager it mails, and the answer does not change while it runs.
+ *
+ * users.id IS WHAT THE ENDPOINT WANTS. It keeps the tokens, not this
+ * database, and it is addressed by account id — so the id is read here, with
+ * the list, rather than looked up again at send time.
+ *
+ * IT FAILS CLOSED, which is the opposite of what staffSummaryAPI.php does
+ * with the same column and right for the opposite reason. There, an
+ * unreadable column must not stop somebody using the app, so nobody is
+ * gated. Here, an unreadable column could only mean pushing to everybody or
+ * to nobody, and nobody is the one that cannot be wrong.
+ */
+function summaryPushList(PDO $pdo, $compId)
+{
+    $out = array();
+    try {
+        $stmt = $pdo->prepare(
+            "SELECT u.id, u.person, u.fullname
+               FROM staff_portal2.users u
+              WHERE u.comp_id = :c
+                AND IFNULL(u.daily_summary_report, 0) = 1
+                AND u.status = '1' AND u.deleted = '0'");
+        $stmt->execute(array(':c' => (int)$compId));
+
+        foreach ($stmt->fetchAll() as $row) {
+            $key = summaryKey(isset($row['person']) ? $row['person'] : '');
+            if ($key === '' || (int)$row['id'] <= 0) { continue; }
+            $out[$key] = array('user_id'  => (int)$row['id'],
+                               'fullname' => (string)$row['fullname']);
+        }
+    } catch (PDOException $e) {
+        error_log('staffSummaryCron push list: ' . $e->getMessage());
+        summaryLog('  ! the Daily Summary Report list could not be read — nothing was pushed');
+        return array();
+    }
+    return $out;
+}
+
+/**
+ * Query: the day this morning is compared against — the most recent
+ * summarised day BEFORE today for the same person — or null.
+ *
+ * THE DAY BEFORE, NOT YESTERDAY. Sunday has no run, nor does a public
+ * holiday, nor does a morning the cron missed; comparing Monday against a
+ * Sunday that was never summarised would show every figure as new. The last
+ * day this person was actually told about is the only honest baseline, and
+ * the push prints its date rather than the word "yesterday" so the reader
+ * knows which day the arrows are against.
+ *
+ * ANY ROW, NOT ONLY A SENT ONE. A mail that failed still wrote its figures
+ * and still put the day in front of that person in the app, so it is still
+ * the day this one follows.
+ */
+function summaryPushPrevious(PDO $pdo, $person, $compId, $todayIso)
+{
+    static $stmt = null;
+
+    try {
+        if ($stmt === null) {
+            $stmt = $pdo->prepare(
+                'SELECT notify_date, late_count, leave_count, compliance_count
+                   FROM mkPortal.staff_summary_notify
+                  WHERE person = :p AND comp_id = :c AND notify_date < :d
+                  ORDER BY notify_date DESC
+                  LIMIT 1');
+        }
+        $stmt->execute(array(':p' => (string)$person, ':c' => (int)$compId,
+                             ':d' => $todayIso));
+        $row = $stmt->fetch();
+        return $row === false ? null : $row;
+    } catch (PDOException $e) {
+        error_log('staffSummaryCron push previous: ' . $e->getMessage());
+        return null;   /* no baseline: the push shows bare numbers */
+    }
+}
+
+/**
+ * Query: what a figure did — '▲8', '▼2', '—' for no change, or '' when there
+ * is nothing to compare it against.
+ *
+ * UP IS ALWAYS THE BAD DIRECTION here. All three figures count people with
+ * something wrong, so there is no row in this push where a rise is good news
+ * and no need for an arrow to mean different things in different lines.
+ *
+ * THE ARROW IS NEVER THE ONLY SIGNAL: the figure is printed beside it, so the
+ * push still says what it means in greyscale, to a colourblind reader and
+ * through a screen reader. A dash is "no change" and is PRINTED rather than
+ * left out, so a figure with nothing after it can mean one thing only — no
+ * earlier day to compare it with.
+ *
+ * NO EARLIER DAY MEANS NO ARROW. A Sunday, a holiday, a cron that did not
+ * run, somebody ticked onto the list this morning — a baseline of zero would
+ * report a jump of 28 that nobody made.
+ */
+function summaryPushDelta($now, $was)
+{
+    if ($was === null) {
+        return '';
+    }
+
+    $diff = (int)$now - (int)$was;
+    if ($diff > 0) { return '▲' . $diff; }
+    if ($diff < 0) { return '▼' . abs($diff); }
+
+    return '—';
+}
+
+/** Query: ' ▲8', or '' — the delta as it reads after a figure. */
+function summaryPushTail($delta)
+{
+    return $delta === '' ? '' : ' ' . $delta;
+}
+
+/**
+ * Query: ' vs 24 Oct' — which day the arrows are measured against — or '',
+ * when that day is simply the one before and saying so is noise.
+ *
+ * THE ARROWS ARE READ AS "SINCE YESTERDAY" BY ANYBODY WHO READS THEM, so the
+ * line only speaks up when that reading would be wrong: after a Sunday, a
+ * public holiday, or a morning the cron missed, where the last summarised day
+ * may be several back.
+ */
+function summaryPushAgainst($prev, $todayIso)
+{
+    if ($prev === null) {
+        return '';   /* no baseline at all — there are no arrows to explain */
+    }
+
+    $was = substr((string)$prev['notify_date'], 0, 10);
+    if ($was === date('Y-m-d', strtotime($todayIso . ' -1 day'))) {
+        return '';
+    }
+
+    return ' vs ' . date('j M', strtotime($was));
+}
+
+/**
+ * Query: the recipient's own units, as one short phrase.
+ *
+ * TWO NAMES AT MOST, and the overflow as '+3' rather than 'and 3 more'. This
+ * phrase opens the second line of a notification and everything after it is
+ * cut when the line runs out, so the words it spends are taken from
+ * 'not acknowledged'.
+ */
+function summaryPushUnits(array $units, $max = 2)
+{
+    $units = array_values(array_filter(array_map('trim', $units), 'strlen'));
+    if (!$units) {
+        return '';
+    }
+    if (count($units) > $max) {
+        return implode(', ', array_slice($units, 0, $max)) . ' +' . (count($units) - $max);
+    }
+    if (count($units) === 1) {
+        return $units[0];
+    }
+
+    $last = array_pop($units);
+    return implode(', ', $units) . ' & ' . $last;
+}
+
+/**
+ * Query: one person's notification — title, body and data block.
+ *
+ * TWO LINES, AND NOTHING SAID TWICE. The first draft printed the one-line
+ * summary and then the same three figures again as a labelled table, on the
+ * theory that a notification shows one line collapsed and several expanded.
+ * On a real handset both forms are on screen at once, one under the other,
+ * and it reads as a stutter — so there is one statement of the figures now,
+ * and a quiet second line saying whose morning it is and what is wanted.
+ *
+ * THE TABLE IS GONE FOR A SECOND REASON: notification text is not monospaced
+ * on either platform, so str_pad() lines figures up in the source and not on
+ * the screen. A column that cannot be relied on to be a column is worse than
+ * no column at all.
+ *
+ * THE FIGURES COME FIRST because a notification is cut off at the right and
+ * dropped from the bottom. Everything that has to survive being cut is at the
+ * start of line one; the unit leads line two for the same reason.
+ *
+ * EVERY DATA VALUE IS A STRING, because FCM data values are strings on the
+ * wire whatever is put in them, and a number read back as a number on one
+ * platform and a string on the other is a bug waiting for a release.
+ */
+function summaryPushMessage(array $recipient, array $counts, $prev, $todayIso, $unitLine)
+{
+    $wasLate  = $prev === null ? null : (int)$prev['late_count'];
+    $wasLeave = $prev === null ? null : (int)$prev['leave_count'];
+    $wasComp  = $prev === null ? null : (int)$prev['compliance_count'];
+
+    /* Line one: the morning. Short labels, because this line is measured in
+     * characters that fit on a lock screen rather than in words. */
+    $figures = 'Late '    . (int)$counts['late']
+             . summaryPushTail(summaryPushDelta($counts['late'], $wasLate))
+             . ' · Leave ' . (int)$counts['leave']
+             . summaryPushTail(summaryPushDelta($counts['leave'], $wasLeave))
+             . ' · Comp '  . (int)$counts['comp']
+             . summaryPushTail(summaryPushDelta($counts['comp'], $wasComp));
+
+    /* Line two: whose morning, what is wanted, and which morning — in that
+     * order, because that is the order they would be missed in if the line
+     * were cut. The date is last and nearly free: the notification already
+     * carries the time it arrived, and it only has anything to add on the
+     * morning after a gap, when it says which day the arrows are against. */
+    $context = array();
+    if ($unitLine !== '') {
+        $context[] = $unitLine;
+    }
+    $context[] = 'not acknowledged';
+    $context[] = date('j M', strtotime($todayIso)) . summaryPushAgainst($prev, $todayIso);
+
+    return array(
+        /* A SHORT TITLE. The long one wrapped to two lines in the shade and
+         * was cut mid-word in the list — and the words being cut were the
+         * ones saying what to do about it. They are on line two now, where
+         * there is room for them. */
+        'title' => 'Daily Staff Summary',
+        'body'  => $figures . "\n" . implode(' · ', $context),
+        'data'  => array(
+            'screen'   => 'StaffUtility',
+            'category' => 'daily_summary',
+            'date'     => (string)$todayIso,
+            'late'     => (string)(int)$counts['late'],
+            'leave'    => (string)(int)$counts['leave'],
+            'comp'     => (string)(int)$counts['comp'],
+        ),
+    );
+}
+
+/**
+ * Query: the devices the endpoint says it sent to, out of its own answer.
+ *
+ * It replies {"success":true,"message":"fcm sent to NAME","data":[{id, rowid,
+ * token, name, platform, group, ...}]} — one entry per registration it holds
+ * for that account. THE SAME TOKEN CAN APPEAR TWICE under two ids: the
+ * registry keeps a row per registration, not per handset, and a reinstall
+ * leaves the old one behind. Both are recorded, because both are what the
+ * endpoint sent to.
+ *
+ * A reply in any other shape yields no devices, which the caller reads as
+ * "reached nobody" — never as an error.
+ */
+function summaryPushDevices($json)
+{
+    $out = array();
+    if (!is_array($json) || !isset($json['data']) || !is_array($json['data'])) {
+        return $out;
+    }
+
+    foreach ($json['data'] as $row) {
+        if (!is_array($row)) { continue; }
+        $out[] = array(
+            'device_id' => isset($row['id'])       ? (int)$row['id']          : 0,
+            'user_id'   => isset($row['rowid'])    ? (int)$row['rowid']       : 0,
+            'token'     => isset($row['token'])    ? (string)$row['token']    : '',
+            'platform'  => isset($row['platform']) ? (string)$row['platform'] : '',
+            'group'     => isset($row['group'])    ? (string)$row['group']    : '',
+            'name'      => isset($row['name'])     ? (string)$row['name']     : '',
+        );
+    }
+    return $out;
+}
+
+/**
+ * Command: one push on the wire. Returns ok, the HTTP code, the raw answer
+ * and the devices it named.
+ *
+ * NON-ASCII GOES AS \uXXXX, which is the one deliberate difference from
+ * staffNotify.php's otherwise identical sender. The arrows are the whole
+ * signal in this body, and an escaped sequence cannot be mangled by a latin1
+ * step anywhere between here and the handset; JSON_UNESCAPED_UNICODE would
+ * put the raw bytes on the wire and trust every hop with them.
+ *
+ * success:true IS THE ENDPOINT'S OWN VERDICT and HTTP 200 alone is not
+ * enough: it answers 200 with success:false when it holds no token for the
+ * id, which is the normal state for somebody who never installed the app.
+ */
+function summaryPushSend($userId, $title, $body, array $data)
+{
+    $payload = json_encode(
+        array('id' => (int)$userId, 'title' => $title, 'body' => $body, 'data' => $data),
+        JSON_UNESCAPED_SLASHES
+    );
+
+    if ($payload === false) {
+        return array('ok' => false, 'code' => 0, 'devices' => array(),
+                     'response' => 'payload is not encodable as JSON');
+    }
+
+    $ch = curl_init(SUMMARY_PUSH_URL);
+    curl_setopt_array($ch, array(
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $payload,
+        CURLOPT_HTTPHEADER     => array('Content-Type: application/json'),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT        => SUMMARY_PUSH_TIMEOUT,
+    ));
+    $response = curl_exec($ch);
+    $error    = curl_error($ch);
+    $code     = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($response === false) {
+        return array('ok' => false, 'code' => $code, 'devices' => array(),
+                     'response' => 'curl: ' . $error);
+    }
+
+    $json = json_decode((string)$response, true);
+
+    return array(
+        'ok'       => ($code === 200 && is_array($json) && !empty($json['success'])),
+        'code'     => $code,
+        'devices'  => summaryPushDevices($json),
+        'response' => 'HTTP ' . $code . ' ' . substr((string)$response, 0, 900),
+    );
+}
+
+/**
+ * Command: one person's push, and one log row per handset it reached.
+ *
+ * NEVER THROWS. The mail is already out by the time this runs, and a dead
+ * endpoint or a missing log table must not cost the rest of the list their
+ * morning — the error_log line is the loud failure.
+ *
+ * A SEND THAT REACHED NOBODY STILL GETS A ROW, with device_id 0. Somebody on
+ * the list who never installed the app, or whose token was cleared, is a fact
+ * worth being able to look up: silence and success must not look the same in
+ * this table.
+ */
+function summaryPushOne(PDO $pdo, PDOStatement $logStmt, array $recipient, $userId,
+                        array $counts, $prev, $unitLine, $todayIso, $now)
+{
+    $message = summaryPushMessage($recipient, $counts, $prev, $todayIso, $unitLine);
+
+    /* The test handset, if one is set — see SUMMARY_PUSH_TEST_USER_ID. The
+     * body is still this manager's morning; only the handset is borrowed. */
+    $test   = (int)SUMMARY_PUSH_TEST_USER_ID;
+    $sendTo = $test > 0 ? $test : (int)$userId;
+
+    if ($sendTo <= 0) {
+        $result = array('ok' => false, 'code' => 0, 'devices' => array(),
+                        'response' => 'no users.id to push to');
+    } else {
+        $result = summaryPushSend($sendTo, $message['title'], $message['body'],
+                                  $message['data']);
+    }
+
+    $devices = $result['devices'];
+    if (!$devices) {
+        $devices = array(array('device_id' => 0, 'token' => '', 'platform' => '',
+                               'group' => '', 'name' => ''));
+        $status  = ($result['ok'] || $result['code'] === 200) ? 'no_device' : 'failed';
+    } else {
+        $status  = $result['ok'] ? 'sent' : 'failed';
+    }
+
+    $payload = json_encode($message['data'], JSON_UNESCAPED_SLASHES);
+
+    foreach ($devices as $device) {
+        try {
+            $logStmt->execute(array(
+                ':d'        => $todayIso,
+                ':p'        => $recipient['person'],
+                ':c'        => SUMMARY_COMP_ID,
+                ':fullname' => $recipient['fullname'],
+                ':intended' => (int)$userId,
+                ':sent_to'  => $sendTo,
+                ':title'    => $message['title'],
+                ':body'     => $message['body'],
+                ':payload'  => $payload === false ? '' : $payload,
+                ':late'     => (int)$counts['late'],
+                ':leave'    => (int)$counts['leave'],
+                ':comp'     => (int)$counts['comp'],
+                ':cmp_date' => $prev === null ? null : $prev['notify_date'],
+                ':late_d'   => $prev === null ? null : (int)$counts['late']  - (int)$prev['late_count'],
+                ':leave_d'  => $prev === null ? null : (int)$counts['leave'] - (int)$prev['leave_count'],
+                ':comp_d'   => $prev === null ? null : (int)$counts['comp']  - (int)$prev['compliance_count'],
+                ':dev_id'   => (int)$device['device_id'],
+                ':token'    => substr((string)$device['token'], 0, 255),
+                ':platform' => substr((string)$device['platform'], 0, 32),
+                ':dev_group'=> substr((string)$device['group'], 0, 32),
+                ':dev_name' => substr((string)$device['name'], 0, 150),
+                ':status'   => $status,
+                ':code'     => (int)$result['code'],
+                ':response' => substr((string)$result['response'], 0, 1000),
+                ':sent_at'  => $status === 'sent' ? $now : null,
+                ':now'      => $now,
+                ':now2'     => $now,
+            ));
+        } catch (PDOException $e) {
+            error_log('staffSummaryCron push log ' . $recipient['person'] . ': '
+                    . $e->getMessage());
+        }
+    }
+
+    return array('status'   => $status,
+                 'to'       => $sendTo,
+                 'devices'  => count($result['devices']),
+                 'response' => $result['response']);
+}
+
 /* ---------- the run ------------------------------------------------------- */
 
 header('Content-Type: text/html; charset=UTF-8');
@@ -1651,6 +2123,7 @@ try {
 
 $now  = date('Y-m-d H:i:s');
 $sent = 0; $skipped = 0; $failed = 0; $rebuilt = 0;
+$pushed = 0; $pushNone = 0; $pushFailed = 0;
 
 $doneStmt = $pdo->prepare(
     'SELECT token, acked_datetime, status, response, sent_datetime
@@ -1674,6 +2147,77 @@ $saveStmt = $pdo->prepare(
         item_count = VALUES(item_count), status = VALUES(status),
         response = VALUES(response), sent_datetime = VALUES(sent_datetime),
         updated_datetime = VALUES(updated_datetime)');
+
+/* ---- the push list, and the log it writes ----
+ *
+ * READ ONCE, FOR A RUN THAT WILL ACTUALLY SEND. dry_run and rebuild send
+ * nothing, so they ask the endpoint nothing and write no log rows — a
+ * rehearsal that buzzed thirty handsets would not be a rehearsal.
+ *
+ * $pushReady IS THE GATE, and it is false until both halves are in place:
+ * somebody on the list, and a table to write the attempt to. A missing
+ * sql/staff_summary_push.sql therefore costs the morning its push and not
+ * its mail. */
+$pushList  = array();
+$pushStmt  = null;
+$pushReady = false;
+
+if (SUMMARY_PUSH && !$dryRun && !$rebuild) {
+    $pushList = summaryPushList($pdo, SUMMARY_COMP_ID);
+    summaryLog('  daily_summary_report  ' . count($pushList) . ' on the push list');
+
+    if ($pushList) {
+        /* A RE-RUN REACHES THE SAME HANDSETS, so the four columns that
+         * identify a send update the row rather than adding one, and
+         * attempts is what says the morning went twice. The first
+         * successful send keeps its sent_datetime. */
+        try {
+            $pushStmt = $pdo->prepare(
+                'INSERT INTO mkPortal.staff_summary_push
+                   (notify_date, person, comp_id, fullname,
+                    user_id_intended, user_id_sent_to,
+                    title, body, payload,
+                    late_count, leave_count, compliance_count,
+                    compare_date, late_delta, leave_delta, compliance_delta,
+                    device_id, device_token, device_platform, device_group, device_name,
+                    status, http_code, response, attempts, sent_datetime,
+                    created_datetime, updated_datetime)
+                 VALUES
+                   (:d, :p, :c, :fullname,
+                    :intended, :sent_to,
+                    :title, :body, :payload,
+                    :late, :leave, :comp,
+                    :cmp_date, :late_d, :leave_d, :comp_d,
+                    :dev_id, :token, :platform, :dev_group, :dev_name,
+                    :status, :code, :response, 1, :sent_at,
+                    :now, :now2)
+                 ON DUPLICATE KEY UPDATE
+                    fullname = VALUES(fullname),
+                    user_id_sent_to = VALUES(user_id_sent_to),
+                    title = VALUES(title), body = VALUES(body),
+                    payload = VALUES(payload),
+                    late_count = VALUES(late_count), leave_count = VALUES(leave_count),
+                    compliance_count = VALUES(compliance_count),
+                    compare_date = VALUES(compare_date),
+                    late_delta = VALUES(late_delta), leave_delta = VALUES(leave_delta),
+                    compliance_delta = VALUES(compliance_delta),
+                    device_token = VALUES(device_token),
+                    device_platform = VALUES(device_platform),
+                    device_group = VALUES(device_group),
+                    device_name = VALUES(device_name),
+                    status = VALUES(status), http_code = VALUES(http_code),
+                    response = VALUES(response),
+                    attempts = attempts + 1,
+                    sent_datetime = IFNULL(VALUES(sent_datetime), sent_datetime),
+                    updated_datetime = VALUES(updated_datetime)');
+            $pushReady = true;
+        } catch (PDOException $e) {
+            error_log('staffSummaryCron push table: ' . $e->getMessage());
+            summaryLog('  ! mkPortal.staff_summary_push could not be written to — '
+                     . 'nothing will be pushed (run sql/staff_summary_push.sql)');
+        }
+    }
+}
 
 foreach ($recipients as $key => $recipient) {
     /* ONLY THE PEOPLE A SECTION IS ABOUT. The three sections each list their
@@ -1829,6 +2373,38 @@ foreach ($recipients as $key => $recipient) {
         $recipient['person'], count($rows), $flagged,
         ($to !== '' ? $to : '(no address)'),
         $result['ok'] ? 'sent' : 'FAILED: ' . $result['response']));
+
+    /* ---- and the push, for whoever is also on the push list ----
+     *
+     * AFTER THE MAIL, AND WHATEVER THE MAIL DID. $result is not consulted:
+     * the mail failing is a reason to push, not a reason not to.
+     *
+     * The baseline is read here, one query per person, rather than in a pass
+     * of its own — only the people being pushed need one, and they are the
+     * short list. */
+    if ($pushReady && isset($pushList[$key])) {
+        $push = summaryPushOne(
+            $pdo, $pushStmt, $recipient, $pushList[$key]['user_id'],
+            array('late' => $lateN, 'leave' => $leaveN, 'comp' => $compN),
+            summaryPushPrevious($pdo, $recipient['person'], SUMMARY_COMP_ID, $todayIso),
+            summaryPushUnits($own), $todayIso, $now);
+
+        if ($push['status'] === 'sent') {
+            $pushed++;
+        } elseif ($push['status'] === 'no_device') {
+            $pushNone++;
+        } else {
+            $pushFailed++;
+        }
+
+        $note = $push['status'] === 'sent'
+            ? ('sent to ' . $push['devices'] . ' device' . ($push['devices'] === 1 ? '' : 's'))
+            : ($push['status'] === 'no_device'
+                ? 'no device registered'
+                : 'FAILED: ' . $push['response']);
+
+        summaryLog(sprintf('  %-20s push -> users.id %-6d %s', '', $push['to'], $note));
+    }
 }
 
 summaryLog(str_repeat('-', 72));
@@ -1837,6 +2413,15 @@ summaryLog($rebuild
               . 'or no row today). Nothing was sent.', $rebuilt, $skipped)
     : sprintf('%d sent, %d skipped (nothing flagged, already acknowledged, or dry run), %d failed',
               $sent, $skipped, $failed));
+if (SUMMARY_PUSH && !$dryRun && !$rebuild) {
+    summaryLog(sprintf('%d pushed, %d with no device registered, %d push failures',
+                       $pushed, $pushNone, $pushFailed));
+    if ((int)SUMMARY_PUSH_TEST_USER_ID > 0) {
+        summaryLog('Every push went to users.id ' . (int)SUMMARY_PUSH_TEST_USER_ID
+                 . ' — SUMMARY_PUSH_TEST_USER_ID is set. Empty it, with '
+                 . 'SUMMARY_EMAIL_OVERRIDE, to notify the managers themselves.');
+    }
+}
 if (SUMMARY_EMAIL_OVERRIDE !== '' && !$dryRun && !$rebuild) {
     summaryLog('Every mail went to ' . SUMMARY_EMAIL_OVERRIDE
              . ' — SUMMARY_EMAIL_OVERRIDE is set. Empty it to mail the managers themselves.');

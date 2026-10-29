@@ -916,6 +916,25 @@ try {
 
         $done = !empty($row['acked_datetime']);
 
+        /* ASKING FOR AN UNACKNOWLEDGED DAY IS OPENING IT. This call is what
+         * the app makes as Staff Utility loads, and the answer it gets is
+         * what it puts on the screen a moment later — so the first one of
+         * these is the morning's first look, and it is stamped here rather
+         * than waiting for a client to volunteer action=open (which the app
+         * never did, leaving opened_datetime null on every mobile day).
+         *
+         * ONLY WHILE THE DAY IS OPEN, so re-reading an acknowledged morning
+         * is not an opening; and only once, because summaryAckOpened() will
+         * not overwrite a time that is already there. The local copy is
+         * updated so the response says what the row now says.
+         */
+        if (!$done && empty($row['opened_datetime'])) {
+            $openedAs = $fromMobile ? 'mobile' : 'web';
+            summaryAckOpened($pdo, $row, $openedAs, $who['ip'], $who['agent']);
+            $row['opened_datetime'] = date('Y-m-d H:i:s');
+            $row['opened_platform'] = summaryPlatform($openedAs);
+        }
+
         apiOut(array(
             'success'     => true,
             'action'      => 'mine',
@@ -990,6 +1009,18 @@ try {
         $mode  = strtolower((string)apiIn('mode', 'replace'));
         $replace = ($mode !== 'add');
 
+        /* commit=0 — "this is where I am up to", not "I am done".
+         *
+         * A CLIENT THAT TICKS A BOX AT A TIME sends each change as it is
+         * made, so the log carries the minute each section was read rather
+         * than three rows sharing the second the button was pressed. Ticking
+         * the last box must NOT finish the day in that mode: the button is
+         * the act, and it is the call that leaves commit alone.
+         *
+         * DEFAULT 1, so every client written before this reads exactly as it
+         * did. */
+        $commit = ((string)apiIn('commit', '1') !== '0');
+
         /* Anything sent that is not a real section is dropped rather than
          * refused, exactly as the page does — but the caller is told, because
          * a client sending 'compliance' instead of 'comp' should find out
@@ -1000,7 +1031,7 @@ try {
         }
 
         $res = summaryAckWrite($pdo, $row, $want, $items, $platform,
-                               $replace, $who['ip'], $who['agent']);
+                               $replace, $who['ip'], $who['agent'], $commit);
 
         /* Re-read, so the answer carries the row as it now stands — and so
          * that a day another platform completed a moment ago reports that
@@ -1016,6 +1047,11 @@ try {
             /* THE ANSWER THE CLIENT ACTUALLY NEEDS: is the day done, and if
              * not, what is left. */
             'complete'    => $res['complete'],
+            /* Every box is ticked — which is not the same as acknowledged
+             * when commit=0 was sent, and is the field such a client uses to
+             * enable its own button. */
+            'all_ticked'  => $res['all_ticked'],
+            'committed'   => $commit,
             'outstanding' => array_keys(array_diff_key($want, $res['ticked'])),
             'ticked'      => array_keys($res['ticked']),
             'items'       => array_keys($want),

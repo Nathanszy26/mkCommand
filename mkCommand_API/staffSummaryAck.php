@@ -549,6 +549,37 @@ try {
     $agent = isset($_SERVER['HTTP_USER_AGENT']) ? (string)$_SERVER['HTTP_USER_AGENT'] : '';
     $ip    = isset($_SERVER['REMOTE_ADDR']) ? (string)$_SERVER['REMOTE_ADDR'] : '';
 
+    /* ---- a tick, as it is made ----
+     *
+     * THE PAGE REPORTS EACH BOX AS IT IS PRESSED, so the log holds the minute
+     * each section was read instead of three rows sharing the second
+     * Acknowledge was pressed. The answer is JSON and the page does not
+     * reload; the form below is still what acknowledges.
+     *
+     * commit=false is the whole of the difference: ticking the last box here
+     * records the tick and leaves the day open, waiting for the button.
+     *
+     * IT NEEDS NO JAVASCRIPT TO WORK. A browser that runs none of this sends
+     * the form at the end exactly as it always did, and the log reads as one
+     * instant for that person — which is the truth about how they answered.
+     */
+    if (!$done && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['tick_only'])) {
+        $posted = isset($_POST['items']) && is_array($_POST['items'])
+                ? $_POST['items'] : array();
+
+        $res = summaryAckWrite($pdo, $row, $want, $posted, 'web', true,
+                               $ip, $agent, false);
+
+        header('Content-Type: application/json; charset=UTF-8');
+        echo json_encode(array(
+            'success'    => true,
+            'ticked'     => array_keys($res['ticked']),
+            'all_ticked' => $res['all_ticked'],
+            'already'    => $res['already'],
+        ), JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
     /* ---- a submitted form ---- */
     /* POST from this page, OR GET from the one in the email. The mail's form
      * has to be a GET — a mail client that submits at all does it by opening
@@ -709,7 +740,21 @@ try {
            . 'left.textContent=short===0?(b.length?"All ticked.":"Nothing to tick."):'
            . '(short+" of "+b.length+" not ticked yet.");'
            . 'go.disabled=short>0;}'
-           . 'b.forEach(function(x){x.addEventListener("change",sync);});'
+           /* Tell the server which boxes are ticked, every time one
+            * changes, so the record carries the time of each. It is a
+            * report and not a request: the page does not wait for it, does
+            * not read the answer and does nothing differently if it fails,
+            * because the form at the end is what actually counts. */
+           . 'var tok=document.querySelector(\'input[name="t"]\'),'
+           . 'busy=false,again=false;'
+           . 'function report(){if(busy||!tok){again=!!tok;return;}busy=true;'
+           . 'var d=new FormData();d.append("t",tok.value);d.append("tick_only","1");'
+           . 'b.forEach(function(x){if(x.checked)d.append("items[]",x.value);});'
+           . 'fetch(location.pathname,{method:"POST",body:d,credentials:"same-origin"})'
+           . '.catch(function(){}).then(function(){busy=false;'
+           . 'if(again){again=false;report();}});}'
+           . 'b.forEach(function(x){x.addEventListener("change",function(){'
+           . 'sync();report();});});'
            . 'sync();'
            /* Land on the first unticked section after a short submission, so
             * the outline is on screen rather than somewhere below the fold. */

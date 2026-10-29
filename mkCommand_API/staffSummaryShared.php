@@ -745,19 +745,33 @@ function summaryAckComplete(array $want, array $ticked, $submitted)
  *                from the mail, where a link can only ever say yes and
  *                arriving twice must not undo anything.
  *
+ * $commit true   the caller is ANSWERING: ticking the last box finishes the
+ *                day and stamps acked_datetime.
+ *         false  the caller is only SAYING WHERE THEY ARE UP TO. The ticks
+ *                are stored and logged with the time each one happened, and
+ *                the day stays open however many of them there are — the
+ *                Acknowledge button is still the act of acknowledging.
+ *
+ * THAT DISTINCTION IS WHY A MORNING'S LOG USED TO READ AS ONE INSTANT. The
+ * app and the page both held the ticks in the browser and sent all three with
+ * the press, so three ticks and the acknowledgement shared a timestamp to the
+ * second and "how long did they spend on it" had no answer. A client that
+ * posts each change with $commit false gets a real sequence; one that still
+ * posts everything at the end behaves exactly as it did.
+ *
  * IT CANNOT UN-ACKNOWLEDGE. The UPDATE carries `acked_datetime IS NULL`, so a
  * late submission against an already-acknowledged day changes nothing and says
  * so with 'already' — including when two platforms arrive at once.
  */
 function summaryAckWrite(PDO $pdo, array $row, array $want, array $ticks,
-                         $platform, $replace, $ip = '', $agent = '')
+                         $platform, $replace, $ip = '', $agent = '', $commit = true)
 {
     $platform = summaryPlatform($platform);
     $before   = summaryTickedSoFar($row['acked_items'], $want);
 
     if (!empty($row['acked_datetime'])) {
-        return array('ticked' => $before, 'complete' => true, 'added' => array(),
-                     'removed' => array(), 'already' => true);
+        return array('ticked' => $before, 'complete' => true, 'all_ticked' => true,
+                     'added' => array(), 'removed' => array(), 'already' => true);
     }
 
     /* What is being asked for, filtered to what exists. */
@@ -770,8 +784,12 @@ function summaryAckWrite(PDO $pdo, array $row, array $want, array $ticks,
     $added   = array_keys(array_diff_key($after, $before));
     $removed = array_keys(array_diff_key($before, $after));
 
-    $complete = summaryAckComplete($want, $after, true);
-    $now      = date('Y-m-d H:i:s');
+    /* TICKED AND ACKNOWLEDGED ARE TWO DIFFERENT FACTS once a client reports
+     * its ticks as it goes: every box can be ticked for several minutes
+     * before anybody presses the button. The caller is told both. */
+    $allTicked = summaryAckComplete($want, $after, true);
+    $complete  = $allTicked && $commit;
+    $now       = date('Y-m-d H:i:s');
 
     $sql = 'UPDATE mkPortal.staff_summary_notify
                SET acked_items = :items,
@@ -804,7 +822,8 @@ function summaryAckWrite(PDO $pdo, array $row, array $want, array $ticks,
         $got = $fresh->fetch();
         if ($got && !empty($got['acked_datetime'])) {
             return array('ticked' => summaryTickedSoFar($got['acked_items'], $want),
-                         'complete' => true, 'added' => array(), 'removed' => array(),
+                         'complete' => true, 'all_ticked' => true,
+                         'added' => array(), 'removed' => array(),
                          'already' => true);
         }
     }
@@ -813,7 +832,8 @@ function summaryAckWrite(PDO $pdo, array $row, array $want, array $ticks,
     foreach ($removed as $k) { summaryAckEvent($pdo, $row, 'untick', $k, $platform, $ip, $agent); }
     if ($complete)           { summaryAckEvent($pdo, $row, 'ack',    '', $platform, $ip, $agent); }
 
-    return array('ticked' => $after, 'complete' => $complete, 'added' => $added,
+    return array('ticked' => $after, 'complete' => $complete,
+                 'all_ticked' => $allTicked, 'added' => $added,
                  'removed' => $removed, 'already' => false);
 }
 
@@ -850,24 +870,66 @@ function summaryAckEvent(PDO $pdo, array $row, $action, $item, $platform, $ip = 
     }
 }
 
-/** Command: note that somebody looked, the first time anybody does. Opening is
- *  not acknowledging and is deliberately a different field — and a different
- *  action in the log — so "read it on a phone, acknowledged at a desk" is
- *  visible rather than inferred. */
+/**
+ * Command: note that somebody looked. Opening is not acknowledging and is
+ * deliberately a different field — and a different action in the log — so
+ * "read it on a phone, acknowledged at a desk" is visible rather than
+ * inferred.
+ *
+ * TWO RECORDS, ANSWERING TWO QUESTIONS.
+ *
+ *   opened_datetime  the FIRST look from anywhere, with the platform it came
+ *                    from. One per day, never overwritten: "when did this
+ *                    person first see today's summary" has one answer.
+ *
+ *   the event log    the first look FROM EACH PLACE. Somebody who reads it on
+ *                    the phone at 07:10 and opens the page at 09:40 has two
+ *                    lines, and the column alone could not have told you the
+ *                    second one happened.
+ *
+ * ONE LINE PER PLATFORM PER DAY, not one per request: the app asks for this
+ * day every time Staff Utility is opened, and a line for each of those would
+ * be a record of walking past the room rather than of reading what is in it.
+ */
 function summaryAckOpened(PDO $pdo, array $row, $platform, $ip = '', $agent = '')
 {
-    if (!empty($row['opened_datetime'])) {
-        return;
-    }
-    $upd = $pdo->prepare(
-        'UPDATE mkPortal.staff_summary_notify
-            SET opened_datetime = :now, opened_platform = :plat
-          WHERE id = :id AND opened_datetime IS NULL');
-    $upd->execute(array(':now'  => date('Y-m-d H:i:s'),
-                        ':plat' => summaryPlatform($platform),
-                        ':id'   => (int)$row['id']));
+    $platform = summaryPlatform($platform);
 
-    if ($upd->rowCount() > 0) {
+    if (empty($row['opened_datetime'])) {
+        $upd = $pdo->prepare(
+            'UPDATE mkPortal.staff_summary_notify
+                SET opened_datetime = :now, opened_platform = :plat
+              WHERE id = :id AND opened_datetime IS NULL');
+        $upd->execute(array(':now'  => date('Y-m-d H:i:s'),
+                            ':plat' => $platform,
+                            ':id'   => (int)$row['id']));
+    }
+
+    if (!summaryAckOpenedOn($pdo, $row, $platform)) {
         summaryAckEvent($pdo, $row, 'open', '', $platform, $ip, $agent);
+    }
+}
+
+/**
+ * Query: has this day already been logged as opened from this platform?
+ *
+ * SAYS YES WHEN IT CANNOT TELL. A failed check must not turn into a line per
+ * request — a log that repeats itself a hundred times is worse than one
+ * missing a line, because the missing line can be inferred from the
+ * acknowledgement and the repetition cannot be undone.
+ */
+function summaryAckOpenedOn(PDO $pdo, array $row, $platform)
+{
+    try {
+        $stmt = $pdo->prepare(
+            "SELECT id FROM mkPortal.staff_summary_ack_event
+              WHERE notify_id = :n AND action = 'open' AND platform = :p
+              LIMIT 1");
+        $stmt->execute(array(':n' => (int)$row['id'], ':p' => $platform));
+
+        return $stmt->fetch() !== false;
+    } catch (Exception $e) {
+        error_log('staffSummary open check: ' . $e->getMessage());
+        return true;
     }
 }
