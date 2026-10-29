@@ -89,9 +89,13 @@ header('Content-Type: application/json; charset=UTF-8');
  *   8:00am — PUNCTUALITY. Were they on time?
  *     status     on_time   checked in before late_from
  *                late      late_from or after
+ *                has_data  A SHIFT PERSON WAS THERE. Presence, not
+ *                          punctuality, and never late — see SHIFT STAFF
  *                no_data   no source has them that day
- *     source     attendance_app | site_check_in | face_log | "" when no_data
- *     late_from  the line THIS person was judged against THIS day
+ *     source     attendance_app | site_patrol | site_check_in | face_log
+ *                | "" when no_data
+ *     late_from  the line THIS person was judged against THIS day, and ''
+ *                for a shift person, who was judged against none
  *
  *   LATE IS MEASURED FROM THEIR OWN SHIFT, NOT FROM 8:01. It is that day's
  *   shift_start plus one minute, so somebody on the 7:00am schedule is late
@@ -123,6 +127,11 @@ header('Content-Type: application/json; charset=UTF-8');
  *   BOTH SLOTS ARE FOUND THE SAME WAY — the source chain below is one rule
  *   applied twice, with each read scoped to its own slot. What differs is
  *   only what is made of a hit.
+ *
+ *   A SHIFT PERSON IS LOOKED FOR IN THE PATROL FIRST — mkPortal's security
+ *   rounds, which are their system of record and nobody else's record of
+ *   anything. See SHIFT STAFF below. The three arms underneath still apply to
+ *   them, in the same order as to everybody else, as fallbacks.
  *
  *   A person is looked for in this order, and the FIRST hit wins:
  *     1. the attendance app — evaluation.staff_attendance for staff,
@@ -238,6 +247,54 @@ header('Content-Type: application/json; charset=UTF-8');
  *   Saturday ends at 12:30pm has their afternoon looked for from 16:30
  *   regardless. Marking the schedule and reading by it are two changes, and
  *   this is the first.
+ *
+ * SHIFT STAFF — THE SIX WITH NO HOURS TO BE LATE AGAINST.
+ *   evaluation.schedule_type row 6 reads "Shift" in both of its columns where
+ *   every other row reads a time range — ATT_SCHEDULE_SHIFT. At comp 1 on 29
+ *   Oct 2026 six people are on it and all six are security guards.
+ *
+ *   THEIR DAY COMES OUT OF THE PATROL, not the app and not the door. They work
+ *   from mkPortal's security check-in — a round started at a site, a scan at
+ *   each checkpoint on it — and the three sources above barely know them:
+ *   between the six of them there is not one app submission, one site check-in
+ *   in April 2026, and a face log that catches the END of a night shift and
+ *   would have it read as a 06:04 arrival. So sitePatrol() is read for them and
+ *   tried first:
+ *     time     the FIRST checkpoint scan of the calendar day
+ *     pm_time  the LAST scan of that same day
+ *
+ *   NOTHING IS LATE AND NOTHING IS ON TIME. status is has_data when a scan was
+ *   found and no_data when none was — the afternoon's two words, for the same
+ *   reason the afternoon uses them — and late_from is '' because no line was
+ *   applied. A shift person can therefore be MISSING, which is the one thing
+ *   worth seeing about them, and can never be late. A guard whose night runs
+ *   19:00 to 07:00 would be eleven hours late against the 08:01 line every
+ *   night he worked it, which is the whole reason this exists.
+ *
+ *   THE CALENDAR DAY IS THE DAY, AND A NIGHT SHIFT CROSSES ONE. A round that
+ *   starts 19:00 Tuesday and ends 07:00 Wednesday leaves scans on both dates,
+ *   so Wednesday's `time` is the tail of Tuesday night's round and Wednesday's
+ *   `pm_time` is the start of Wednesday night's. That is "the first scan of the
+ *   day" and "the last scan of the day", which is what was asked for and is a
+ *   statement about the DATE rather than about one person's shift. Pairing a
+ *   night's two ends would mean deciding where one begins from the size of a
+ *   gap between scans, and nobody has agreed to that rule. The rule that WAS
+ *   agreed is written here, so the day the other one is wanted it is plain
+ *   what is being replaced.
+ *
+ *   is_off_day READS '1' FOR THEM ON EVERY DAY, and that is attShift()
+ *   meeting a cell it cannot parse: "Shift" is not a time range, and an
+ *   unreadable cell reads as off — the quiet direction. Nothing in this repo
+ *   reads that field, so it costs nobody an answer; what it does do is put
+ *   their person-days into counts.off_day, where they are a statement that
+ *   nobody knows their hours rather than that they were not due in. Their two
+ *   cells are answered either way, as every off day's are.
+ *
+ *   ONLY SCHEDULE 6 IS READ THIS WAY, and the gate is the point. Thirteen
+ *   people have patrol rounds at comp 1: the six guards, one who left, and six
+ *   others — a programmer, an admin manager, a driver — with one or two rounds
+ *   each from 2025 and early 2026. For them a patrol round is not attendance,
+ *   and reading it as such would hand them an arrival they never claimed.
  *
  * PUBLIC HOLIDAYS — MARKED, NEVER SCORED.
  *   is_public_holiday  '1'  that calendar day is a public holiday
@@ -382,6 +439,24 @@ define('ATT_SCHEDULE_DEFAULT_GW',    3);
  * everybody by the shape of the table — not by a rule written here.
  */
 define('ATT_SCHEDULE_SUNDAY_OFF', true);
+
+/**
+ * THE SHIFT SCHEDULE — THE ONE WITH NO HOURS IN IT.
+ *
+ * evaluation.schedule_type row 6 reads "Shift" in both columns; every other
+ * row reads a time range. There is no start to be late from, so the people on
+ * it are not judged for lateness at all: their morning is a presence check,
+ * has_data or no_data, and their two times come out of the security patrol.
+ * SHIFT STAFF at the top has the whole of it and sitePatrol() has the read.
+ *
+ * AN ID, BECAUSE THE TABLE HAS NO FLAG FOR "no hours". The row is recognised
+ * by its id and nothing else, so a seventh schedule added later is an ordinary
+ * one until somebody says here that it is not. attShift() does parse "Shift"
+ * as an off day — it is not a time range — and that is not enough on its own:
+ * an off day scores nothing but still carries the 08:01 fallback, and a cell
+ * judged against a line nobody was given is what this avoids.
+ */
+define('ATT_SCHEDULE_SHIFT', 6);
 
 /* ---------- the calendar -------------------------------------------------- */
 
@@ -735,6 +810,91 @@ class AttendanceRepository
             }
         }
         return array('by_person' => $byPerson, 'by_mk_id' => $byMkId);
+    }
+
+    /**
+     * Query: the security patrol's day for each guard, keyed by person — the
+     * first checkpoint scan of each date and the last.
+     *
+     * THIS IS site_check_in_rounds, WHICH siteCheckIn() ABOVE IS NOT. Two
+     * systems, similar names: that one is the check-in a staff member makes on
+     * arriving at a site (mkPortal.staff_attendance_logs, about thirty people),
+     * this one is a security round — a guard starts a round at a site and scans
+     * each checkpoint on it, several rounds a night. siteCheckInReport.php
+     * reads both and keeps them in two separate reports; so does this file.
+     *
+     * FOR THE SHIFT STAFF, AND NOBODY ELSE USES IT — see ATT_SCHEDULE_SHIFT and
+     * SHIFT STAFF at the top. The query itself is not filtered by schedule:
+     * building the index and deciding who may be answered from it are two
+     * jobs, and the second belongs where the source chain is applied, in
+     * attFind(), which asks for a shift person only.
+     *
+     * BOTH ENDS OUT OF ONE QUERY, like faceLog() and unlike siteCheckIn():
+     *   first_in   MIN of the day's scans — the check-in
+     *   last_out   MAX of the same — the check-out
+     *
+     * NO 16:30 WINDOW ON THE SECOND. Site check-in has one because that table
+     * is a stream of check-ins where a morning arrival could pass for a
+     * departure. Here the pair is the two ends of a date's scans by
+     * definition, and a guard's night is mostly over before 16:30 anyway —
+     * windowing it would report every night shift as never having checked out.
+     *
+     * THE SCAN IS THE CHECK-IN, not the round's started_at. A round started and
+     * never scanned is somebody opening the app, and rounds is joined for
+     * person and comp_id — whose round it was — which is all this read needs
+     * from it.
+     *
+     * A CANCELLED ROUND'S SCANS STILL COUNT. cancel_reason is about the round;
+     * a scan that happened is a guard who was there. It is 60 of comp 1's
+     * 35,000 scans either way. Deleted rows are retractions on both tables and
+     * stay out.
+     *
+     * BY PERSON ONLY. This table carries person and comp_id and no mymk_id, so
+     * there is no second index to build — unlike staffApp() and siteCheckIn(),
+     * which carry both and are keyed both ways.
+     */
+    public function sitePatrol($compId, $fromYmd, $toYmd)
+    {
+        $sql = "SELECT r.person, DATE(l.checked_in_at) AS d,
+                       MIN(TIME(l.checked_in_at)) AS first_in,
+                       MAX(TIME(l.checked_in_at)) AS last_out
+                  FROM mkPortal.site_check_in_logs l
+                  JOIN mkPortal.site_check_in_rounds r
+                    ON r.id = l.round_id
+                   AND r.deleted = '0'
+                 WHERE l.deleted = '0'
+                   AND r.comp_id = :c
+                   AND l.checked_in_at IS NOT NULL
+                   AND DATE(l.checked_in_at) BETWEEN :f AND :t
+                 GROUP BY r.person, DATE(l.checked_in_at)";
+
+        /* comp_id is int(11) here, where staff_attendance_logs holds it as a
+         * VARCHAR — so it binds as an int in this read and as a string in that
+         * one. */
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute(array(':c' => (int)$compId, ':f' => $fromYmd, ':t' => $toYmd));
+
+        $firstIn = array();
+        $lastOut = array();
+        foreach ($stmt->fetchAll() as $r) {
+            $date   = self::isoDate($r['d']);
+            $person = strtolower(trim((string)$r['person']));
+            if ($date === null || $person === '') {
+                continue;
+            }
+
+            $in = self::clockTime($r['first_in']);
+            if ($in !== null) {
+                self::keepEarliest($firstIn, $person, $date, $in);
+            }
+
+            $out = self::clockTime($r['last_out']);
+            if ($out !== null) {
+                self::keepLatest($lastOut, $person, $date, $out);
+            }
+        }
+        return array('first_in' => array('by_person' => $firstIn),
+                     'last_out' => array('by_person' => $lastOut));
     }
 
     /**
@@ -1207,9 +1367,15 @@ function attCell(array $row, $date, array $am, array $pm, array $holidays,
      * is_off_day still scores nothing — see SCHEDULES at the top. */
     $shift = attShiftOn($schedule, $date);
 
-    $cell = attArrival($row, $date, $am, attLateFrom($shift));
+    /* IS THIS A SHIFT PERSON — read off the SCHEDULE and not off the day,
+     * because it is a fact about them and not about the date. It changes two
+     * things: the patrol becomes their first source, and their morning stops
+     * being judged. ATT_SCHEDULE_SHIFT has why, SHIFT STAFF has the whole. */
+    $isShift = ((int)$schedule['schedule_type_id'] === ATT_SCHEDULE_SHIFT);
 
-    $afternoon         = attPresence($row, $date, $pm);
+    $cell = attArrival($row, $date, $am, attLateFrom($shift), $isShift);
+
+    $afternoon         = attPresence($row, $date, $pm, $isShift);
     $cell['pm_time']   = $afternoon['time'];
     $cell['pm_status'] = $afternoon['status'];
     $cell['pm_source'] = $afternoon['source'];
@@ -1303,10 +1469,18 @@ function attShiftOn(array $schedule, $date)
  * between slots — attArrival() for the morning, attPresence() for the
  * afternoon — and that difference is one line each, below.
  *
- * $reads is the four indexes for ONE slot:
- *   array('staff_app' => …, 'gw_app' => …, 'site' => …, 'face' => …)
+ * $isShift PUTS THE PATROL IN FRONT OF ALL OF THEM, and is true for exactly
+ * the people on ATT_SCHEDULE_SHIFT. It adds an arm rather than replacing the
+ * chain: a guard with no round that day is still looked for in the other
+ * three. Everybody else is answered as they always were, which is why this is
+ * a flag and not an extra entry in the chain — thirteen people have patrol
+ * rounds and only six of them are guards. See SHIFT STAFF at the top.
+ *
+ * $reads is the five indexes for ONE slot:
+ *   array('staff_app' => …, 'gw_app' => …, 'site' => …, 'face' => …,
+ *         'patrol' => …)
  */
-function attFind(array $row, $date, array $reads)
+function attFind(array $row, $date, array $reads, $isShift = false)
 {
     $person   = strtolower(trim((string)$row['person']));
     $isGw     = ($row['person_type'] === 'gw');
@@ -1314,6 +1488,10 @@ function attFind(array $row, $date, array $reads)
     $gwApp    = $reads['gw_app'];
     $site     = $reads['site'];
     $face     = $reads['face'];
+    /* Defaulted, not required: a caller holding a slot's reads from before
+     * the patrol existed is answered by the three arms it does have. */
+    $patrol   = isset($reads['patrol']) ? $reads['patrol']
+                                        : array('by_person' => array());
 
     if ($isGw) {
         if (isset($gwApp[$person][$date])) {
@@ -1324,9 +1502,20 @@ function attFind(array $row, $date, array $reads)
          * somebody's login there would be a different person. No face-log arm
          * either, for the same reason one step further back — a face reading
          * resolves to a users.id, through the terminal's enrolment table, and
-         * a GW has neither a users row nor an enrolment on a door. The app is
-         * the whole of a GW's answer. */
+         * a GW has neither a users row nor an enrolment on a door. No patrol
+         * arm either, for the first of those reasons again — a round names a
+         * users.person — and no GW is on the shift schedule in any case. The
+         * app is the whole of a GW's answer. */
         return null;
+    }
+
+    /* THE PATROL FIRST, AND ONLY FOR A SHIFT PERSON. It is the security
+     * guards' own record of their night and the three arms below hardly know
+     * them; for anybody else it is not attendance at all and is not consulted.
+     * Keyed by person only — sitePatrol() says why there is no mk_id arm. */
+    if ($isShift && isset($patrol['by_person'][$person][$date])) {
+        return array('time' => $patrol['by_person'][$person][$date],
+                     'source' => 'site_patrol');
     }
 
     if (isset($staffApp['by_person'][$person][$date])) {
@@ -1360,10 +1549,28 @@ function attFind(array $row, $date, array $reads)
  * Query: the MORNING cell — a punctuality judgement, on_time or late,
  * against $lateFrom, which is THIS person's line on THIS day. attLateFrom()
  * works it out; see there for where it comes from.
+ *
+ * EXCEPT FOR A SHIFT PERSON, who is not judged. $isShift turns this cell into
+ * the presence check the afternoon has always been — has_data or no_data, the
+ * time as found, and late_from '' because no line was applied, which is the
+ * field that says so. ATT_SCHEDULE_SHIFT has the reasoning.
  */
-function attArrival(array $row, $date, array $reads, $lateFrom)
+function attArrival(array $row, $date, array $reads, $lateFrom, $isShift = false)
 {
-    $hit = attFind($row, $date, $reads);
+    $hit = attFind($row, $date, $reads, $isShift);
+
+    if ($isShift) {
+        /* late_from IS DELIBERATELY EMPTY HERE, where every other cell carries
+         * the line it was judged against. A shift person was judged against
+         * none, and publishing 08:01 beside them would invite a caller to
+         * apply it and reach the verdict this whole branch exists to avoid. */
+        return ($hit === null)
+            ? array('time' => '', 'status' => 'no_data', 'source' => '',
+                    'late_from' => '')
+            : array('time' => $hit['time'], 'status' => 'has_data',
+                    'source' => $hit['source'], 'late_from' => '');
+    }
+
     return ($hit === null)
         ? attJudge(null, '', $lateFrom)
         : attJudge($hit['time'], $hit['source'], $lateFrom);
@@ -1410,9 +1617,9 @@ function attLateFrom(array $shift)
  * reference). The time is still published, because when somebody checked in
  * is worth reading even when it is not being marked.
  */
-function attPresence(array $row, $date, array $reads)
+function attPresence(array $row, $date, array $reads, $isShift = false)
 {
-    $hit = attFind($row, $date, $reads);
+    $hit = attFind($row, $date, $reads, $isShift);
     if ($hit === null) {
         return array('time' => '', 'status' => 'no_data', 'source' => '');
     }
@@ -1570,17 +1777,24 @@ try {
 
     $face = $att->faceLog($fromIso, $toIso);
 
+    /* THE PATROL, both ends out of one query like the face log. Read for the
+     * whole company and answered for the shift staff only — attFind() is the
+     * gate; see SHIFT STAFF at the top. */
+    $patrol = $att->sitePatrol($compId, $fromIso, $toIso);
+
     $am = array(
         'staff_app' => $att->staffApp($compId, $appFrom, $appTo, ATT_PERIOD_AM),
         'gw_app'    => $att->gwApp($appFrom, $appTo, ATT_PERIOD_AM),
         'site'      => $att->siteCheckIn($compId, $fromIso, $toIso),
         'face'      => $face['first_in'],
+        'patrol'    => $patrol['first_in'],
     );
     $pm = array(
         'staff_app' => $att->staffApp($compId, $appFrom, $appTo, ATT_PERIOD_PM),
         'gw_app'    => $att->gwApp($appFrom, $appTo, ATT_PERIOD_PM),
         'site'      => $att->siteCheckIn($compId, $fromIso, $toIso, ATT_PM_FROM),
         'face'      => $face['last_out'],
+        'patrol'    => $patrol['last_out'],
     );
 
     /* ---- and the working week ---- */
@@ -1607,7 +1821,12 @@ try {
 
     /* ---- compose ---- */
     $out      = array();
-    $totals   = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
+    /* has_data IS THE SHIFT STAFF'S MORNING and is counted beside the other
+     * three, not inside them: it is a fourth answer to the morning question,
+     * so the four together still come to people x days. Nearly every person
+     * has 0 there. */
+    $totals   = array('on_time' => 0, 'late' => 0, 'has_data' => 0,
+                      'no_data' => 0);
     /* The afternoon is counted separately because it is counted in different
      * words: has_data / no_data, with no on_time or late to add to. */
     $pmTotals = array('has_data' => 0, 'no_data' => 0);
@@ -1662,7 +1881,8 @@ try {
             }
         } else {
             $byDay     = array();
-            $summary   = array('on_time' => 0, 'late' => 0, 'no_data' => 0);
+            $summary   = array('on_time' => 0, 'late' => 0, 'has_data' => 0,
+                               'no_data' => 0);
             $pmSummary = array('has_data' => 0, 'no_data' => 0);
             foreach ($days as $day) {
                 $cell = attCell($row, $day, $am, $pm, $holidays, $schedule);
@@ -1720,9 +1940,16 @@ try {
                      * cell's own late_from instead: on a 7:00am shift this
                      * number is an hour out. */
                     'late_from' => ATT_LATE_FROM,
-                    'statuses'  => array('on_time', 'late', 'no_data'),
+                    'statuses'  => array('on_time', 'late', 'has_data', 'no_data'),
                     'fields'    => array('time', 'status', 'source', 'late_from'),
                     'summary'   => 'summary',
+                    /* THE ONE SCHEDULE THIS SLOT DOES NOT JUDGE. Its people
+                     * have no hours to be late against, so their morning is
+                     * answered in the afternoon's words — has_data — with an
+                     * empty late_from beside it. See SHIFT STAFF at the top. */
+                    'shift_schedule_type_id' => ATT_SCHEDULE_SHIFT,
+                    'shift_judges'           => 'presence',
+                    'shift_source'           => 'site_patrol',
                 ),
                 'pm' => array(
                     'period'    => ATT_PERIOD_PM,
@@ -1738,7 +1965,8 @@ try {
             /* In the order they are tried, which is the order a tie would be
              * broken in if the sources ever overlapped much. They barely do
              * — see the chain at the top of this file. */
-            'sources'   => array('attendance_app', 'site_check_in', 'face_log'),
+            'sources'   => array('attendance_app', 'site_patrol',
+                                 'site_check_in', 'face_log'),
             /* The three below are the morning's rule under the names it was
              * published with before the afternoon slot existed, kept so a
              * caller written against that answer still reads the same thing.
@@ -1750,6 +1978,10 @@ try {
              * that was applied to it. */
             'period'    => ATT_PERIOD_AM,
             'late_from' => ATT_LATE_FROM,
+            /* FROZEN AT THREE. has_data is a fourth morning status — the shift
+             * staff's — and it is published in rules.periods.am.statuses,
+             * which is the list to read. This copy is left as the answer a
+             * caller written before either change already agreed to. */
             'statuses'  => array('on_time', 'late', 'no_data'),
             /* THE WORKING WEEK, published so a caller can see which schedule
              * a person's hours came from rather than inferring it. The five
@@ -1759,6 +1991,9 @@ try {
                 'fields'      => array('is_off_day', 'shift_start', 'shift_end'),
                 'defaults'    => array('staff' => ATT_SCHEDULE_DEFAULT_STAFF,
                                        'gw'    => ATT_SCHEDULE_DEFAULT_GW),
+                /* The schedule with no hours in it. Its people are read from
+                 * the patrol and judged for nothing; see SHIFT STAFF. */
+                'shift'       => ATT_SCHEDULE_SHIFT,
                 'sunday_off'  => ATT_SCHEDULE_SUNDAY_OFF ? '1' : '0',
                 /* WHAT THE SCHEDULE DECIDES, and what it does not. It sets
                  * the morning's line — shift_start + the grace — so a 7:00am
@@ -1781,11 +2016,14 @@ try {
             'days'   => count($days),
             /* Over every person AND every day, so in month mode these add up
              * to people x days and not to people. The first three are the
-             * 8am slot, the pm_ pair the 4:30pm one; each set adds up to
-             * people x days on its own, and adding one set to the other
-             * would count every cell twice. */
+             * 8am slot — all four of them — and the pm_ pair the 4:30pm one;
+             * each set adds up to people x days on its own, and adding one
+             * set to the other would count every cell twice. */
             'on_time'     => $totals['on_time'],
             'late'        => $totals['late'],
+            /* The shift staff's morning — present, never judged. One of the
+             * four the morning adds up to, not a slice of the three. */
+            'has_data'    => $totals['has_data'],
             'no_data'     => $totals['no_data'],
             'pm_has_data' => $pmTotals['has_data'],
             'pm_no_data'  => $pmTotals['no_data'],

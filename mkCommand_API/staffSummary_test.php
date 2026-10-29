@@ -10,7 +10,7 @@ if (!UnifiedAuth::isLoggedIn()) {
 
 $currentUser = UnifiedAuth::getLoggedInUser();
 $person = $currentUser['person'];
-$person = 'justin';   // TODO: restore the line above before deploying
+// $person = 'justin';   // TODO: restore the line above before deploying
 
 // Only Heads of Department and Area Managers / Assistant Area Managers can use this page.
 // Add any other person ids that should also be allowed (e.g. the CEO) here.
@@ -399,6 +399,10 @@ const CHECK = '<i class="fa-solid fa-check"></i>', CROSS = '<i class="fa-solid f
 function stHtml(d) {
   if (!d || d.status === 'no_data') return isPH(d) ? '<span class="st ph" title="' + esc(phName(d)) + '">PH</span>' : '<span class="st none">–</span>';
   const t = (d.time || '').slice(0, 5);
+  // has_data is a shift person's morning: the time, and no verdict either way.
+  // They have no hours to be late against, so neither the tick nor the cross is
+  // true of them - see SHIFT STAFF in attendanceAPI.php.
+  if (d.status === 'has_data') return '<span class="st none" title="Shift - not judged for lateness">' + t + '</span>';
   return d.status === 'late' ? '<span class="st bad" title="Late">' + CROSS + ' ' + t + '</span>'
                              : '<span class="st ok" title="On time">' + CHECK + ' ' + t + '</span>';
 }
@@ -431,6 +435,9 @@ function lateCell(person) {
   const s = e.summary || {};
   if (s.late > 0) return '<span class="st bad" title="Late days this month">' + CROSS + ' ' + s.late + '</span>';
   if (s.on_time > 0) return '<span class="st ok" title="No late days this month">' + CHECK + '</span>';
+  // A shift person reaches neither figure: nothing of theirs was judged, so
+  // saying "no late days" of them would claim a verdict nobody gave.
+  if (s.has_data > 0) return '<span class="st none" title="Shift - not judged for lateness">Shift</span>';
   return '';
 }
 
@@ -545,7 +552,12 @@ async function renderCal() {
       : st === 'on_time' ? ' ok'
       : ms ? ' bad'
       : ph ? ' ph' : '';
-    const val = st === 'late' ? CROSS + ' ' + esc((x.time || '').slice(0, 5)) : st === 'on_time' ? CHECK + ' ' + esc((x.time || '').slice(0, 5)) : ms ? CROSS + ' Missed' : '';
+    // A shift day carries its time and no colour: has_data is presence and not
+    // a verdict. See stHtml() and SHIFT STAFF in attendanceAPI.php.
+    const val = st === 'late' ? CROSS + ' ' + esc((x.time || '').slice(0, 5))
+      : st === 'on_time' ? CHECK + ' ' + esc((x.time || '').slice(0, 5))
+      : st === 'has_data' ? esc((x.time || '').slice(0, 5))
+      : ms ? CROSS + ' Missed' : '';
     const tip = [
       ph ? phName(x) : '',
       ms ? 'Missed submission' : '',
