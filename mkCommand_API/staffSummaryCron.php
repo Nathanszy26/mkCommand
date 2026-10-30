@@ -23,6 +23,16 @@
  *     leaveAPI.php        the month's leave, day by day
  *     performanceAPI.php  the month's compliance
  *
+ * AND, SINCE 30 OCT 2026, WHATEVER THE MODULE CATALOGUE NAMES. The three
+ * sections above were constants in this file; they are now rows in
+ * mkPortal.staff_summary_module, ticked per person on
+ * staffSummaryModuleReport.php. A module marked NOT built-in is FETCHED per
+ * person from the address stored beside it — RO1 Work Achievement lives on
+ * glob.com.my, which is a different server with its own database, so there is
+ * no filename here that could reach it. See staffSummaryModules.php; it fails
+ * open to the original three, so a morning before the DDL is run is a morning
+ * exactly like last week's.
+ *
  * THAT IS THE POINT OF THE HTTP CALLS. Reading the tables directly here would
  * be a second definition of "late", of "on leave" and of "who reports to
  * whom", free to drift from the APIs the day somebody changes one. Change the
@@ -109,6 +119,16 @@ require_once $summaryCore;
  * page cannot disagree about what a column means. It defines and returns and
  * runs nothing — see the note at the top of it. */
 require_once __DIR__ . '/staffSummaryShared.php';
+
+/* WHICH SECTIONS EACH PERSON GETS, AND WHERE THE FETCHED ONES COME FROM.
+ * The three built-in sections used to be a constant in this file; they are
+ * now rows in mkPortal.staff_summary_module, together with any module that
+ * lives on ANOTHER SERVER and so has to be fetched by address rather than
+ * named by filename. Ticked per person on staffSummaryModuleReport.php.
+ *
+ * It fails open to the original three, every one of them shown and required,
+ * so a morning before the DDL is run is a morning exactly like last week's. */
+require_once __DIR__ . '/staffSummaryModules.php';
 
 /* ---------- configuration ------------------------------------------------- */
 
@@ -225,6 +245,23 @@ define('SUMMARY_COMP_ID', 1);
 /** How long to wait on one API call. */
 define('SUMMARY_HTTP_TIMEOUT', 120);
 
+/**
+ * HOW LONG A PUSH LINE MAY BE BEFORE IT STARTS LOSING FIGURES.
+ *
+ * Measured in characters, because that is what a notification shade is
+ * measured in. Forty is the observed wrap point on a mid-size Android handset
+ * at the default font size, and 38 leaves a little room for a wider one. The
+ * existing staff line sits at 33 and has never wrapped.
+ *
+ * IT IS A CEILING FOR THE FETCHED MODULE LINES AND NOTHING ELSE. The staff
+ * line is three fixed figures and cannot grow; a module's line is whatever its
+ * endpoint describes, so that is the one that needs a limit.
+ *
+ * Raise it and lines wrap; lower it and figures are dropped sooner. Neither is
+ * an error — see the note in summaryPushModuleLine() for what dropping means.
+ */
+define('SUMMARY_PUSH_LINE_MAX', 38);
+
 /* ---------- the palette ---------------------------------------------------
  *
  * Named once, used throughout the mail, and matched by staffSummaryAck.php so
@@ -243,6 +280,7 @@ define('SUM_HAIR',   '#f1f5f9');   /* the line between two rows         */
 define('SUM_WASH',   '#f8fafc');   /* a panel, a table head             */
 define('SUM_BLUE',   '#2563eb');
 define('SUM_RED',    '#dc2626');
+define('SUM_GREEN',  '#059669');   /* a change that is good news        */
 define('SUM_AMBER',  '#b45309');
 define('SUM_TINT',   '#fef2f2');   /* the wash behind a row with something */
 
@@ -935,8 +973,16 @@ function summaryCapGroups(array $groups, $max)
  * 2002-era HTML on purpose — nested tables, width and bgcolor attributes
  * beside the CSS, and not one class name.
  */
-function summaryHtml(array $recipient, array $groups, $todayIso, $ackUrl, array $dayCols)
+function summaryHtml(array $recipient, array $groups, $todayIso, $ackUrl, array $dayCols,
+                     array $modShown = null, array $modFetched = array(),
+                     array $modCatalogue = array(), array $modBoxes = null)
 {
+    /* THE OLD SIGNATURE STILL WORKS. Called with five arguments this prints
+     * the three original sections, all of them required — which is what every
+     * caller wanted before the catalogue existed, and what a fallback morning
+     * still wants. */
+    if ($modShown === null)  { $modShown  = array('late', 'leave', 'comp'); }
+    if ($modBoxes === null)  { $modBoxes  = $modShown; }
     $font = 'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,Helvetica,sans-serif;';
     $rows = summaryFlatten($groups);
     $ym   = summaryMonthLabel($todayIso);
@@ -1011,22 +1057,65 @@ function summaryHtml(array $recipient, array $groups, $todayIso, $ackUrl, array 
         . summaryEsc($recipient['fullname'] !== '' ? $recipient['fullname'] : $recipient['person'])
         . '</td></tr></table></td></tr>';
 
-    /* ---- the three sections ---- */
-    /* A ROW BUDGET SHARED BETWEEN THEM, not a cap on the people list. Each
-     * section counts its own people first, then prints as many as its share
-     * allows and says how many it left out. See summarySectionCaps(). */
-    $caps = summarySectionCaps(summarySectionCounts($groups),
-                               SUMMARY_MAIL_MAX_ROWS, SUMMARY_MAIL_MIN_ROWS);
+    /* ---- the sections this person is shown ----
+     *
+     * THE CATALOGUE DECIDES, NOT THIS FILE. $modShown is what
+     * staffSummaryModuleReport.php has them ticked for, already in display
+     * order; the numbers are 1, 2, 3… off that list, so a person without RO1
+     * Work Achievement reads 1-3 and a person with it reads 1-4, rather than
+     * the fourth sliding into a gap.
+     *
+     * A ROW BUDGET SHARED BETWEEN THE PEOPLE-LISTING SECTIONS, not a cap on
+     * any one list. Each counts its own people first, then prints as many as
+     * its share allows and says how many it left out. A section this person is
+     * NOT shown is zeroed before the share-out, so it cannot hold budget the
+     * other sections could have used. See summarySectionCaps().
+     *
+     * A FETCHED SECTION IS NOT IN THE BUDGET AT ALL. It is a handful of
+     * district rows, not a department, so it cannot be the thing that pushes a
+     * mail past Gmail's clipping threshold. */
+    $counts = summarySectionCounts($groups);
+    foreach ($counts as $kind => $n) {
+        if (!in_array($kind, $modShown, true)) { $counts[$kind] = 0; }
+    }
+    $caps = summarySectionCaps($counts, SUMMARY_MAIL_MAX_ROWS, SUMMARY_MAIL_MIN_ROWS);
 
-    $h .= summarySectionHtml('1', 'Lateness', 'late', $groups, $dayCols, $ym,
-                             'Nobody was late or missing a check-in.',
-                             $caps['late'], $ackUrl);
-    $h .= summarySectionHtml('2', 'Excessive Leaves (' . $ym . ')', 'leave', $groups, $dayCols, $ym,
-                             'No leave taken or booked this month.',
-                             $caps['leave'], $ackUrl);
-    $h .= summarySectionHtml('3', 'Compliance (' . $ym . ')', 'comp', $groups, $dayCols, $ym,
-                             'No compliance recorded this month.',
-                             $caps['comp'], $ackUrl);
+    $no = 0;
+    foreach ($modShown as $kind) {
+        $no++;
+        $mod = isset($modCatalogue[$kind]) ? $modCatalogue[$kind] : array();
+
+        /* THE HEADING AND THE EMPTY LINE COME FROM THE TABLE, with the words
+         * that were hard-coded here as the fallback — so a morning before the
+         * DDL is run reads exactly as it always did. The month is appended to
+         * everything except Lateness, which is about today and not the month. */
+        $title = (isset($mod['title']) && $mod['title'] !== '')
+            ? $mod['title'] : summaryFallbackTitle($kind);
+        $empty = (isset($mod['empty_line']) && $mod['empty_line'] !== '')
+            ? $mod['empty_line'] : summaryFallbackEmpty($kind);
+        $heading = ($kind === 'late') ? $title : $title . ' (' . $ym . ')';
+
+        /* THE BOX IS PRINTED ONLY WHERE THERE IS ONE. $modBoxes already says
+         * which sections are allowed, have content AND are must-acknowledge.
+         * An EMPTY section never had a box — summarySectionHtml() returns
+         * before the box when its total is 0, and the server has never counted
+         * one. What is new is the third test: a section somebody is shown for
+         * information only prints in full and ends without a box, which is the
+         * whole of what "must acknowledge: no" means to a reader. */
+        $withBox = in_array($kind, $modBoxes, true);
+
+        if (empty($mod) || !empty($mod['built_in'])) {
+            $h .= summarySectionHtml((string)$no, $heading, $kind, $groups, $dayCols, $ym,
+                                     $empty,
+                                     isset($caps[$kind]) ? $caps[$kind] : 0,
+                                     $ackUrl, $withBox);
+            continue;
+        }
+
+        $h .= summaryModuleSectionHtml((string)$no, $heading, $kind, $mod, $empty,
+                                       isset($modFetched[$kind]) ? $modFetched[$kind] : null,
+                                       $withBox);
+    }
 
     /* ---- the way back ---- */
     $h .= '<tr><td align="center" style="padding:20px 24px 24px;">'
@@ -1091,7 +1180,7 @@ function summaryAckToken($ackUrl)
  * drift the first time somebody adjusted a padding.
  */
 function summarySectionHtml($no, $heading, $kind, array $groups, array $dayCols, $ym,
-                           $emptyLine, $cap = 0, $ackUrl = '')
+                           $emptyLine, $cap = 0, $ackUrl = '', $withBox = true)
 {
     $flag = ($kind === 'late') ? 'in_late' : (($kind === 'leave') ? 'in_leave' : 'in_comp');
 
@@ -1186,7 +1275,224 @@ function summarySectionHtml($no, $heading, $kind, array $groups, array $dayCols,
             . '</td></tr></table>';
     }
 
-    return $h . summaryConfirmHtml($kind) . '</td></tr>';
+    /* NO BOX WHERE THIS PERSON IS NOT HELD TO THE SECTION. $withBox is
+     * dsModBoxKeys()'s answer, threaded in rather than re-derived, so the
+     * mail, the acknowledgement page and the API cannot end up disagreeing
+     * about which boxes exist. An empty section has already returned above. */
+    return $h . ($withBox ? summaryConfirmHtml($kind) : '') . '</td></tr>';
+}
+
+/** Query: the heading a built-in section had before the catalogue existed.
+ *  Used only when the module tables are missing, so a fallback morning reads
+ *  exactly as last week's did. */
+function summaryFallbackTitle($kind)
+{
+    $t = array('late' => 'Lateness', 'leave' => 'Excessive Leaves',
+               'comp' => 'Compliance');
+    return isset($t[$kind]) ? $t[$kind] : $kind;
+}
+
+/** Query: the empty line a built-in section had before the catalogue existed. */
+function summaryFallbackEmpty($kind)
+{
+    $t = array('late' => 'Nobody was late or missing a check-in.',
+               'leave' => 'No leave taken or booked this month.',
+               'comp'  => 'No compliance recorded this month.');
+    return isset($t[$kind]) ? $t[$kind] : 'Nothing to show.';
+}
+
+/**
+ * Command: one FETCHED section — a module whose figures came from an endpoint
+ * rather than from the snapshot this cron builds.
+ *
+ * NOT A LIST OF PEOPLE, WHICH IS WHY IT IS NOT summarySectionHtml(). The three
+ * built-in sections all answer "which of your staff", and share a shape: a
+ * department, then names, then day columns. RO1 Work Achievement answers
+ * "which of your districts", and its rows are places with figures against
+ * them. Forcing it through the people renderer would have meant inventing a
+ * fake person per district.
+ *
+ * IT DRAWS WHATEVER THE ENDPOINT DESCRIBED. columns[] carries the key, label,
+ * format and decimals for each column and rows[] carries a cell per key, so
+ * this file holds no knowledge of what RO1 measures — a fifth column added at
+ * the endpoint appears here with no change on this side. That is the whole
+ * point of the contract: the module owns its figures, the cron owns the
+ * envelope.
+ *
+ * A FAILED FETCH SAYS SO, in the section, in plain words. Printing nothing
+ * would read as a quiet month, which is the one thing a manager must not
+ * conclude from an endpoint that was down.
+ *
+ * THE CHANGE CHIP IS COLOURED BY DIRECTION AND NOT BY GOODNESS. Up is blue,
+ * down is grey, and neither is red or green — because "work done up" is good
+ * and "outstanding potholes up" is not, and this renderer does not know which
+ * column it is drawing. The endpoint could say one day; until it does, a
+ * neutral chip is honest and a guessed colour would not be.
+ */
+function summaryModuleSectionHtml($no, $heading, $kind, array $mod, $emptyLine,
+                                  $fetched, $withBox)
+{
+    $ok   = is_array($fetched) && !empty($fetched['ok']) && is_array($fetched['data']);
+    $data = $ok ? $fetched['data'] : array();
+    $rows = ($ok && isset($data['rows']) && is_array($data['rows'])) ? $data['rows'] : array();
+    $cols = ($ok && isset($data['columns']) && is_array($data['columns']))
+        ? $data['columns'] : array();
+
+    /* The heading figure is how many ROWS the section is about — districts
+     * here — which is the same promise the people sections make with their
+     * own count. */
+    $h = '<tr><td style="padding:30px 24px 0;">'
+       . '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+       . 'width="100%" style="border-bottom:3px solid ' . SUM_BLUE . ';">'
+       . '<tr>'
+       . '<td width="40" valign="middle" style="width:40px;padding:0 12px 11px 0;">'
+       . '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+       . 'width="34" style="width:34px;"><tr>'
+       . '<td align="center" height="34" bgcolor="' . SUM_BLUE . '" '
+       . 'style="height:34px;border-radius:8px;background:' . SUM_BLUE . ';'
+       . 'font-size:19px;font-weight:bold;color:#ffffff;line-height:34px;">'
+       . summaryEsc($no) . '</td></tr></table></td>'
+       . '<td valign="middle" style="padding:0 0 11px;font-size:22px;font-weight:bold;'
+       . 'color:' . SUM_INK . ';line-height:1.25;">'
+       . summaryEsc($heading) . '</td>'
+       . '<td align="right" valign="middle" style="padding:0 0 11px;font-size:22px;'
+       . 'font-weight:bold;color:' . SUM_BLUE . ';white-space:nowrap;">'
+       . count($rows) . '</td>'
+       . '</tr></table>';
+
+    if (!$ok) {
+        return $h . '<div style="font-size:12.5px;color:' . SUM_FAINT . ';padding:12px 0 2px;">'
+             . summaryEsc('These figures could not be read this morning'
+                 . (is_array($fetched) && $fetched['error'] !== ''
+                        ? ' (' . $fetched['error'] . ')' : '')
+                 . '. Nothing is being asked of you about them.')
+             . '</div></td></tr>';
+    }
+
+    if (empty($rows) || empty($cols)) {
+        return $h . '<div style="font-size:12.5px;color:' . SUM_FAINT . ';padding:12px 0 2px;">'
+             . summaryEsc(isset($data['empty_reason']) && $data['empty_reason'] !== ''
+                   ? $data['empty_reason'] : $emptyLine)
+             . '</div></td></tr>';
+    }
+
+    $th = 'padding:9px 10px;font-size:11px;font-weight:bold;letter-spacing:.04em;'
+        . 'text-transform:uppercase;color:' . SUM_MUTED . ';background:' . SUM_WASH . ';'
+        . 'border-bottom:1px solid ' . SUM_LINE . ';';
+
+    $h .= '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        . 'style="margin-top:12px;border:1px solid ' . SUM_LINE . ';border-radius:10px;'
+        . 'border-collapse:separate;border-spacing:0;font-size:12px;">'
+        . '<tr><td align="left" bgcolor="' . SUM_WASH . '" style="' . $th . '">'
+        . summaryEsc(isset($data['row_label']) ? $data['row_label'] : 'Districts')
+        . '</td>';
+    foreach ($cols as $c) {
+        $h .= '<td align="right" bgcolor="' . SUM_WASH . '" style="' . $th . '">'
+            . summaryEsc(isset($c['label']) ? $c['label'] : $c['key']) . '</td>';
+    }
+    $h .= '</tr>';
+
+    /* The total rides in its own field rather than as a last row, so it can be
+     * drawn as a total — heavier, ruled off — instead of looking like one more
+     * district. A module with nothing to total simply omits it. */
+    $all = $rows;
+    if (isset($data['total']) && is_array($data['total'])) {
+        $all[] = $data['total'] + array('_is_total' => true);
+    }
+
+    foreach ($all as $r) {
+        $isTotal = !empty($r['_is_total']);
+        $td = 'padding:10px;border-top:1px solid ' . SUM_LINE . ';'
+            . ($isTotal ? 'font-weight:bold;background:' . SUM_WASH . ';' : '');
+
+        $h .= '<tr><td align="left" style="' . $td . 'color:' . SUM_INK . ';">'
+            . summaryEsc(isset($r['district']) ? $r['district'] : '') . '</td>';
+        foreach ($cols as $c) {
+            $key  = isset($c['key']) ? $c['key'] : '';
+            $cell = (isset($r[$key]) && is_array($r[$key])) ? $r[$key] : null;
+            $h   .= '<td align="right" style="' . $td . 'color:' . SUM_BODY . ';'
+                  . 'white-space:nowrap;">'
+                  . summaryModuleCellHtml($cell, $c) . '</td>';
+        }
+        $h .= '</tr>';
+    }
+    $h .= '</table>';
+
+    /* WHAT THE PERIOD AND THE COMPARISON WERE, under the table they describe.
+     * A figure labelled only "Work done" invites the reader to assume it is
+     * today's; saying "October 2026 (1 to 30), vs 29 Oct" costs one line and
+     * removes the assumption. */
+    $note = array();
+    if (isset($data['period']['label']))  { $note[] = $data['period']['label']; }
+    if (isset($data['compare']['label'])) { $note[] = $data['compare']['label']; }
+    if (!empty($note)) {
+        $h .= '<div style="font-size:11.5px;color:' . SUM_FAINT . ';padding:8px 2px 0;">'
+            . summaryEsc(implode(' · ', $note)) . '</div>';
+    }
+
+    return $h . ($withBox ? summaryConfirmHtml($kind) : '') . '</td></tr>';
+}
+
+/**
+ * Query: one figure in a fetched module's table — the value at the precision
+ * the endpoint asked for, and its change as a chip.
+ *
+ * A NULL CHANGE PRINTS NOTHING AND A ZERO CHANGE PRINTS A DASH. They are
+ * different facts: null is "there was nothing to compare this against" (the
+ * first of the month), zero is "measured, and it did not move". Flattening
+ * them into one would make a quiet day and a first day look identical.
+ */
+function summaryModuleCellHtml($cell, array $col)
+{
+    if (!is_array($cell) || !array_key_exists('value', $cell)) {
+        return summaryEsc(SUM_DASH);
+    }
+
+    $dp  = isset($col['decimals']) ? (int)$col['decimals'] : 0;
+    $out = number_format((float)$cell['value'], $dp);
+    if (isset($col['format']) && $col['format'] === 'percent') { $out .= '%'; }
+    if (!empty($col['unit'])) { $out .= $col['unit']; }
+    $out = summaryEsc($out);
+
+    $d = array_key_exists('delta', $cell) ? $cell['delta'] : null;
+    if ($d === null) { return $out; }
+
+    /* AT THE PRINTED PRECISION. A change of 0.004 shown to 0 dp is '+0',
+     * which contradicts the figure beside it; rounded first it is a dash. */
+    $r = round((float)$d, $dp);
+    if (abs($r) < 0.0000001) {
+        return $out . ' <span style="font-size:11px;color:' . SUM_FAINT . ';">'
+             . summaryEsc(SUM_DASH) . '</span>';
+    }
+
+    return $out . ' <span style="font-size:11px;font-weight:bold;color:'
+         . summaryModuleChipColour($col, $r > 0) . ';">'
+         /* NO UNIT ON THE CHANGE — the figure it follows carries one, and
+          * '91.73% −0.64%' says '%' twice. +/− rather than the ▲/▼ the app
+          * and the push use: this is read on a desktop beside a table, where
+          * a sign is the ordinary notation and has room to be one. */
+         . summaryEsc(($r > 0 ? '+' : '−') . number_format(abs($r), $dp))
+         . '</span>';
+}
+
+/**
+ * Query: the colour a change is printed in.
+ *
+ * BY MEANING, NOW THAT THE ENDPOINT SAYS WHAT ITS FIGURES MEAN. higher_is is
+ * 'better' for work done and 'worse' for outstanding potholes, so a rise is
+ * green on one and red on the other — which is the whole point of colouring
+ * it. Before the field existed every rise had to be the same neutral blue,
+ * because green or red would have been a judgement nobody had made.
+ *
+ * A COLUMN THAT SAYS NOTHING KEEPS THE NEUTRAL TREATMENT, so an endpoint
+ * written before higher_is existed is not quietly given an opinion.
+ */
+function summaryModuleChipColour(array $col, $up)
+{
+    $sense = isset($col['higher_is']) ? $col['higher_is'] : '';
+    if ($sense === 'better') { return $up ? SUM_GREEN : SUM_RED; }
+    if ($sense === 'worse')  { return $up ? SUM_RED   : SUM_GREEN; }
+    return $up ? SUM_BLUE : SUM_MUTED;
 }
 
 /**
@@ -1675,6 +1981,175 @@ function summaryPushTail($delta)
 }
 
 /**
+ * Query: a FETCHED module as one line of a push notification, or '' when it
+ * has nothing to say.
+ *
+ * THE SAME GRAMMAR AS THE STAFF LINE ABOVE IT — figure, then arrow, then a
+ * middot — so the two read as one message and not as two notifications that
+ * happen to have arrived together. A reader who has learnt what '▲1' means on
+ * line one does not have to learn anything new on line two.
+ *
+ * IT IS THE TOTAL ROW AND ONLY THE TOTAL ROW. A manager of four districts
+ * would otherwise get four lines in a shade that shows two, and the line that
+ * answers "how are we doing" is the one that adds them up. The breakdown is
+ * one tap away, in the section this line is advertising.
+ *
+ * THE ARROWS ARE THE ENDPOINT'S OWN DELTAS, carried on each cell. Nothing here
+ * subtracts anything or reads a baseline out of staff_summary_notify: the
+ * endpoint measured the same month twice in one run and already knows. A null
+ * delta prints no arrow at all — on the first of the month there is nothing to
+ * compare against, and a bare figure says exactly that.
+ *
+ * COARSER THAN THE TABLE, DELIBERATELY: 2,099 m² and 91.7%, not 2,098.94 and
+ * 91.73%. The endpoint's push block says at what precision; see
+ * ro1waPushBlock() for why the endpoint is the layer that decides.
+ *
+ * A MODULE THAT SENDS NO PUSH BLOCK still gets a line, built from its title
+ * and its ordinary columns. Longer, and correct.
+ */
+function summaryPushModuleLine(array $mod, $fetched)
+{
+    if (!is_array($fetched) || empty($fetched['ok']) || !is_array($fetched['data'])) {
+        return '';
+    }
+    $data  = $fetched['data'];
+    $total = isset($data['total']) && is_array($data['total']) ? $data['total'] : null;
+    if ($total === null || empty($data['rows'])) {
+        return '';
+    }
+
+    $push = (isset($data['push']) && is_array($data['push'])) ? $data['push'] : array();
+
+    /* WHICH LIST OF COLUMNS THIS LINE IS BUILT FROM, and it changes how a
+     * column is NAMED. A push column's label is taken exactly as given,
+     * EMPTY INCLUDED — 'm²' says what the figure is, so the work-done column
+     * deliberately has no label at all. An ordinary column has always got a
+     * label, so "take it when it is set" would never reach short_label; the
+     * two cases have to be told apart rather than merged. */
+    $fromPush = (isset($push['columns']) && is_array($push['columns'])
+                 && !empty($push['columns']));
+    $cols = $fromPush
+        ? $push['columns']
+        : (isset($data['columns']) && is_array($data['columns']) ? $data['columns'] : array());
+    if (empty($cols)) { return ''; }
+
+    /* The module's own short name, then its title's FIRST WORD as the
+     * fallback — 'RO1 Work Achievement' gives 'RO1', which is what anybody
+     * would have abbreviated it to anyway. */
+    $label = isset($push['label']) && $push['label'] !== '' ? $push['label'] : '';
+    if ($label === '') {
+        $words = preg_split('/\s+/', trim((string)$mod['title']));
+        $label = isset($words[0]) ? $words[0] : '';
+    }
+
+    /* The full column list, to borrow format and unit from — the push block
+     * says what to CALL a column and at what precision, not what it is. */
+    $full = array();
+    foreach ((isset($data['columns']) && is_array($data['columns'])) ? $data['columns'] : array() as $c) {
+        if (isset($c['key'])) { $full[$c['key']] = $c; }
+    }
+
+    $parts = array();
+    foreach ($cols as $c) {
+        $key = isset($c['key']) ? $c['key'] : '';
+        if ($key === '' || !isset($total[$key]) || !is_array($total[$key])) { continue; }
+
+        $base = isset($full[$key]) ? $full[$key] : array();
+        $dp   = isset($c['decimals']) ? (int)$c['decimals']
+              : (isset($base['decimals']) ? (int)$base['decimals'] : 0);
+        $fmt  = isset($base['format']) ? $base['format'] : 'number';
+        /* The push may override the unit as well as the precision: the table
+         * wants '1,219.22 m²' and the shade wants '1,219m²', and the space is
+         * worth having in one place and not the other. */
+        $unit = isset($c['unit']) ? $c['unit']
+              : (isset($base['unit']) ? $base['unit'] : '');
+
+        $cell = $total[$key];
+        $text = number_format((float)$cell['value'], $dp);
+        if ($fmt === 'percent') { $text .= '%'; }
+        if ($unit !== '')       { $text .= $unit; }
+
+        /* The label goes BEFORE the figure, as 'Late 5' does — or after it,
+         * for a word that reads as a noun rather than a heading ('102 open').
+         * label_after is how a column says which it is.
+         *
+         * WITHOUT A PUSH BLOCK the ordinary short_label stands in, and the
+         * full label only as a last resort. A module that describes neither
+         * gets a long line, which the trim at the end will then shorten by
+         * dropping figures — it is still right, and the fix is one field. */
+        if ($fromPush) {
+            $name = isset($c['label']) ? trim((string)$c['label']) : '';
+        } else {
+            $name = (isset($base['short_label']) && $base['short_label'] !== '')
+                ? $base['short_label']
+                : (isset($base['label']) ? (string)$base['label'] : '');
+        }
+        if ($name !== '') {
+            $text = !empty($c['label_after']) ? $text . ' ' . $name : $name . ' ' . $text;
+        }
+
+        $parts[] = $text . summaryPushTail(summaryPushCellDelta($cell, $dp, $fmt));
+    }
+
+    if (empty($parts)) { return ''; }
+
+    /* A LAST LINE OF DEFENCE AGAINST A WRAPPED LINE.
+     *
+     * A notification shade is about forty characters wide and Android wraps
+     * wherever it likes — in the middle of '5 open ▲10' if that is where the
+     * edge falls, which reads as noise rather than as a figure. The endpoint's
+     * push block is what keeps a line short (see ro1waPushBlock(), which drops
+     * one of its three figures for exactly this reason), but a module that
+     * sends no push block, or a district with unusually large numbers, can
+     * still overflow.
+     *
+     * So the line gives up its LAST figure rather than its shape, one at a
+     * time, until it fits. Dropping from the end is the only honest direction:
+     * the push block lists its figures in the order they matter, so the one
+     * that goes is the one its own author ranked last. One figure fewer is a
+     * loss; a figure cut in half is a mess, and the whole line is then worth
+     * less than the figures it still shows.
+     *
+     * The first figure is never dropped, however long it is — a line reading
+     * 'RO1' and nothing else would say less than no line at all. */
+    $head = ($label !== '' ? $label . ' ' : '');
+    while (count($parts) > 1
+           && mb_strlen($head . implode(' · ', $parts), 'UTF-8') > SUMMARY_PUSH_LINE_MAX) {
+        array_pop($parts);
+    }
+
+    return $head . implode(' · ', $parts);
+}
+
+/**
+ * Query: '▲10', '▼0.6', '—' or '' — one fetched cell's own change, printed
+ * the way summaryPushDelta() prints a head count's.
+ *
+ * '' AND '—' ARE DIFFERENT ANSWERS and the difference matters on exactly one
+ * morning a month: '' is "there was no earlier day in this month to compare
+ * against", which is the 1st, and '—' is "measured, and it did not move". A
+ * bare figure on the 1st is therefore correct and not a missing arrow.
+ */
+function summaryPushCellDelta(array $cell, $dp, $format)
+{
+    if (!array_key_exists('delta', $cell) || $cell['delta'] === null) { return ''; }
+
+    $d = (float)$cell['delta'];
+    /* AT THE PRINTED PRECISION, not the raw value. A change of 0.004 shown to
+     * 0 dp is '▲0', which reads as a contradiction; rounded first it is '—',
+     * which agrees with the figure beside it. The same rule the report's
+     * colour test uses. */
+    $r = round($d, $dp);
+    if (abs($r) < 0.0000001) { return '—'; }
+
+    /* NO UNIT ON THE ARROW, not even on a percentage. The figure it follows
+     * already carries one — '91.7% ▼0.6%' says '%' twice in nine characters,
+     * on the line where characters are scarcest — and the staff line above
+     * prints a bare '▲1' for the same reason. */
+    return ($r > 0 ? '▲' : '▼') . number_format(abs($r), $dp);
+}
+
+/**
  * Query: ' vs 24 Oct' — which day the arrows are measured against — or '',
  * when that day is simply the one before and saying so is noise.
  *
@@ -1745,7 +2220,8 @@ function summaryPushUnits(array $units, $max = 2)
  * wire whatever is put in them, and a number read back as a number on one
  * platform and a string on the other is a bug waiting for a release.
  */
-function summaryPushMessage(array $recipient, array $counts, $prev, $todayIso, $unitLine)
+function summaryPushMessage(array $recipient, array $counts, $prev, $todayIso, $unitLine,
+                           array $modLines = array(), array $modData = array())
 {
     $wasLate  = $prev === null ? null : (int)$prev['late_count'];
     $wasLeave = $prev === null ? null : (int)$prev['leave_count'];
@@ -1772,13 +2248,29 @@ function summaryPushMessage(array $recipient, array $counts, $prev, $todayIso, $
     $context[] = 'not acknowledged';
     $context[] = date('j M', strtotime($todayIso)) . summaryPushAgainst($prev, $todayIso);
 
+    /* THE FIGURE LINES STAY TOGETHER AND THE CONTEXT LINE GOES LAST. A fetched
+     * module's line is built to the same grammar as the staff line — figure,
+     * arrow, middot — so the two read as one message. Putting the unit and the
+     * date between them would split one statement into two that merely arrived
+     * together.
+     *
+     * It costs the context line a place further down, which is the right
+     * trade: "not acknowledged" is also what the notification's existence
+     * says, and the date is nearly free because the shade already shows the
+     * time it arrived. */
+    $lines = array($figures);
+    foreach ($modLines as $line) {
+        if ($line !== '') { $lines[] = $line; }
+    }
+    $lines[] = implode(' · ', $context);
+
     return array(
         /* A SHORT TITLE. The long one wrapped to two lines in the shade and
          * was cut mid-word in the list — and the words being cut were the
          * ones saying what to do about it. They are on line two now, where
          * there is room for them. */
         'title' => 'Daily Staff Summary',
-        'body'  => $figures . "\n" . implode(' · ', $context),
+        'body'  => implode("\n", $lines),
         'data'  => array(
             'screen'   => 'StaffUtility',
             'category' => 'daily_summary',
@@ -1786,7 +2278,10 @@ function summaryPushMessage(array $recipient, array $counts, $prev, $todayIso, $
             'late'     => (string)(int)$counts['late'],
             'leave'    => (string)(int)$counts['leave'],
             'comp'     => (string)(int)$counts['comp'],
-        ),
+        /* A fetched module's line rides along under its own key, so the app
+         * could act on it without opening the summary. Nothing reads these
+         * yet; they cost a few bytes in a payload already being sent. */
+        ) + $modData,
     );
 }
 
@@ -1892,9 +2387,11 @@ function summaryPushSend($userId, $title, $body, array $data)
  * this table.
  */
 function summaryPushOne(PDO $pdo, PDOStatement $logStmt, array $recipient, $userId,
-                        array $counts, $prev, $unitLine, $todayIso, $now)
+                        array $counts, $prev, $unitLine, $todayIso, $now,
+                        array $modLines = array(), array $modData = array())
 {
-    $message = summaryPushMessage($recipient, $counts, $prev, $todayIso, $unitLine);
+    $message = summaryPushMessage($recipient, $counts, $prev, $todayIso, $unitLine,
+                                  $modLines, $modData);
 
     /* The test handset, if one is set — see SUMMARY_PUSH_TEST_USER_ID. The
      * body is still this manager's morning; only the handset is borrowed. */
@@ -2219,6 +2716,25 @@ if (SUMMARY_PUSH && !$dryRun && !$rebuild) {
     }
 }
 
+/* ---------- which sections, for whom ------------------------------------- *
+ *
+ * READ ONCE FOR THE WHOLE RUN, not once per recipient: four catalogue rows and
+ * a handful of exceptions, asked for inside a loop over thirty-odd people,
+ * would be seventy queries for an answer that cannot change mid-run.
+ *
+ * A module that is NOT built in is FETCHED PER PERSON further down, because
+ * its figures are about that one person — RO1 Work Achievement answers for
+ * the districts one manager holds, so there is nothing to read once and share.
+ */
+$modCatalogue = dsModCatalogue(Db::get());
+$modStaffRows = dsModStaffRows(Db::get(), SUMMARY_COMP_ID);
+
+summaryLog('  modules             ' . count($modCatalogue) . ' active'
+         . (dsModInstalled()
+              ? ''
+              : ' (the module tables are NOT installed — falling back to the '
+                . 'original three; run sql/staff_summary_module.sql)'));
+
 foreach ($recipients as $key => $recipient) {
     /* ONLY THE PEOPLE A SECTION IS ABOUT. The three sections each list their
      * own, so somebody who was on time, took no leave and collected nothing
@@ -2264,8 +2780,60 @@ foreach ($recipients as $key => $recipient) {
      * budget allows — see SUMMARY_MAIL_MAX_ROWS. Capping first was what made
      * a section's heading disagree with the section. */
 
+    /* ---- this person's sections ----
+     *
+     * AFTER THE SKIP CHECKS, DELIBERATELY. Somebody with a clean department or
+     * an acknowledgement already in is never reached here, so no endpoint is
+     * called on their behalf — which is the difference between four HTTP
+     * requests this morning and thirty-three.
+     *
+     * A FETCHED MODULE IS ONLY CALLED FOR SOMEBODY WHO IS SHOWN IT. Nobody has
+     * RO1 Work Achievement until they are ticked for it, so on the morning
+     * this first runs $modFetched is empty for all thirty-three and the run is
+     * byte for byte the run it was yesterday.
+     *
+     * THE DAY ASKED FOR IS $todayIso, NOT date('Y-m-d'). A re-run of an
+     * earlier day must ask the endpoint for THAT day, or the snapshot would
+     * carry this morning's figures under yesterday's heading. */
+    $modPersonKey = dsModKey(SUMMARY_COMP_ID, $recipient['person']);
+    $modShown     = dsModAllowedKeys($modPersonKey, $modStaffRows, $modCatalogue);
+    $modFetched   = array();
+
+    foreach ($modShown as $modKey) {
+        if (!empty($modCatalogue[$modKey]['built_in'])) { continue; }
+        $modFetched[$modKey] = dsModFetch(
+            $modCatalogue[$modKey],
+            array('email'   => $recipient['email'],
+                  'person'  => $recipient['person'],
+                  'comp_id' => SUMMARY_COMP_ID),
+            $todayIso
+        );
+        summaryLog(sprintf('  %-20s module %-10s %s',
+            $recipient['person'], $modKey,
+            $modFetched[$modKey]['ok']
+                ? 'read ' . count($modFetched[$modKey]['data']['rows']) . ' row(s)'
+                : 'NOT read: ' . $modFetched[$modKey]['error']));
+    }
+
+    /* WHAT MUST BE TICKED — allowed, has something in it, and must-acknowledge.
+     * It replaces summaryItemKeys() wherever a day is judged complete: that
+     * function tests only whether a section has content, which was the whole
+     * rule while everybody got every section and had to tick all three. */
+    $modBoxes = dsModBoxKeys($modPersonKey, $modStaffRows, $modCatalogue,
+                             $groups, $modFetched);
+
     /* The snapshot is EVERY group, not the shown ones: the page is where the
-     * ticking happens and it must hold the whole department. */
+     * ticking happens and it must hold the whole department.
+     *
+     * THE FETCHED MODULES ARE STORED WITH IT, answer and all. The page, the
+     * API and the app read this and never call the endpoint themselves — the
+     * same rule the three built-in sections live under, so what somebody
+     * acknowledges is what they were sent. dsModFetch() has the reasoning.
+     *
+     * module_keys AND ack_keys ARE WRITTEN DOWN rather than recomputed by each
+     * reader. They are what THIS MORNING decided; a tick changed at noon must
+     * not retrospectively add a section to a summary already in somebody's
+     * inbox, or move the finishing line on a day half acknowledged. */
     $payload = json_encode(array(
         'date'      => $todayIso,
         'recipient' => array(
@@ -2275,8 +2843,12 @@ foreach ($recipients as $key => $recipient) {
             'role'     => $recipient['role'],
             'units'    => array_keys($recipient['units']),
         ),
-        'day_cols' => $dayCols,
-        'groups'   => $groups,
+        'day_cols'    => $dayCols,
+        'groups'      => $groups,
+        'module_keys' => $modShown,
+        'module_meta' => dsModMeta($modShown, $modCatalogue),
+        'ack_keys'    => $modBoxes,
+        DS_MOD_PAYLOAD_KEY => $modFetched,
     ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
     /* The three figures the row keeps are the DEPARTMENT's totals, so a report
@@ -2302,7 +2874,8 @@ foreach ($recipients as $key => $recipient) {
     $subject = (!empty($own) ? implode(' · ', array_slice($own, 0, 2)) . ' — ' : '')
              . 'Staff Summary ' . $todayIso;
 
-    $html = summaryHtml($recipient, $groups, $todayIso, $ackUrl, $dayCols);
+    $html = summaryHtml($recipient, $groups, $todayIso, $ackUrl, $dayCols,
+                        $modShown, $modFetched, $modCatalogue, $modBoxes);
 
     if ($dryRun) {
         summaryLog(sprintf('  %-20s %3d staff, %3d flagged   -> %s  [dry run]',
@@ -2332,7 +2905,7 @@ foreach ($recipients as $key => $recipient) {
             ':late'     => $lateN,
             ':leave'    => $leaveN,
             ':comp'     => $compN,
-            ':items'    => count(summaryItemKeys($groups)),
+            ':items'    => count($modBoxes),
             ':token'    => $token,
             ':status'   => $existing['status'],
             ':response' => (string)$existing['response'],
@@ -2357,9 +2930,11 @@ foreach ($recipients as $key => $recipient) {
         ':late'     => $lateN,
         ':leave'    => $leaveN,
         ':comp'     => $compN,
-        /* item_count is what must be TICKED, which is one box per SECTION a
-         * person appears in — so somebody late and on leave counts twice. */
-        ':items'    => count(summaryItemKeys($groups)),
+        /* item_count is what must be TICKED: one box per SECTION this person
+         * is shown, has something in and is held to. Somebody late and on
+         * leave counts twice; a section they are shown for information only
+         * counts not at all. dsModBoxKeys() is the rule. */
+        ':items'    => count($modBoxes),
         ':token'    => $token,
         ':status'   => $result['ok'] ? 'sent' : 'failed',
         ':response' => substr($result['response'], 0, 255),
@@ -2383,11 +2958,29 @@ foreach ($recipients as $key => $recipient) {
      * of its own — only the people being pushed need one, and they are the
      * short list. */
     if ($pushReady && isset($pushList[$key])) {
+        /* ONE LINE PER FETCHED MODULE THIS PERSON WAS SENT, in section order,
+         * so the push is ordered like the summary it is advertising. Built
+         * here rather than inside summaryPushOne() because $modFetched belongs
+         * to this loop, and threading the catalogue two levels down to reach
+         * it would buy nothing. */
+        $pushModLines = array();
+        $pushModData  = array();
+        foreach ($modShown as $mk) {
+            if (empty($modCatalogue[$mk]) || !empty($modCatalogue[$mk]['built_in'])) { continue; }
+            $line = summaryPushModuleLine($modCatalogue[$mk],
+                        isset($modFetched[$mk]) ? $modFetched[$mk] : null);
+            if ($line !== '') {
+                $pushModLines[]   = $line;
+                $pushModData[$mk] = $line;
+            }
+        }
+
         $push = summaryPushOne(
             $pdo, $pushStmt, $recipient, $pushList[$key]['user_id'],
             array('late' => $lateN, 'leave' => $leaveN, 'comp' => $compN),
             summaryPushPrevious($pdo, $recipient['person'], SUMMARY_COMP_ID, $todayIso),
-            summaryPushUnits($own), $todayIso, $now);
+            summaryPushUnits($own), $todayIso, $now,
+            $pushModLines, $pushModData);
 
         if ($push['status'] === 'sent') {
             $pushed++;

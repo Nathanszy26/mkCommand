@@ -144,6 +144,13 @@ require_once $apiCore;
  * cron is never included here, because including it would run it. */
 require_once __DIR__ . '/staffSummaryShared.php';
 
+/* WHICH SECTIONS A PERSON WAS SENT, AND WHICH OF THEM NEED A TICK. Read back
+ * out of the stored payload, never off the live module table — see
+ * dsModPayloadSections(). A payload written before the catalogue existed
+ * resolves to the original three, so every day already in
+ * staff_summary_notify answers exactly as it did. */
+require_once __DIR__ . '/staffSummaryModules.php';
+
 /* ---------- the rules ----------------------------------------------------- */
 
 /**
@@ -612,13 +619,92 @@ function apiAckUrl(array $row, $via)
 /* ---------- what a summary looks like on the wire -------------------------- */
 
 /**
+ * Query: one FETCHED section, shaped for a client that has to draw it.
+ *
+ * A TABLE OF FIGURES, NOT A LIST OF PEOPLE. The three built-in sections all
+ * answer "which of your staff", and share a shape the app has drawn since it
+ * was written. A fetched module answers something else entirely — RO1 Work
+ * Achievement answers "which of your districts" — so it is published as
+ * kind 'table' with the endpoint's own columns[] and rows[], and `groups` is
+ * an empty array so an older client finds nothing to draw and falls back to
+ * the heading and the empty line rather than breaking.
+ *
+ * THE ENDPOINT DESCRIBES ITS OWN COLUMNS and this file holds no knowledge of
+ * what they mean: key, label, format and decimals come straight through. A
+ * fifth column added at the endpoint reaches every client with no change
+ * here, which is the whole point of the module contract.
+ *
+ * A FAILED FETCH IS PUBLISHED AS A FAILURE, not as an empty month. error
+ * carries the reason, tick is false, and the client says the figures could
+ * not be read — because "nothing happened" and "nobody could tell you what
+ * happened" must never look the same to a manager.
+ */
+function apiModuleSection($no, array $secDef, array $row, $fetched, $tick, $isTicked)
+{
+    $ok   = is_array($fetched) && !empty($fetched['ok']) && is_array($fetched['data']);
+    $data = $ok ? $fetched['data'] : array();
+    $rows = ($ok && isset($data['rows']) && is_array($data['rows'])) ? $data['rows'] : array();
+    $cols = ($ok && isset($data['columns']) && is_array($data['columns']))
+        ? $data['columns'] : array();
+
+    $empty = $secDef['empty_line'];
+    if ($ok && isset($data['empty_reason']) && $data['empty_reason'] !== '') {
+        $empty = $data['empty_reason'];
+    }
+
+    return array(
+        'key'        => $secDef['key'],
+        'no'         => $no,
+        'kind'       => 'table',
+        'title'      => $secDef['title'],
+        'month'      => summaryMonthLabel($row['notify_date']),
+        'total'      => count($rows),
+        'empty_line' => $empty,
+        'tick'       => (bool)$tick,
+        'ticked'     => (bool)$isTicked,
+        'confirm'    => summaryConfirmLine($secDef['key']),
+        /* EMPTY, AND PRESENT. Every section has carried `groups` since this
+         * endpoint was written; removing it for one kind would make a client
+         * that reads it without checking `kind` throw rather than render
+         * nothing. */
+        'groups'     => array(),
+        'table'      => array(
+            'ok'          => $ok,
+            'error'       => is_array($fetched) ? (string)$fetched['error'] : 'not fetched',
+            'row_label'   => ($ok && isset($data['row_label'])) ? $data['row_label'] : 'Districts',
+            'columns'     => $cols,
+            'rows'        => $rows,
+            /* null rather than an empty object when the endpoint sent none, so
+             * a client can test it without inspecting its contents. */
+            'total_row'   => ($ok && isset($data['total']) && is_array($data['total']))
+                ? $data['total'] : null,
+            'period'      => ($ok && isset($data['period']))  ? $data['period']  : null,
+            'compare'     => ($ok && isset($data['compare'])) ? $data['compare'] : null,
+            'fetched_at'  => is_array($fetched) ? $fetched['fetched_at'] : null,
+            /* WHERE IT CAME FROM, published on purpose. When a figure here is
+             * queried, the first question is which endpoint produced it, and
+             * the answer should not require opening the database. */
+            'source'      => is_array($fetched) ? $fetched['api_url'] : '',
+        ),
+    );
+}
+
+/**
  * Query: the stored snapshot, shaped for a client that has to DRAW it.
  *
  * STRUCTURED, NOT HTML. The mail is the only place HTML is built, because an
  * HTML mail is a different thing from an app screen. What every client shares
  * is the DATA and the rules, which is what this returns: the same groups the
- * mail drew, the day columns, the three sections with their true totals, and
- * the wording each tick box stands for.
+ * mail drew, the day columns, the sections this person was sent with their
+ * true totals, and the wording each tick box stands for.
+ *
+ * WHICH SECTIONS, AND HOW MANY, IS PER PERSON since 30 Oct 2026 — read back
+ * out of the payload's module_keys, which is what the morning decided. Each
+ * section carries a `kind`: 'people' is the shape this endpoint has always
+ * served, groups[] of rows[]; 'table' is a module FETCHED from another server,
+ * whose body is columns[] and rows[] of figures with no people in it at all.
+ * A client meeting a kind it does not know should draw the heading and the
+ * empty line and never guess.
  *
  * THE SENTENCES COME FROM HERE, not from the app. summaryConfirmLine() is
  * what the mail printed and what the page prints; an app writing its own
@@ -630,30 +716,57 @@ function apiSummaryBody(array $row)
     $groups  = (is_array($payload) && isset($payload['groups']))   ? $payload['groups']   : array();
     $dayCols = (is_array($payload) && isset($payload['day_cols'])) ? $payload['day_cols'] : array();
 
-    $want   = summaryItemKeys($groups);
+    /* WHICH SECTIONS THIS PERSON WAS SENT, AND WHICH OF THEM NEED A TICK —
+     * both out of the stored payload, never off the live module table. What
+     * the morning decided is what is served: a tick changed at noon on
+     * staffSummaryModuleReport.php must not add a section to a summary
+     * already in somebody's inbox, nor move the finishing line on a day half
+     * acknowledged. A payload written before the catalogue existed resolves
+     * to the original three, so every day already in staff_summary_notify
+     * still answers exactly as it did. */
+    $secDefs    = dsModPayloadSections($payload);
+    $modFetched = dsModPayloadModules($payload);
+
+    $want   = dsModPayloadBoxes($payload, $groups);
     $ticked = summaryTickedSoFar($row['acked_items'], $want);
     $done   = !empty($row['acked_datetime']);
 
-    /* The three sections, in order, each with the people it is about. The
-     * totals are counted HERE from the snapshot rather than read from the
-     * row's denormalised columns: those tally events (a person late twice is
-     * two) and these count people, which is what a heading shows. */
+    /* The sections, in order, each with the people it is about. The totals are
+     * counted HERE from the snapshot rather than read from the row's
+     * denormalised columns: those tally events (a person late twice is two)
+     * and these count people, which is what a heading shows. */
     $sections = array();
-    $headings = array(
-        'late'  => array('no' => 1, 'title' => 'Lateness',
-                         'empty' => 'Nobody was late or missing a check-in.'),
-        'leave' => array('no' => 2, 'title' => 'Excessive Leaves',
-                         'empty' => 'No leave taken or booked this month.'),
-        'comp'  => array('no' => 3, 'title' => 'Compliance',
-                         'empty' => 'No compliance recorded this month.'),
-    );
+    $flags    = summarySections();
+    $no       = 0;
 
-    foreach (summarySections() as $kind => $flag) {
+    foreach ($secDefs as $secDef) {
+        $kind = $secDef['key'];
+        $no++;
+
+        /* A FETCHED SECTION IS A TABLE OF FIGURES, NOT A LIST OF PEOPLE, so
+         * it is published with the same envelope and a different body — see
+         * apiModuleSection(). `kind` is the field a client branches on; every
+         * section has carried one since 30 Oct 2026, and a client that does
+         * not know a kind should draw the heading and the empty line rather
+         * than guess. */
+        if (empty($secDef['built_in'])) {
+            $sections[] = apiModuleSection(
+                $no, $secDef, $row,
+                isset($modFetched[$kind]) ? $modFetched[$kind] : null,
+                isset($want[$kind]), isset($ticked[$kind]));
+            continue;
+        }
+
+        $flag   = isset($flags[$kind]) ? $flags[$kind] : null;
         $people = array();
         foreach ($groups as $g) {
             $keep = array();
             foreach (isset($g['rows']) ? $g['rows'] : array() as $r) {
-                if (!empty($r[$flag])) {
+                /* $flag is null for a built-in module summarySections()
+                 * does not know — a key invented in the catalogue and marked
+                 * built_in by mistake. It lists nobody rather than indexing a
+                 * row with a null key. */
+                if ($flag !== null && !empty($r[$flag])) {
                     /* EMERGENCY LEAVE AND LEAVE WITHOUT PAY, COUNTED AT SERVE
                      * TIME and not stored. It is a reading of the
                      * applications the snapshot already holds, so it is the
@@ -694,11 +807,17 @@ function apiSummaryBody(array $row)
 
         $sections[] = array(
             'key'        => $kind,
-            'no'         => $headings[$kind]['no'],
-            'title'      => $headings[$kind]['title'],
+            'no'         => $no,
+            /* WHAT A CLIENT BRANCHES ON. 'people' is this shape — groups[] of
+             * rows[], which is what the app has always drawn. 'table' is a
+             * fetched module: columns[] and rows[] of figures, with no people
+             * in it at all. A client meeting an unknown kind should draw the
+             * heading and the empty line, never guess. */
+            'kind'       => 'people',
+            'title'      => $secDef['title'],
             'month'      => ($kind === 'late') ? '' : summaryMonthLabel($row['notify_date']),
             'total'      => $total,
-            'empty_line' => $headings[$kind]['empty'],
+            'empty_line' => $secDef['empty_line'],
             /* NO BOX ON AN EMPTY SECTION — there is nothing to have
              * understood, so it is not part of the total and cannot hold the
              * acknowledgement up. A client must honour this or it will ask

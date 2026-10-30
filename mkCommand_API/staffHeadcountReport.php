@@ -43,6 +43,16 @@
  *   See the Daily Summary Report section below for the whole of it, and
  *   sql/daily_summary_report.sql for the column.
  *
+ * THE DAILY SUMMARY REPORT BUTTON
+ *   The fifth column answers WHO is on the daily summary. WHICH SECTIONS each
+ *   of those people gets — Lateness, Excessive Leaves, Compliance, RO1 Work
+ *   Achievement — and which they must acknowledge is a second question with
+ *   two more answers per person per module, so it has its own page:
+ *   staffSummaryModuleReport.php, reached from the button in the filter row.
+ *   It lists only the ticked people, which is why it is a page of 33 rows and
+ *   not a page of several hundred. The rules behind it are in
+ *   staffSummaryModules.php and its tables in sql/staff_summary_module.sql.
+ *
  * ACCESS
  *   View : any logged-in user, their own company. Super admins see every
  *          company and "All companies"; a company admin sees the companies
@@ -74,6 +84,14 @@ require_once '../includes/UnifiedAuth.php';
  * what keeps this page and every application reading that API on one set of
  * figures. Nothing below re-implements a rule from it. */
 require_once __DIR__ . '/staffPoolCore.php';
+
+/* THE DAILY SUMMARY LIST AND ITS MODULES. This page owns the tick column that
+ * decides WHO is on the daily summary; staffSummaryModuleReport.php owns WHICH
+ * SECTIONS each of those people gets, and the Daily Summary Report button
+ * below opens it. Both read the list through dsModTicked() and the companies
+ * through dsModComps(), out of this one file, so a company added to one and
+ * not the other cannot happen. */
+require_once __DIR__ . '/staffSummaryModules.php';
 
 if (!UnifiedAuth::isLoggedIn()) {
     header('Location: /accounts/mkPortal/user_validation.php');
@@ -124,28 +142,26 @@ function selfUrl(array $changes)
 define('HC_DAILY_SUMMARY_FLAG', 'daily_summary');
 
 /**
- * WHICH COMPANIES SHOW THE COLUMN — a comma list of comp ids, '1' today.
+ * WHICH COMPANIES SHOW THE COLUMN — DS_MOD_COMPS, in staffSummaryModules.php.
  *
- * The list is here rather than in the markup so a second company is one edit:
- * put its id in, and the column appears for it, saves for it and counts for
- * it. An empty string turns the column off everywhere without removing any
+ * THE LIST MOVED, THE NAME DID NOT. It used to be defined here, and it is
+ * still read by that name everywhere below, but the definition now lives in
+ * the shared file because TWO pages need it: this one draws the tick column
+ * and staffSummaryModuleReport.php draws a row per ticked person. A second
+ * company put on one list and not the other would give that company a tick
+ * box whose modules could not be edited, so there is one list.
+ *
+ * An empty string there turns the column off everywhere without removing any
  * of the code — and without touching the data, which stays on the users rows
  * and comes back the moment the id goes back in.
- *
- * It is matched against homeCompId(), so Trillium (16) is covered by 1: its
- * people are reported as company 16 and stored under Globinaco.
  */
-define('HC_DAILY_SUMMARY_COMPS', '1');
+define('HC_DAILY_SUMMARY_COMPS', DS_MOD_COMPS);
 
-/** Query: HC_DAILY_SUMMARY_COMPS as a list of ints. */
+/** Query: the companies with a daily summary list, as a list of ints. One
+ *  definition, in staffSummaryModules.php. */
 function hcDsComps()
 {
-    $out = array();
-    foreach (explode(',', HC_DAILY_SUMMARY_COMPS) as $c) {
-        $c = trim($c);
-        if ($c !== '' && ctype_digit($c)) { $out[] = (int)$c; }
-    }
-    return $out;
+    return dsModComps();
 }
 
 /**
@@ -157,12 +173,14 @@ function hcDsComps()
  * report down with it. So the first read decides, once, and everything else
  * asks here — no column, no column on screen, and the rest of the report is
  * exactly as it was. Run sql/daily_summary_report.sql and it appears.
+ *
+ * It is dsModListInstalled()'s flag, not one of this page's own: the read that
+ * sets it is dsModTicked(), shared with the module page, so the diagnosis has
+ * to be shared too.
  */
 function hcDsInstalled($set = null)
 {
-    static $ok = true;
-    if ($set !== null) { $ok = (bool)$set; }
-    return $ok;
+    return dsModListInstalled($set);
 }
 
 /** Query: does the column appear on THIS view? '' is "all companies", where
@@ -176,55 +194,33 @@ function hcDsOnView($compId)
     return in_array(homeCompId((int)$compId), $comps, true);
 }
 
-/** Query: does THIS row get a box — a staff row at a listed company. */
+/** Query: does THIS row get a box — a staff row at a listed company. One
+ *  definition, in staffSummaryModules.php, shared with the module page. */
 function hcDsOnRow(array $row)
 {
-    return $row['person_type'] === 'staff'
-        && in_array(homeCompId($row['comp_id']), hcDsComps(), true);
+    return dsModOnRow($row);
 }
 
 /** Query: the key one person is held under. Lower-cased because a login is
  *  typed by people and users.person is not consistently cased; the company is
- *  the home one, so a Trillium row and its users row agree. */
+ *  the home one, so a Trillium row and its users row agree. dsModKey() is
+ *  that rule, and the module table is keyed by it too — which is what makes a
+ *  tick here and a module row there the same person. */
 function hcDsKey($compId, $person)
 {
-    return homeCompId($compId) . "\x1f" . strtolower(trim((string)$person));
+    return dsModKey($compId, $person);
 }
 
 /** Query: everybody ticked, as a set keyed by hcDsKey(). One query for the
- *  page, not one per row. */
+ *  page, not one per row — and dsModTicked()'s query, not a second copy of
+ *  it, because the module page lists exactly the people this column ticks.
+ *
+ *  A COLUMN THAT IS NOT ON SCREEN IS NOT READ. hcDsOnView() short-circuits
+ *  before the query, so a company with no daily summary list costs nothing. */
 function hcDsTicks(PDO $db, $compId)
 {
     if (!hcDsOnView($compId)) { return array(); }
-
-    $sql  = "SELECT u.person, u.comp_id
-               FROM staff_portal2.users u
-              WHERE IFNULL(u.daily_summary_report, 0) = 1
-                AND u.status = '1' AND u.deleted = '0'";
-    $args = array();
-    /* One company on screen narrows the read; "all companies" does not, since
-     * the table then holds rows from every one of them. */
-    if ($compId !== null && $compId !== '') {
-        $sql .= " AND u.comp_id = :c";
-        $args[':c'] = homeCompId((int)$compId);
-    }
-
-    $out = array();
-    try {
-        $stmt = $db->prepare($sql);
-        $stmt->execute($args);
-        foreach ($stmt->fetchAll() as $r) {
-            $out[hcDsKey($r['comp_id'], $r['person'])] = 1;
-        }
-    } catch (PDOException $e) {
-        /* Almost certainly the column not being there yet. The report is not
-         * worth losing over a column it gained last week, so it is noted and
-         * the column stands down. */
-        error_log('staffHeadcountReport daily_summary_report: ' . $e->getMessage());
-        hcDsInstalled(false);
-        return array();
-    }
-    return $out;
+    return dsModTicked($db, $compId);
 }
 
 /** Query: is this row ticked? */
@@ -853,6 +849,14 @@ function logPhrase($old, $new)
         border:1px solid var(--border); background:var(--surface); color:var(--text); }
     .btn { text-decoration:none; display:inline-block; cursor:pointer; }
     .btn.on { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:600; }
+    /* The one control on this row that LEAVES the page, so it is marked as a
+       destination rather than another filter. Pushed to the right end where a
+       "go somewhere" control is looked for. */
+    .btn.go { margin-left:auto; background:var(--primary); border-color:var(--primary);
+              color:#fff; font-weight:600; }
+    .btn.go:hover { background:#1d4ed8; }
+    .btn.go i { margin-right:5px; }
+    @media (max-width:768px) { .btn.go { margin-left:0; } }
     .btn:disabled { opacity:.5; cursor:default; }
     .check { display:inline-flex; align-items:center; gap:6px; font-size:13px;
              padding:7px 2px; white-space:nowrap; }
@@ -1021,6 +1025,34 @@ function logPhrase($old, $new)
     <?php if ($filtered): ?>
         <a class="btn" href="<?php echo h(selfUrl(array(
             'q' => null, 'dept' => null, 'changed' => null, 'flag' => null))); ?>">Clear</a>
+    <?php endif; ?>
+
+    <?php
+    /* THE DAILY SUMMARY REPORT BUTTON — the modules page.
+     *
+     * This column answers WHO is on the daily summary. It cannot answer WHICH
+     * SECTIONS each of them gets, because that is four answers a person and
+     * would be eight more tick boxes across a table that already carries five
+     * — on every row of a pool of several hundred, almost all of which have no
+     * daily summary at all. So the second question gets its own page, listing
+     * only the ticked people, and this is the way to it.
+     *
+     * SHOWN UNDER EXACTLY THE SAME TEST AS THE COLUMN, hcDsOnView(): if there
+     * is no list on this view there is nothing to configure, and a button
+     * leading to an empty page reads as a broken feature. It carries comp_id
+     * so the two pages open on the same company.
+     *
+     * NOT A FILTER, so it sits outside the form's own controls visually and
+     * is the last thing on the row. */
+    if (hcDsOnView($compId)):
+        $dsmUrl = 'staffSummaryModuleReport.php'
+                . ($compId === null ? '' : '?comp_id=' . (int)$compId);
+    ?>
+        <a class="btn go" href="<?php echo h($dsmUrl); ?>"
+           title="Choose which sections each person on the daily summary list is shown, and which they must acknowledge">
+            <i class="fa-regular fa-rectangle-list"></i>
+            Daily Summary Report
+        </a>
     <?php endif; ?>
 </form>
 
@@ -1225,7 +1257,12 @@ renderTable(array_merge($staffShown, $gwShown), $groupBy, $overrides,
 
     function setNum(id, value) {
         var el = document.getElementById(id);
-        if (el) { el.textContent = String(value); }
+        /* An absent id OR an absent value is left alone. A total the server
+           did not send must keep the figure the page was rendered with —
+           writing "undefined" over it would read as a broken count. */
+        if (el && value !== undefined && value !== null) {
+            el.textContent = String(value);
+        }
     }
 
     function show(id, on) {
@@ -1253,7 +1290,14 @@ renderTable(array_merge($staffShown, $gwShown), $groupBy, $overrides,
         show('s_removed_wrap', s.removed > 0);
         setNum('s_shown', t.shown);
 
-        ['in_pool', 'kpi', 'mk_command', 'mk_academy'].forEach(function (k) {
+        /* The Daily Summary Report foot is in this list because the save
+           endpoint has always sent it — footTotals() plus hcDsFoot() — and
+           nothing was writing it back, so ticking the fifth column moved the
+           box and left its total reading whatever the page was rendered with
+           until a reload. setNum() ignores an absent id, so the extra key
+           costs nothing on a view where the column is not drawn. */
+        ['in_pool', 'kpi', 'mk_command', 'mk_academy',
+         <?php echo json_encode(HC_DAILY_SUMMARY_FLAG); ?>].forEach(function (k) {
             setNum('f_' + k, f[k]);
         });
     }

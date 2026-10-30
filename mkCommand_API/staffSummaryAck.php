@@ -1,17 +1,26 @@
 <?php
 /**
  * STAFF SUMMARY ACKNOWLEDGEMENT — the page the mail's Acknowledge link opens,
- * where a manager reads the three sections and says so.
+ * where a manager reads their sections and says so.
  *
- * ONE TICK A SECTION. Lateness, Excessive Leaves and Compliance each end in a
- * single box carrying the sentence it stands for — summaryConfirmLine(), the
- * same words the mail prints. A section with nobody in it has no box. The
- * Acknowledge button is held until every box that exists is ticked, and the
- * server checks the same thing, so a browser with no JavaScript is told
- * rather than let through.
+ * HOW MANY SECTIONS, AND WHICH, IS NO LONGER FIXED. It was Lateness,
+ * Excessive Leaves and Compliance for everybody; since 30 Oct 2026 it is
+ * whatever that person was sent, which the morning wrote into the payload as
+ * module_keys. A module may also be FETCHED from another server — RO1 Work
+ * Achievement is — and such a section is a table of figures rather than a list
+ * of staff. dsModPayloadSections() is the reader; staffSummaryModules.php has
+ * the rules and staffSummaryModuleReport.php is where a person's set is
+ * chosen.
+ *
+ * ONE TICK A SECTION. Each ends in a single box carrying the sentence it
+ * stands for — summaryConfirmLine(), the same words the mail prints. A section
+ * with nothing in it has no box, and neither has one this person is shown for
+ * information only. The Acknowledge button is held until every box that exists
+ * is ticked, and the server checks the same thing, so a browser with no
+ * JavaScript is told rather than let through.
  *
  * WAYS IN, AND ALL OF THEM RECORD:
- *   ?t=TOKEN                the three sections, with a box closing each.
+ *   ?t=TOKEN                the sections, with a box closing each.
  *   ?t=TOKEN&tick=SECTION   that section ticked on arrival, then the page.
  *   a submitted form        from this page (POST), or from the mail (GET),
  *                           because a mail client that submits at all does it
@@ -57,6 +66,13 @@ require_once $ackCore;
  * what was sent. The cron itself is never included here, because including it
  * would run it. */
 require_once __DIR__ . '/staffSummaryShared.php';
+
+/* WHICH SECTIONS THIS PERSON WAS SENT, AND WHICH OF THEM NEED A TICK. Read
+ * back out of the stored payload, never off the live table — see
+ * dsModPayloadSections(). A payload written before any of this falls back to
+ * the original three, so every day already in staff_summary_notify still
+ * opens exactly as it did. */
+require_once __DIR__ . '/staffSummaryModules.php';
 
 /* ---------- the page ------------------------------------------------------ */
 
@@ -144,6 +160,17 @@ function ackHead($title)
        . '.sh .t{flex:1;font-size:22px;font-weight:700;color:var(--ink);line-height:1.25}'
        . '.sh .c{font-size:22px;font-weight:700;color:var(--blue);white-space:nowrap}'
        . '.none{font-size:12.5px;color:var(--faint);padding:12px 0 2px}'
+       /* A fetched module's table: a heavier total row, a neutral change chip
+          and the period note under it. The chip is coloured by DIRECTION and
+          not by goodness -- "work done up" is good and "outstanding potholes
+          up" is not, and nothing here knows which column it is drawing. */
+       . 'table.t tr.tot td{font-weight:700;background:var(--wash);'
+       . 'border-top:2px solid var(--line)}'
+       . '.chip{font-size:11px;font-weight:700;margin-left:5px}'
+       . '.chip.up{color:var(--blue)}.chip.down{color:var(--muted)}'
+       . '.chip.good{color:var(--green)}.chip.bad{color:var(--red)}'
+       . '.chip.flat{color:var(--faint)}'
+       . '.modnote{font-size:11.5px;color:var(--faint);padding:8px 2px 0}'
        /* the entries listed under a person's figures */
        . 'table.t tr.ent td{padding:1px 10px 11px;font-size:12px;color:var(--muted);'
        . 'line-height:1.75;border-top:0;text-align:left;vertical-align:top}'
@@ -278,19 +305,181 @@ function ackAttCell(array $cell)
  * list, which is one act, not one act per person on it. See
  * summaryItemKeys().
  */
-function ackSections(array $groups, array $dayCols, array $ticked, array $missing, $done, $ym)
+function ackSections(array $groups, array $dayCols, array $ticked, array $missing, $done, $ym,
+                     array $sections = null, array $modFetched = array(), array $want = null)
 {
-    ackSection('1', 'Lateness', 'late', $groups, $dayCols, $ym, $ticked, $missing, $done,
-               'Nobody was late or missing a check-in.');
-    ackSection('2', 'Excessive Leaves (' . $ym . ')', 'leave', $groups, $dayCols, $ym,
-               $ticked, $missing, $done, 'No leave taken or booked this month.');
-    ackSection('3', 'Compliance (' . $ym . ')', 'comp', $groups, $dayCols, $ym,
-               $ticked, $missing, $done, 'No compliance recorded this month.');
+    /* THE OLD CALL STILL WORKS — the original three, every one of them
+     * required. Nothing calls it that way today; it is the shape a payload
+     * from before the catalogue resolves to anyway, through
+     * dsModPayloadSections(). */
+    if ($sections === null) {
+        $sections = dsModPayloadSections(null);
+    }
+
+    /* THE NUMBERS COME OFF THIS LIST, so a person without RO1 Work
+     * Achievement reads 1-3 and a person with it reads 1-4, rather than the
+     * fourth arriving as a number with a gap in front of it. */
+    $no = 0;
+    foreach ($sections as $sec) {
+        $no++;
+        $kind    = $sec['key'];
+        $heading = ($kind === 'late') ? $sec['title'] : $sec['title'] . ' (' . $ym . ')';
+
+        /* A SECTION WITH NO BOX IS STILL DRAWN IN FULL. $want is the morning's
+         * ack_keys; a section this person is shown for information only is not
+         * in it, so it prints its table and ends without a tick. Passing null
+         * keeps the old behaviour, where having content was the whole test. */
+        $withBox = ($want === null) ? null : isset($want[$kind]);
+
+        if (!empty($sec['built_in'])) {
+            ackSection((string)$no, $heading, $kind, $groups, $dayCols, $ym,
+                       $ticked, $missing, $done, $sec['empty_line'], $withBox);
+            continue;
+        }
+
+        ackModuleSection((string)$no, $heading, $kind, $sec['empty_line'],
+                         isset($modFetched[$kind]) ? $modFetched[$kind] : null,
+                         $ticked, $missing, $done, $withBox);
+    }
+}
+
+/**
+ * Command: one FETCHED section — figures an endpoint produced, not a list of
+ * this person's staff.
+ *
+ * THE PAGE'S TWIN OF summaryModuleSectionHtml() IN THE CRON, drawing the same
+ * stored answer with the same rules, because the mail and the page must show
+ * the same thing hours apart. It reads columns[] and rows[] off the endpoint's
+ * own description, so a column added there appears here with no change on this
+ * side.
+ *
+ * NO TICK BOX WITHOUT FIGURES. A failed fetch and an empty district list both
+ * end the section early, exactly as an empty people section does — there is
+ * nothing to have read, so nothing to confirm, and nothing that can hold the
+ * acknowledgement up.
+ */
+function ackModuleSection($no, $heading, $kind, $emptyLine, $fetched,
+                          array $ticked, array $missing, $done, $withBox = null)
+{
+    $e    = function ($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); };
+    $ok   = is_array($fetched) && !empty($fetched['ok']) && is_array($fetched['data']);
+    $data = $ok ? $fetched['data'] : array();
+    $rows = ($ok && isset($data['rows']) && is_array($data['rows'])) ? $data['rows'] : array();
+    $cols = ($ok && isset($data['columns']) && is_array($data['columns']))
+        ? $data['columns'] : array();
+
+    echo '<div class="card"><div class="pad">'
+       . '<div class="sh">'
+       . '<div class="n">' . $e($no) . '</div>'
+       . '<div class="t">' . $e($heading) . '</div>'
+       . '<div class="c">' . count($rows) . '</div></div>';
+
+    if (!$ok) {
+        echo '<div class="none">'
+           . $e('These figures could not be read this morning'
+                . (is_array($fetched) && $fetched['error'] !== ''
+                       ? ' (' . $fetched['error'] . ')' : '')
+                . '. Nothing is being asked of you about them.')
+           . '</div></div></div>';
+        return;
+    }
+    if (empty($rows) || empty($cols)) {
+        echo '<div class="none">'
+           . $e(isset($data['empty_reason']) && $data['empty_reason'] !== ''
+                   ? $data['empty_reason'] : $emptyLine)
+           . '</div></div></div>';
+        return;
+    }
+
+    echo '<div class="scroll"><table class="t"><thead><tr>'
+       . '<th style="text-align:left">'
+       . $e(isset($data['row_label']) ? $data['row_label'] : 'Districts') . '</th>';
+    foreach ($cols as $c) {
+        echo '<th style="text-align:right">'
+           . $e(isset($c['label']) ? $c['label'] : $c['key']) . '</th>';
+    }
+    echo '</tr></thead><tbody>';
+
+    /* The total is its own field, not a last row, so it can be drawn as a
+     * total rather than looking like one more district. */
+    $all = $rows;
+    if (isset($data['total']) && is_array($data['total'])) {
+        $all[] = $data['total'] + array('_is_total' => true);
+    }
+
+    foreach ($all as $r) {
+        echo '<tr' . (!empty($r['_is_total']) ? ' class="tot"' : '') . '>'
+           . '<td style="text-align:left">' . $e(isset($r['district']) ? $r['district'] : '')
+           . '</td>';
+        foreach ($cols as $c) {
+            $key  = isset($c['key']) ? $c['key'] : '';
+            $cell = (isset($r[$key]) && is_array($r[$key])) ? $r[$key] : null;
+            echo '<td style="text-align:right">' . ackModuleCell($cell, $c) . '</td>';
+        }
+        echo '</tr>';
+    }
+    echo '</tbody></table></div>';
+
+    $note = array();
+    if (isset($data['period']['label']))  { $note[] = $data['period']['label']; }
+    if (isset($data['compare']['label'])) { $note[] = $data['compare']['label']; }
+    if (!empty($note)) {
+        echo '<div class="modnote">' . $e(implode(' · ', $note)) . '</div>';
+    }
+
+    if ($withBox === false) {
+        echo '</div></div>';
+        return;
+    }
+    ackConfirm($kind, $ticked, $missing, $done);
+    echo '</div></div>';
+}
+
+/** Query: one figure in a fetched table — the value at the endpoint's stated
+ *  precision, and its change as a chip. A null change prints nothing (there
+ *  was nothing to compare against); a zero change prints a dash (measured, and
+ *  it did not move). Collapsing the two would make a quiet day and the first
+ *  of the month look identical. */
+function ackModuleCell($cell, array $col)
+{
+    $e = function ($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); };
+    if (!is_array($cell) || !array_key_exists('value', $cell)) { return $e(SUM_DASH); }
+
+    $dp  = isset($col['decimals']) ? (int)$col['decimals'] : 0;
+    $out = number_format((float)$cell['value'], $dp);
+    if (isset($col['format']) && $col['format'] === 'percent') { $out .= '%'; }
+    if (!empty($col['unit'])) { $out .= $col['unit']; }
+    $out = $e($out);
+
+    $d = array_key_exists('delta', $cell) ? $cell['delta'] : null;
+    if ($d === null) { return $out; }
+
+    /* AT THE PRINTED PRECISION, so a change too small to show does not print
+     * as '+0' beside a figure that did not move. */
+    $r = round((float)$d, $dp);
+    if (abs($r) < 0.0000001) {
+        return $out . ' <span class="chip flat">' . $e(SUM_DASH) . '</span>';
+    }
+
+    /* COLOURED BY MEANING where the endpoint stated one — higher_is is
+     * 'better' for work done and 'worse' for outstanding potholes, so a rise
+     * is green on one and red on the other. A column that says nothing keeps
+     * the neutral blue/grey rather than being given an opinion. The mail does
+     * exactly this; summaryModuleChipColour() is the same rule in the same
+     * words. No unit on the change — the figure it follows carries one. */
+    $up    = ($r > 0);
+    $sense = isset($col['higher_is']) ? $col['higher_is'] : '';
+    $cls   = ($sense === 'better') ? ($up ? 'good' : 'bad')
+           : (($sense === 'worse') ? ($up ? 'bad' : 'good')
+                                   : ($up ? 'up' : 'down'));
+
+    return $out . ' <span class="chip ' . $cls . '">'
+         . $e(($up ? '+' : '−') . number_format(abs($r), $dp)) . '</span>';
 }
 
 /** Command: one section — its heading, then a table of the people it covers. */
 function ackSection($no, $heading, $kind, array $groups, array $dayCols, $ym,
-                    array $ticked, array $missing, $done, $emptyLine)
+                    array $ticked, array $missing, $done, $emptyLine, $withBox = null)
 {
     $flag = ($kind === 'late') ? 'in_late' : (($kind === 'leave') ? 'in_leave' : 'in_comp');
 
@@ -432,7 +621,28 @@ function ackSection($no, $heading, $kind, array $groups, array $dayCols, $ym,
     }
     echo '</tbody></table></div>';
 
-    /* THE ONE BOX THAT CLOSES THE SECTION, under the table it is about. */
+    /* THE ONE BOX THAT CLOSES THE SECTION, under the table it is about —
+     * unless this person is shown the section for information only, which is
+     * what $withBox === false says. null keeps the original rule, where
+     * having content was the whole test. */
+    if ($withBox !== false) {
+        ackConfirm($kind, $ticked, $missing, $done);
+    }
+
+    echo '</div></div>';
+}
+
+/**
+ * Command: the one tick box that closes a section, and the sentence it stands
+ * for.
+ *
+ * LIFTED OUT OF ackSection() SO THE FETCHED SECTIONS CAN USE IT TOO. It is the
+ * same box, the same name, the same wording and the same disabled rule for
+ * every section on the page — a reader must not be able to tell from the box
+ * whether the figures above it came from this server or another one.
+ */
+function ackConfirm($kind, array $ticked, array $missing, $done)
+{
     $on   = isset($ticked[$kind]);
     $miss = isset($missing[$kind]);
     echo '<label class="cfm' . ($miss ? ' miss' : ($on ? ' on' : '')) . '" for="c' . $kind . '">'
@@ -441,8 +651,6 @@ function ackSection($no, $heading, $kind, array $groups, array $dayCols, $ym,
        . ($on ? ' checked' : '') . ($done ? ' disabled' : '') . '>'
        . '<span>' . htmlspecialchars(summaryConfirmLine($kind), ENT_QUOTES, 'UTF-8')
        . '</span></label>';
-
-    echo '</div></div>';
 }
 
 /** Command: the leave sub-row — taken applications under Taken, upcoming
@@ -519,6 +727,11 @@ try {
     $groups  = (is_array($payload) && isset($payload['groups']))   ? $payload['groups']   : array();
     $dayCols = (is_array($payload) && isset($payload['day_cols'])) ? $payload['day_cols'] : array();
 
+    /* The sections this person was sent, in the order they were sent, and the
+     * figures any fetched one came back with. Both out of the snapshot. */
+    $sections   = dsModPayloadSections($payload);
+    $modFetched = dsModPayloadModules($payload);
+
     /* Flattened once, for the counts and the item keys. The table itself is
      * drawn from the groups, so the page shows what the mail showed. */
     $rows = array();
@@ -526,10 +739,17 @@ try {
         foreach (isset($g['rows']) ? $g['rows'] : array() as $r) { $rows[] = $r; }
     }
 
-    /* Every tick box on the page — 'late', 'leave', 'comp', and only those
-     * of the three with somebody in them. A posted value that is not one of
-     * these counts for nothing. */
-    $want = summaryItemKeys($groups);
+    /* EVERY TICK BOX ON THE PAGE, and nothing else counts: a posted value
+     * that is not one of these is worth nothing.
+     *
+     * READ BACK OUT OF THE SNAPSHOT, not recomputed. ack_keys is what the
+     * morning decided — the sections this person is shown, that have
+     * something in them, and that they are held to. Recomputing it here would
+     * let a tick changed at noon on staffSummaryModuleReport.php move the
+     * finishing line on a day somebody had half acknowledged. A payload
+     * written before ack_keys existed falls back to summaryItemKeys(), which
+     * is the rule those days were sent under. */
+    $want = dsModPayloadBoxes($payload, $groups);
 
     /* What has been ticked so far, from the email links and from any earlier
      * submission. summaryTickedSoFar() filters it against $want, so a stale
@@ -700,7 +920,8 @@ try {
 
     /* Each section draws its own card, so there is no wrapper here. */
     ackSections($groups, $dayCols, $ticked, $missing, $done,
-                summaryMonthLabel($row['notify_date']));
+                summaryMonthLabel($row['notify_date']),
+                $sections, $modFetched, $want);
 
     if (!$done) {
         echo '<div class="card bar"><div class="pad">'

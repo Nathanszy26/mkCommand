@@ -3,6 +3,11 @@
 // Shows a blocking popup only when staffSummaryAPI.php returns "show_popup": true.
 // Optional: set $summaryPerson before the include to force a person (testing only).
 
+
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+
 if (defined('SSW_LOADED')) return;          // already included on this page
 define('SSW_LOADED', true);
 

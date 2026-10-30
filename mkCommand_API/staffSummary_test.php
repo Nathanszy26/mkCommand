@@ -10,7 +10,7 @@ if (!UnifiedAuth::isLoggedIn()) {
 
 $currentUser = UnifiedAuth::getLoggedInUser();
 $person = $currentUser['person'];
-$person = 'sooCK';   // TODO: restore the line above before deploying
+// $person = 'justin';   // TODO: restore the line above before deploying
 
 // Only Heads of Department and Area Managers / Assistant Area Managers can use this page.
 // Add any other person ids that should also be allowed (e.g. the CEO) here.
@@ -316,7 +316,7 @@ async function fetchTree(person) {
 
 // ---------- Lateness (attendanceAPI.php) ----------
 // staff=<person> returns that person plus everyone under them, so one call per opened department
-// covers the whole branch. Result is cached by month: attCache['2026-10'][person] = {summary, days:{1..31}}.
+// covers the whole branch. Result is cached by month: attCache['2026-10'][person] = {summary, days:{1..31}, schedule}.
 const ATT_API = 'attendanceAPI.php';
 const attCache = {}, attReq = {};
 let attRules = { late_from: '08:01:00' };
@@ -354,6 +354,21 @@ function loadAttFor(staff) {
   loadAtt(staff, y, m).catch(() => {})
     .then(() => fillAttGaps(y, m))
     .then(() => { if (y === +$('fy').value && m === +$('fm').value) refreshCells(); });
+}
+
+// ---------- work schedule (from attendanceAPI: staff[].schedule) ----------
+// Example: schedule = { schedule_type_id:1, schedule_source:'assigned',
+//                       mon_fri:{is_off_day:'0', start:'08:00:00', end:'17:30:00'},
+//                       saturday:{is_off_day:'1', ...} }
+// Only the off days are taken from the schedule (e.g. Saturday is_off_day = 1):
+// no check-in / PM check-out / missed-submission checks on an off day. Everything else works as before.
+const schedOf = (person, y, m) => { const e = (attCache[y + '-' + m] || {})[person]; return (e && e.schedule) || null; };
+// dow: 0=Sun ... 6=Sat. Sunday is always off; Saturday/weekdays follow the schedule.
+function isOffDay(s, dow) {
+  if (dow === 0) return true;
+  if (!s) return false;                                  // no schedule data: keep the old behaviour
+  const blk = dow === 6 ? s.saturday : s.mon_fri;
+  return !!blk && String(blk.is_off_day) === '1';
 }
 
 // ---------- Compliance: demerit records (performanceAPI.php) ----------
@@ -407,6 +422,8 @@ const PM_FROM = '16:30';
 function pmLateHtml(t, person, now) {
   const hhmm = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
   if (hhmm < PM_FROM || now.getDay() === 0) return '';                  // not before 4.30pm, never on Sunday
+  const sc = schedOf(person, now.getFullYear(), now.getMonth() + 1);
+  if (isOffDay(sc, now.getDay())) return '';                            // off day (e.g. Saturday off)
   const ds = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
   const md = (monthCache[ym()] || {})[person];
   if (md && (md.leave || []).some(r => (r.days_in_month || []).some(d => String(d).slice(0, 10) === ds))) return '';   // on leave today
@@ -419,13 +436,16 @@ function pmLateHtml(t, person, now) {
 
 // Current month: today's check-in, plus today's PM check-out from 4.30pm (blank when there is none).
 // Other months: late-day summary (blank when none).
+// Off day today (e.g. Saturday off) -> blank.
 function lateCell(person) {
   const y = +$('fy').value, m = +$('fm').value, e = (attCache[y + '-' + m] || {})[person];
   if (!e) return '';
+  const sc = e.schedule || null;
   const now = new Date();
   if (y === now.getFullYear() && m === now.getMonth() + 1) {
     const t = e.days && e.days[now.getDate()];
     if (isPH(t) && (!t.status || t.status === 'no_data')) return '<span class="st ph" title="' + esc(phName(t)) + '">PH</span>';
+    if (isOffDay(sc, now.getDay())) return '';                // off day: leave blank
     return (t && t.time && t.status !== 'no_data' ? stHtml(t) : '') + pmLateHtml(t, person, now);
   }
   const s = e.summary || {};
@@ -456,6 +476,11 @@ async function renderCal() {
   const e = (attCache[key] || {})[c.person] || { days: {}, summary: {} };
   const md = (monthCache[key] || {})[c.person] || {};
 
+  // Work schedule: off days (e.g. Saturday off)
+  const sched = e.schedule || null;
+  $('msub').textContent = 'Late from ' + (attRules.late_from || '08:01:00').slice(0, 5) +
+    (sched && sched.saturday && String(sched.saturday.is_off_day) === '1' ? ' · Saturday off' : '');
+
   const dk = d => c.y + '-' + String(c.m).padStart(2, '0') + '-' + String(d).padStart(2, '0');
 
   // Leave by day (a leave record can span several days)
@@ -482,8 +507,9 @@ async function renderCal() {
   });
 
   // Automatically detect missed attendance submissions:
-  //  - working day (Mon-Sat) with no check-in at all   -> "Missed Attendance Submission"
+  //  - working day with no check-in at all   -> "Missed Attendance Submission"
   //  - working day with a check-in but no PM check-out -> "Missed PM Check-out"
+  // Working day = not Sunday and not an off day in the person's schedule (e.g. Saturday off).
   const autoCompliance = [], missed = {};
 
   const today = new Date();
@@ -495,7 +521,7 @@ async function renderCal() {
     const date = dk(day);
     const dayDate = new Date(c.y, c.m - 1, day);
 
-    if (dayDate.getDay() === 0) continue;          // Sunday
+    if (isOffDay(sched, dayDate.getDay())) continue;   // Sunday, or Saturday off per schedule
     if (dayDate > today) continue;                 // future
     const isTodayD = dayDate.getTime() === today.getTime();
 
@@ -541,11 +567,16 @@ async function renderCal() {
     // Today's PM check-out is not "missed" until 4.30pm; earlier days are always due.
     const pmDue = !isToday || (String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0')) >= PM_FROM;
     const ms = !!missed[key2];
+    const off = isOffDay(sched, new Date(c.y, c.m - 1, d).getDay());
+    const timed = st === 'late' || st === 'on_time';
     const cls = st === 'late' ? ' bad'
       : st === 'on_time' ? ' ok'
       : ms ? ' bad'
       : ph ? ' ph' : '';
-    const val = st === 'late' ? CROSS + ' ' + esc((x.time || '').slice(0, 5)) : st === 'on_time' ? CHECK + ' ' + esc((x.time || '').slice(0, 5)) : ms ? CROSS + ' Missed' : '';
+    const val = timed
+      ? (st === 'late' ? CROSS : CHECK) + ' ' + esc((x.time || '').slice(0, 5))
+      : ms ? CROSS + ' Missed'
+      : '';
     const tip = [
       ph ? phName(x) : '',
       ms ? 'Missed submission' : '',
@@ -572,10 +603,10 @@ async function renderCal() {
 
         '<span class="v' + (ms ? ' ms' : '') + '">' + val + '</span>' +
 
-        // PM attendance: Monday-Saturday, up to today only,
+        // PM attendance: working days only (not Sunday, not an off day), up to today only,
         // excluding public holidays and leave dates
         (
-            !ph &&
+            !ph && !off &&
             lv.length === 0 &&
             new Date(c.y, c.m - 1, d) <= today &&
             new Date(c.y, c.m - 1, d).getDay() !== 0
@@ -600,7 +631,7 @@ async function renderCal() {
   );
 
   // Compliance has two parts:
-  //  1. Missed attendance submissions detected by the system (working days, Mon-Sat, with no check-in
+  //  1. Missed attendance submissions detected by the system (working days with no check-in
   //     at all, or with a check-in but no PM check-out).
   //     A date that is already in a compliance record's missed_dates is not listed here again.
   //  2. Official compliance records from the compliance API (performanceAPI).
@@ -1178,6 +1209,6 @@ setInterval(() => {
 })();
 </script>
 
- <?php include 'staffSummaryWidget.php'; ?>
+ <?php // include 'staffSummaryWidget.php'; ?>
 </body>
 </html>
